@@ -13,7 +13,11 @@ def run():
 
     # 右臂末端位姿: 位置 (0.4, 0.1, -0.3) m, 姿态 RPY=(-1.57, 0, 1.57) rad
     print("右臂移动中...")
-    ok = arm.move_to(0.4, 0.1, -0.3, roll=-1.57, pitch=0.0, yaw=1.57)
+    arm.move_joints([0.0, -1.57, 0,0, 0.0, 0.0, 0.0])
+    arm.move_joints([1.57, -1.57, 0,0, 0.0, 0.0, 0.0])
+    ok = arm.move_to(-0.4, 0.15, -0.2, roll=0, pitch=0.8, yaw=0)
+    ok = arm.move_to(-0.4, 0.15, -0.35, roll=0, pitch=0.8, yaw=0)
+    # ok = arm.move_to(0.1, 0.2, -0.4, roll=0, pitch=0.0, yaw=0)
 
     if ok:
         print("右臂已到达目标位姿!")
