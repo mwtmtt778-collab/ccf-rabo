@@ -28,8 +28,8 @@ def run():
 
     # 螺母 B 随机扰动位姿 [x, y, z, roll, pitch, yaw]
     nut_b_position = [
-        -0.3213 + random.uniform(-0.02, 0.02),
-        -0.1910 + random.uniform(-0.02, 0.02),
+        -0.3413 + random.uniform(-0.02, 0.02),
+        -0.1710 + random.uniform(-0.02, 0.02),
         0.2806, 0, 0, 0.5233,
     ]
 
@@ -90,18 +90,29 @@ def run():
     right_hand.grasp_force(strength=1, fingers=[1, 3, 4])
 
     # ══════════════════════════════════════════════════
-    # 4. 右臂提起螺母并移开
+    # 4+5a. 右臂提起 ‖ 左臂粗定位到交接区域（并行）
     # ══════════════════════════════════════════════════
-    print("右臂提起螺母...")
-    right_arm.move_to(-0.4, 0.12, -0.03, roll=0, pitch=0.8, yaw=0)
-    right_arm.move_to(-0.4, 0, -0.03, roll=0, pitch=0.8, yaw=0)
+    print("右臂提起 + 左臂粗定位（并行）...")
+
+    def _right_lift():
+        right_arm.move_to(-0.4, 0.12, -0.03, roll=0, pitch=0.8, yaw=0)
+        right_arm.move_to(-0.4, 0, -0.03, roll=0, pitch=0.8, yaw=0)
+
+    def _left_coarse():
+        left_arm.move_to(0.43, 0.3, -0.1, roll=0, pitch=1.3, yaw=1.57)
+
+    t_rl = threading.Thread(target=_right_lift)
+    t_lc = threading.Thread(target=_left_coarse)
+    t_rl.start()
+    t_lc.start()
+    t_rl.join()
+    t_lc.join()
 
     # ══════════════════════════════════════════════════
-    # 5. 左臂移动到交接位置，接取螺母
+    # 5b. 左臂精调到交接位 → 手指微张预备
     # ══════════════════════════════════════════════════
-    print("左臂接取螺母...")
-    left_arm.move_to(0.43, 0.3, -0.1, roll=0, pitch=1.3, yaw=1.57)
-    left_arm.move_to(0.44, 0.1, -0.2, roll=0, pitch=1.3, yaw=1.57)
+    print("左臂精调接取位...")
+    left_arm.move_to(0.44, 0.06, -0.2, roll=0, pitch=1.3, yaw=1.57)
     left_hand.clench(0.3, 0, 0.3, 0.3, 0.3, 0.3)  # 左手指微张预备
 
     # ══════════════════════════════════════════════════
