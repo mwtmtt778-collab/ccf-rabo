@@ -1,6 +1,7 @@
 """双臂协作抓取螺母: 右臂抓螺母B → 左臂辅助接取。"""
 
 import random
+import threading
 from rabo_robocap import LinkerArmA7, LinkerHandO6Right, LinkerHandO6Left
 from rabo_dev_kit import SetEntityPose
 
@@ -46,15 +47,26 @@ def run():
     left_hand = LinkerHandO6Left(robot_id=LEFT_HAND_ID, mode="sim")
 
     # ══════════════════════════════════════════════════
-    # 1. 双臂预摆位: 关节空间粗定位
+    # 1. 双臂预摆位: 关节空间粗定位（左右并行）
     # ══════════════════════════════════════════════════
-    print("双臂预摆位...")
-    # 右臂: 先收拢再展开到抓取预备姿态
-    right_arm.move_joints([-1.57, -1.5, 0, -1.57, 0, -1, 0])
-    right_arm.move_joints([0, 0, 0, -2, 0, 1, 0])
-    # 左臂: 先摆到竖直再前倾到预备姿态
-    left_arm.move_joints([0, -1.57, 0, 0, 0, 0, 0])
-    left_arm.move_joints([-1.57, -0.7, 0, 0, 0, 0, 0])
+    print("双臂预摆位（并行）...")
+
+    def _right_pre_position():
+        # 先收拢再展开到抓取预备姿态
+        right_arm.move_joints([-1.57, -1.5, 0, -1.57, 0, -1, 0])
+        right_arm.move_joints([0, 0, 0, -2, 0, 1, 0])
+
+    def _left_pre_position():
+        # 先摆到竖直再前倾到预备姿态
+        left_arm.move_joints([0, -1.57, 0, 0, 0, 0, 0])
+        left_arm.move_joints([-1.57, -0.7, 0, 0, 0, 0, 0])
+
+    t_rp = threading.Thread(target=_right_pre_position)
+    t_lp = threading.Thread(target=_left_pre_position)
+    t_rp.start()
+    t_lp.start()
+    t_rp.join()
+    t_lp.join()
 
     # ══════════════════════════════════════════════════
     # 2. 右臂笛卡尔逼近螺母 B
@@ -78,19 +90,26 @@ def run():
     right_hand.grasp_force(strength=1, fingers=[1, 3, 4])
 
     # ══════════════════════════════════════════════════
-    # 4. 右臂提起螺母并移开
+    # 4+5. 右臂提起移开 ‖ 左臂到交接位置（并行）
     # ══════════════════════════════════════════════════
-    print("右臂提起螺母...")
-    right_arm.move_to(-0.4, 0.12, -0.03, roll=0, pitch=0.8, yaw=0)
-    right_arm.move_to(-0.4, 0, -0.03, roll=0, pitch=0.8, yaw=0)
+    print("右臂提起 + 左臂接取（并行）...")
 
-    # ══════════════════════════════════════════════════
-    # 5. 左臂移动到交接位置，接取螺母
-    # ══════════════════════════════════════════════════
-    print("左臂接取螺母...")
-    left_arm.move_to(0.43, 0.3, -0.1, roll=0, pitch=1.3, yaw=1.57)
-    left_arm.move_to(0.44, 0.1, -0.2, roll=0, pitch=1.3, yaw=1.57)
-    left_hand.clench(0.3, 0, 0.3, 0.3, 0.3, 0.3)  # 左手指微张预备
+    def _right_lift():
+        right_arm.move_to(-0.4, 0.12, -0.03, roll=0, pitch=0.8, yaw=0)
+        right_arm.move_to(-0.4, 0, -0.03, roll=0, pitch=0.8, yaw=0)
+
+    def _left_approach():
+        left_arm.move_to(0.43, 0.3, -0.1, roll=0, pitch=1.3, yaw=1.57)
+        left_arm.move_to(0.44, 0.1, -0.2, roll=0, pitch=1.3, yaw=1.57)
+        # 左手指微张预备
+        left_hand.clench(0.3, 0, 0.3, 0.3, 0.3, 0.3)
+
+    t_rl = threading.Thread(target=_right_lift)
+    t_la = threading.Thread(target=_left_approach)
+    t_rl.start()
+    t_la.start()
+    t_rl.join()
+    t_la.join()
 
     # ══════════════════════════════════════════════════
     # 6. 右手释放 → 左手抓取
