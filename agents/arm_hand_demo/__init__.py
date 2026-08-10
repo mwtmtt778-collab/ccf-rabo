@@ -14,7 +14,10 @@ def run():
 
     # 右臂末端位姿: 位置 (0.4, 0.1, -0.3) m, 姿态 RPY=(-1.57, 0, 1.57) rad
     print("右臂移动中...")
-    ok = arm.move_to(0.4, 0.1, -0.3, roll=-1.57, pitch=0.0, yaw=1.57)
+    arm.move_joints([0,-1.57,0,0,0,0,0])
+    arm.move_joints([1.57,-1.57,0,0,0,0,0])
+    ok = arm.move_to(-0.43, 0.16, -0.2, roll=0, pitch=0.8, yaw=0)
+    ok = arm.move_to(-0.43, 0.16, -0.33, roll=0, pitch=0.8, yaw=0)
 
     if ok:
         print("右臂已到达目标位姿!")
@@ -30,7 +33,10 @@ def run():
 
     # 2) 力控握紧
     print("力控握紧...")
-    hand.grasp_force(strength=1.0)
+    hand.grasp_force(strength=0.5)
+
+    ok = arm.move_to(-0.4, 0.12, -0.2, roll=0, pitch=0.8, yaw=0)
+    ok = arm.move_to(-0.4, 0, -0.2, roll=0, pitch=0.8, yaw=0)
 
     arm.shutdown()
     hand.shutdown()
