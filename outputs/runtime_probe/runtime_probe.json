@@ -1,0 +1,2025 @@
+{
+  "environment": {
+    "generated_at": "2026-08-13T18:17:54+0800",
+    "hostname": "liyi",
+    "pwd": "/home/liyi/agent_system",
+    "python_version": "3.10.12 (main, Jun 22 2026, 18:55:27) [GCC 11.4.0]",
+    "platform": "Linux-6.8.0-124-generic-x86_64-with-glibc2.35",
+    "ros_distro": "humble",
+    "ros_domain_id": null,
+    "rmw_implementation": null,
+    "pythonpath": "/opt/ros/humble/lib/python3.10/site-packages:/opt/ros/humble/local/lib/python3.10/dist-packages",
+    "ros2_cli": {
+      "which": {
+        "available": true,
+        "returncode": 0,
+        "stdout": [
+          "/opt/ros/humble/bin/ros2"
+        ],
+        "stderr": []
+      },
+      "node_list": {
+        "available": true,
+        "returncode": 0,
+        "stdout": [],
+        "stderr": []
+      },
+      "topic_list": {
+        "available": true,
+        "returncode": 0,
+        "stdout": [
+          "/parameter_events [rcl_interfaces/msg/ParameterEvent]",
+          "/rosout [rcl_interfaces/msg/Log]"
+        ],
+        "stderr": []
+      },
+      "service_list": {
+        "available": true,
+        "returncode": 0,
+        "stdout": [],
+        "stderr": []
+      },
+      "action_list": {
+        "available": false,
+        "returncode": 2,
+        "stdout": [],
+        "stderr": [
+          "usage: ros2 [-h] [--use-python-default-buffering]",
+          "            Call `ros2 <command> -h` for more detailed usage. ...",
+          "ros2: error: unrecognized arguments: --no-daemon"
+        ]
+      }
+    }
+  },
+  "static_source": {
+    "matches": [
+      {
+        "file": "README.md",
+        "line": 57,
+        "text": "`RemoteControl` 示例的注释(需先在场景里建 H5 遥控面板, 并取消 `config.py` 里"
+      },
+      {
+        "file": "README.md",
+        "line": 58,
+        "text": "`REMOTE_ID` / `CHAT_CONTROL_ID` 的注释填好), 也可以改成订阅 ROS2 话题。"
+      },
+      {
+        "file": "README.md",
+        "line": 63,
+        "text": "4. **对话** —— 接好输入源(如上面的 RemoteControl)后, 在对应通道发消息即可。以 H5"
+      },
+      {
+        "file": "README.md",
+        "line": 69,
+        "text": "帮我记一下: 周三开会前先准备 demo"
+      },
+      {
+        "file": "README.md",
+        "line": 90,
+        "text": "├── __init__.py        # 暴露 run() 入口 (默认占位; 含注释掉的 RemoteControl 接法)"
+      },
+      {
+        "file": "README.md",
+        "line": 92,
+        "text": "├── tools.py           # 工具 schema + handler + 调度 (一站式)"
+      },
+      {
+        "file": "README.md",
+        "line": 108,
+        "text": "| 给 agent 加一个新工具 | `agents/<agent>/tools.py` | schema + handler + 调度都在一个文件, 改一处搞定 |"
+      },
+      {
+        "file": "README.md",
+        "line": 117,
+        "text": "### 工具 handler 签名 (硬约定)"
+      },
+      {
+        "file": "README.md",
+        "line": 158,
+        "text": "- 接 H5 控制面板的 chat 控件 (`rabo_dev_kit.RemoteControl` + `rclpy.spin`) —— **注释掉的示例**, 取消注释即可"
+      },
+      {
+        "file": "README.md",
+        "line": 167,
+        "text": "- 不要把 `_HANDLERS` 里没注册的工具加进 `TOOLS` schema (LLM 会调到一个不存在的 handler)。"
+      },
+      {
+        "file": "README.md",
+        "line": 168,
+        "text": "- 不要在 handler 里 raise, 用 return 返回错误信息。"
+      },
+      {
+        "file": "README.md",
+        "line": 186,
+        "text": "\"type\": \"object\","
+      },
+      {
+        "file": "README.md",
+        "line": 197,
+        "text": "**2. 在同文件里写 handler:**"
+      },
+      {
+        "file": "README.md",
+        "line": 209,
+        "text": "**3. 在 `_HANDLERS` 字典加一行:**"
+      },
+      {
+        "file": "README.md",
+        "line": 212,
+        "text": "_HANDLERS = {"
+      },
+      {
+        "file": "README.md",
+        "line": 294,
+        "text": "1. 在 `drivers/` 加一个 `my_arm.py`, 写一个类 `MyArm` 把硬件 SDK 包装成你想要的接口"
+      },
+      {
+        "file": "README.md",
+        "line": 295,
+        "text": "2. 在 `drivers/__init__.py` 暴露: `from .my_arm import MyArm`"
+      },
+      {
+        "file": "README.md",
+        "line": 299,
+        "text": "from drivers import MyArm"
+      },
+      {
+        "file": "README.md",
+        "line": 304,
+        "text": "self.arm = MyArm(robot_id=config.ROBOT_ID)"
+      },
+      {
+        "file": "README.md",
+        "line": 308,
+        "text": "4. 在 `tools.py` 写工具 handler 直接用 `agent.arm.move_to(...)` 即可"
+      },
+      {
+        "file": "README.md",
+        "line": 315,
+        "text": "from rabo_robocap import UR5, RobotiqHandEGripper"
+      },
+      {
+        "file": "README.md",
+        "line": 321,
+        "text": "self.arm = UR5(robot_id=\"<sdf-model-name>\", mode=\"sim\")"
+      },
+      {
+        "file": "README.md",
+        "line": 322,
+        "text": "self.gripper = RobotiqHandEGripper(robot_id=\"<sdf-model-name>\", mode=\"sim\")"
+      },
+      {
+        "file": "README.md",
+        "line": 326,
+        "text": "然后在 `tools.py` 的 handler 里调 `agent.arm.move_to(...)` / `agent.gripper.grasp()`。"
+      },
+      {
+        "file": "README.md",
+        "line": 352,
+        "text": "子 agent\" 的 multi-agent, 把\"调用子 agent\" 也写成一个工具就行 — 在 handler"
+      },
+      {
+        "file": "README.md",
+        "line": 357,
+        "text": "handler 都拿得到 `agent`, 直接读写就行。"
+      },
+      {
+        "file": "README.md",
+        "line": 362,
+        "text": "分层, 可以搭出 \"UR5 机械臂 + RGBD 相机 + 视觉检测 + LLM\" 这种完整 agent ——"
+      },
+      {
+        "file": "agents/__init__.py",
+        "line": 3,
+        "text": "每个子目录就是一个 agent (例如 example_agent/, arm_agent/, inspect_agent/),"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 5,
+        "text": "from rabo_robocap import LinkerArmA7, LinkerHandO6Right, LinkerHandO6Left"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 6,
+        "text": "from rabo_dev_kit import SetEntityPose"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 9,
+        "text": "NUT_A_ID = \"thing_3eb64241-4166-4c4e-9144-edf733c885f1\""
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 10,
+        "text": "NUT_B_ID = \"thing_e937f633-faed-4b2e-b609-a7b80825a64a\""
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 11,
+        "text": "NUT_C_ID = \"thing_4a38ffae-a85b-43c9-8b20-abb0cf6dcac7\""
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 14,
+        "text": "RIGHT_ARM_ID = \"r412d237980e3167577d7aece10f7aedb\""
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 15,
+        "text": "RIGHT_HAND_ID = \"rcd72e2daf71f064c29aa45d4eeceeca9\""
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 16,
+        "text": "LEFT_ARM_ID = \"rbd03ebf4ebf83c6a6a64754454bc520a\""
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 17,
+        "text": "LEFT_HAND_ID = \"r136d7b4b6e527ea3875679b4bf7eeb7d\""
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 26,
+        "text": "# right_arm_base = [-0.8316, -0.004]   # 备选位置"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 27,
+        "text": "right_arm_base = [-0.6816, -0.004]"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 30,
+        "text": "nut_b_position = ["
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 36,
+        "text": "pose_setter = SetEntityPose(world=WORLD_ID)"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 37,
+        "text": "pose_setter.set("
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 38,
+        "text": "NUT_B_ID, ("
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 39,
+        "text": "nut_b_position[0], nut_b_position[1], nut_b_position[2],"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 40,
+        "text": "nut_b_position[3], nut_b_position[4], nut_b_position[5],"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 44,
+        "text": "right_arm = LinkerArmA7(robot_id=RIGHT_ARM_ID, mode=\"sim\")"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 45,
+        "text": "left_arm = LinkerArmA7(robot_id=LEFT_ARM_ID, mode=\"sim\")"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 46,
+        "text": "right_hand = LinkerHandO6Right(robot_id=RIGHT_HAND_ID, mode=\"sim\")"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 47,
+        "text": "left_hand = LinkerHandO6Left(robot_id=LEFT_HAND_ID, mode=\"sim\")"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 56,
+        "text": "right_arm.move_joints([-1.57, -1.5, 0, -1.57, 0, -1, 0])"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 57,
+        "text": "right_arm.move_joints([0, 0, 0, -2, 0, 1, 0])"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 61,
+        "text": "left_arm.move_joints([0, -1.57, 0, 0, 0, 0, 0])"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 62,
+        "text": "left_arm.move_joints([-1.57, -0.7, 0, 0, 0, 0, 0])"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 64,
+        "text": "t_rp = threading.Thread(target=_right_pre_position)"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 65,
+        "text": "t_lp = threading.Thread(target=_left_pre_position)"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 76,
+        "text": "target_x = right_arm_base[0] - nut_b_position[0] + 0.06"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 77,
+        "text": "target_y = right_arm_base[1] - nut_b_position[1] - 0.01"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 78,
+        "text": "right_arm.move_to(target_x, target_y, -0.33, roll=0, pitch=0.8, yaw=0)"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 85,
+        "text": "right_hand.clench(thumb_rotation=1.0)"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 90,
+        "text": "right_hand.grasp_force(strength=1, fingers=[1, 3, 4])"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 98,
+        "text": "right_arm.move_to(-0.4, 0.12, -0.03, roll=0, pitch=0.8, yaw=0)"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 99,
+        "text": "right_arm.move_to(-0.4, 0, -0.03, roll=0, pitch=0.8, yaw=0)"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 102,
+        "text": "left_arm.move_to(0.43, 0.3, -0.1, roll=0, pitch=1.3, yaw=1.57)"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 104,
+        "text": "t_rl = threading.Thread(target=_right_lift)"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 105,
+        "text": "t_lc = threading.Thread(target=_left_coarse)"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 115,
+        "text": "left_arm.move_to(0.44, 0.06, -0.2, roll=0, pitch=1.3, yaw=1.57)"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 116,
+        "text": "left_hand.clench(0.3, 0, 0.3, 0.3, 0.3, 0.3)  # 左手指微张预备"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 122,
+        "text": "right_hand.clench(0, 0, 0, 0, 0, 0)            # 右手完全张开释放"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 123,
+        "text": "right_arm.move_to(-0.4, 0, 0.12, roll=0, pitch=0.8, yaw=0)"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 129,
+        "text": "left_hand.clench(1, 0, 0.3, 0.3, 0.3, 0.3)    # 拇指内扣, 四指微合"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 130,
+        "text": "left_hand.grasp_force(strength=0.5)"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 136,
+        "text": "left_arm.move_to(0.43, 0.25, -0.2, roll=0, pitch=0, yaw=0)"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 137,
+        "text": "left_hand.clench(0, 0, 0, 0, 0, 0)             # 左手张开释放"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 142,
+        "text": "right_arm.shutdown()"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 143,
+        "text": "left_arm.shutdown()"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 144,
+        "text": "right_hand.shutdown()"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 145,
+        "text": "left_hand.shutdown()"
+      },
+      {
+        "file": "agents/example_agent/__init__.py",
+        "line": 21,
+        "text": "② 接入输入源: 平台容器没有交互式 stdin, 取消下方 RemoteControl 示例的注释并删掉"
+      },
+      {
+        "file": "agents/example_agent/__init__.py",
+        "line": 36,
+        "text": "# 可选输入示例: H5 控制面板 chat 控件 (RemoteControl)"
+      },
+      {
+        "file": "agents/example_agent/__init__.py",
+        "line": 43,
+        "text": "#      CHAT_CONTROL_ID 的注释并填好;"
+      },
+      {
+        "file": "agents/example_agent/__init__.py",
+        "line": 49,
+        "text": "# 即可 —— 那些 SDK 自带后台 executor, 不影响这里只 spin RemoteControl 这一个节点。"
+      },
+      {
+        "file": "agents/example_agent/__init__.py",
+        "line": 55,
+        "text": "# from rabo_dev_kit import RemoteControl"
+      },
+      {
+        "file": "agents/example_agent/__init__.py",
+        "line": 76,
+        "text": "# def on_control(data: dict):"
+      },
+      {
+        "file": "agents/example_agent/__init__.py",
+        "line": 77,
+        "text": "#     \"\"\"RemoteControl 回调。data 形如 {'chat-1': {'value': '用户输入'}, ...}。"
+      },
+      {
+        "file": "agents/example_agent/__init__.py",
+        "line": 82,
+        "text": "#     text = data.get(config.CHAT_CONTROL_ID, {}).get(\"value\")"
+      },
+      {
+        "file": "agents/example_agent/__init__.py",
+        "line": 95,
+        "text": "#             rc.send(config.CHAT_CONTROL_ID, reply)"
+      },
+      {
+        "file": "agents/example_agent/__init__.py",
+        "line": 99,
+        "text": "# rc = RemoteControl(remote_id=config.REMOTE_ID, callback=on_control)"
+      },
+      {
+        "file": "agents/example_agent/__init__.py",
+        "line": 103,
+        "text": "#     f\"{config.CHAT_CONTROL_ID} 控件。\""
+      },
+      {
+        "file": "agents/example_agent/agent.py",
+        "line": 46,
+        "text": "# 真实场景里这里可能是: self.arm = ..., self.camera = ..., 等。"
+      },
+      {
+        "file": "agents/example_agent/config.py",
+        "line": 38,
+        "text": "# 取消 __init__.py 里 run() 中 RemoteControl 那段示例的注释。"
+      },
+      {
+        "file": "agents/example_agent/config.py",
+        "line": 40,
+        "text": "# CHAT_CONTROL_ID: 面板上 chat 控件的 ID，用户在此输入、agent 回复也回传到这里。"
+      },
+      {
+        "file": "agents/example_agent/config.py",
+        "line": 41,
+        "text": "# RemoteControl 连接所需的 RABO_REMOTE_WS_URL 由平台运行环境自动注入，无需在此配置。"
+      },
+      {
+        "file": "agents/example_agent/config.py",
+        "line": 43,
+        "text": "# CHAT_CONTROL_ID = \"chat-1\""
+      },
+      {
+        "file": "agents/example_agent/tools.py",
+        "line": 1,
+        "text": "\"\"\"ExampleAgent 的工具集: schema + handler + 调度。"
+      },
+      {
+        "file": "agents/example_agent/tools.py",
+        "line": 22,
+        "text": "│ 在 _HANDLERS 字典加一行:  \"tool_name\": _xxx              │"
+      },
+      {
+        "file": "agents/example_agent/tools.py",
+        "line": 28,
+        "text": "handler 函数命名约定: 文件内私有函数加下划线前缀 (_my_tool), 这样能跟工具"
+      },
+      {
+        "file": "agents/example_agent/tools.py",
+        "line": 50,
+        "text": "\"parameters\": {\"type\": \"object\", \"properties\": {}},"
+      },
+      {
+        "file": "agents/example_agent/tools.py",
+        "line": 59,
+        "text": "\"type\": \"object\","
+      },
+      {
+        "file": "agents/example_agent/tools.py",
+        "line": 76,
+        "text": "\"type\": \"object\","
+      },
+      {
+        "file": "agents/example_agent/tools.py",
+        "line": 92,
+        "text": "\"parameters\": {\"type\": \"object\", \"properties\": {}},"
+      },
+      {
+        "file": "agents/example_agent/tools.py",
+        "line": 99,
+        "text": "#  handler 实现"
+      },
+      {
+        "file": "agents/example_agent/tools.py",
+        "line": 102,
+        "text": "# 每个 handler 的签名都是  _xxx(agent, args) -> str。"
+      },
+      {
+        "file": "agents/example_agent/tools.py",
+        "line": 104,
+        "text": "#                  需要硬件就用 agent.arm / agent.camera (在你自己的 agent 里)。"
+      },
+      {
+        "file": "agents/example_agent/tools.py",
+        "line": 147,
+        "text": "# 这两个工具演示\"在 agent 实例上保存状态\"的常见模式: handler 通过 agent.xxx"
+      },
+      {
+        "file": "agents/example_agent/tools.py",
+        "line": 168,
+        "text": "#  调度表: tool name → handler"
+      },
+      {
+        "file": "agents/example_agent/tools.py",
+        "line": 174,
+        "text": "_HANDLERS = {"
+      },
+      {
+        "file": "agents/example_agent/tools.py",
+        "line": 187,
+        "text": "- handler 抛异常 → catch 后返回错误字符串, 同样让 LLM 看到"
+      },
+      {
+        "file": "agents/example_agent/tools.py",
+        "line": 190,
+        "text": "handler = _HANDLERS.get(name)"
+      },
+      {
+        "file": "agents/example_agent/tools.py",
+        "line": 191,
+        "text": "if handler is None:"
+      },
+      {
+        "file": "agents/example_agent/tools.py",
+        "line": 194,
+        "text": "return handler(agent, args)"
+      },
+      {
+        "file": "core/base_agent.py",
+        "line": 81,
+        "text": "py_s = s.replace('true', 'True').replace('false', 'False').replace('null', 'None')"
+      },
+      {
+        "file": "docs/RABO_RUNTIME_REPORT.md",
+        "line": 16,
+        "text": "- Cameras discovered: `0`"
+      },
+      {
+        "file": "docs/RABO_RUNTIME_REPORT.md",
+        "line": 17,
+        "text": "- Robot state topics: `0`"
+      },
+      {
+        "file": "docs/RABO_RUNTIME_REPORT.md",
+        "line": 18,
+        "text": "- Robot control interfaces: `0`"
+      },
+      {
+        "file": "docs/RABO_RUNTIME_REPORT.md",
+        "line": 19,
+        "text": "- Can read nut ground-truth pose: `NO`"
+      },
+      {
+        "file": "docs/RABO_RUNTIME_REPORT.md",
+        "line": 20,
+        "text": "- Can control arm: `NOT FOUND`"
+      },
+      {
+        "file": "docs/RABO_RUNTIME_REPORT.md",
+        "line": 21,
+        "text": "- Can control hand: `NOT FOUND`"
+      },
+      {
+        "file": "docs/RABO_RUNTIME_REPORT.md",
+        "line": 23,
+        "text": "## Cameras"
+      },
+      {
+        "file": "docs/RABO_RUNTIME_REPORT.md",
+        "line": 25,
+        "text": "- No RGB camera frames discovered."
+      },
+      {
+        "file": "docs/RABO_RUNTIME_REPORT.md",
+        "line": 27,
+        "text": "## Robot State"
+      },
+      {
+        "file": "docs/RABO_RUNTIME_REPORT.md",
+        "line": 29,
+        "text": "- No sampled robot state topic."
+      },
+      {
+        "file": "docs/RABO_RUNTIME_REPORT.md",
+        "line": 31,
+        "text": "## Robot Control Interfaces (Read-Only Discovery)"
+      },
+      {
+        "file": "docs/RABO_RUNTIME_REPORT.md",
+        "line": 33,
+        "text": "- No command/control interfaces found by ROS discovery."
+      },
+      {
+        "file": "docs/RABO_RUNTIME_REPORT.md",
+        "line": 35,
+        "text": "No command/control/reset interface was called by this probe."
+      },
+      {
+        "file": "docs/RABO_RUNTIME_REPORT.md",
+        "line": 37,
+        "text": "## Known Object IDs From Source"
+      },
+      {
+        "file": "docs/RABO_RUNTIME_REPORT.md",
+        "line": 39,
+        "text": "- `NUT_A_ID`: `thing_3eb64241-4166-4c4e-9144-edf733c885f1`"
+      },
+      {
+        "file": "docs/RABO_RUNTIME_REPORT.md",
+        "line": 40,
+        "text": "- `NUT_B_ID`: `thing_e937f633-faed-4b2e-b609-a7b80825a64a`"
+      },
+      {
+        "file": "docs/RABO_RUNTIME_REPORT.md",
+        "line": 41,
+        "text": "- `NUT_C_ID`: `thing_4a38ffae-a85b-43c9-8b20-abb0cf6dcac7`"
+      },
+      {
+        "file": "docs/RABO_RUNTIME_REPORT.md",
+        "line": 43,
+        "text": "## Object / Target Runtime Discovery"
+      },
+      {
+        "file": "docs/RABO_RUNTIME_REPORT.md",
+        "line": 45,
+        "text": "- Object candidates: `0`"
+      },
+      {
+        "file": "docs/RABO_RUNTIME_REPORT.md",
+        "line": 46,
+        "text": "- Target candidates: `0`"
+      },
+      {
+        "file": "docs/RABO_RUNTIME_REPORT.md",
+        "line": 47,
+        "text": "- Runtime pose availability is recorded in `outputs/runtime_probe/runtime_probe.json`."
+      },
+      {
+        "file": "docs/RABO_RUNTIME_REPORT.md",
+        "line": 49,
+        "text": "## Reset / Episode Interfaces"
+      },
+      {
+        "file": "docs/RABO_RUNTIME_REPORT.md",
+        "line": 51,
+        "text": "- No reset interface found by ROS discovery."
+      },
+      {
+        "file": "docs/RABO_RUNTIME_REPORT.md",
+        "line": 52,
+        "text": "- Static reset-related source matches exist; inspect JSON for exact file/line."
+      },
+      {
+        "file": "docs/RABO_RUNTIME_REPORT.md",
+        "line": 57,
+        "text": "- Control/example matches: `25`"
+      },
+      {
+        "file": "drivers/__init__.py",
+        "line": 7,
+        "text": "- 相机驱动 (RGBD / 普通 RGB / 事件相机)"
+      },
+      {
+        "file": "drivers/__init__.py",
+        "line": 27,
+        "text": "1. 写 drivers/my_camera.py, 暴露一个类 (例如 MyCamera)"
+      },
+      {
+        "file": "drivers/__init__.py",
+        "line": 28,
+        "text": "2. 在本文件 __init__.py 加:  from .my_camera import MyCamera"
+      },
+      {
+        "file": "drivers/__init__.py",
+        "line": 29,
+        "text": "3. 在 __all__ 加:             \"MyCamera\""
+      },
+      {
+        "file": "drivers/__init__.py",
+        "line": 30,
+        "text": "4. 在 agent 里:               from drivers import MyCamera"
+      },
+      {
+        "file": "main.py",
+        "line": 29,
+        "text": "DEFAULT_AGENT = \"arm_hand_demo\""
+      },
+      {
+        "file": "requirements.txt",
+        "line": 5,
+        "text": "# 平台输入通道 RemoteControl 来自 rabo_dev_kit (example_agent 用到)"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 22,
+        "text": "\"camera\": [\"camera\", \"image\", \"rgb\", \"depth\"],"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 23,
+        "text": "\"robot_state\": [\"joint\", \"state\", \"qpos\", \"position\", \"arm\", \"hand\", \"o6\", \"a7\", \"p7\"],"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 24,
+        "text": "\"robot_control\": [\"command\", \"cmd\", \"control\", \"action\", \"trajectory\", \"servo\", \"move\"],"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 25,
+        "text": "\"objects\": [\"nut\", \"object\", \"pose\", \"thing\"],"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 26,
+        "text": "\"targets\": [\"target\", \"goal\", \"placement\", \"area\", \"bin\", \"tray\"],"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 28,
+        "text": "\"reset\": [\"reset\", \"reset_scene\", \"reset_env\", \"reset_episode\", \"restart\"],"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 32,
+        "text": "\"camera|image|rgb|joint|qpos|state|command|control|arm|hand|o6|a7|p7|nut|object|pose|target|reset|expert|demo|pick|place\""
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 109,
+        "text": "def image_summary(msg: Any) -> dict[str, Any]:"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 124,
+        "text": "def msg_to_image_bytes(msg: Any) -> tuple[bytes | None, str | None]:"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 125,
+        "text": "# Avoid cv_bridge dependency. Save RGB/BGR mono sensor_msgs/Image as PPM/PGM bytes."
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 127,
+        "text": "return None, \"not a raw Image message\""
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 130,
+        "text": "if encoding in (\"rgb8\", \"bgr8\"):"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 133,
+        "text": "return None, f\"short image buffer {len(data)} < {expected}\""
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 142,
+        "text": "return None, f\"short image buffer {len(data)} < {expected}\""
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 144,
+        "text": "return None, f\"unsupported safe image encoding: {encoding}\""
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 184,
+        "text": "def __init__(self, duration: float, output_dir: Path, save_images: bool, verbose: bool):"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 187,
+        "text": "self.save_images = save_images"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 194,
+        "text": "\"cameras\": [],"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 195,
+        "text": "\"robot_state\": {\"topics\": [], \"samples\": []},"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 196,
+        "text": "\"robot_control\": {\"topics\": [], \"services\": [], \"actions\": []},"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 197,
+        "text": "\"objects\": [],"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 198,
+        "text": "\"targets\": [],"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 199,
+        "text": "\"reset\": {\"interfaces\": []},"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 267,
+        "text": "if \"robot_control\" in item[\"categories\"]:"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 268,
+        "text": "self.report[\"robot_control\"][\"topics\"].append(item)"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 269,
+        "text": "if \"reset\" in item[\"categories\"]:"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 270,
+        "text": "self.report[\"reset\"][\"interfaces\"].append({\"kind\": \"topic\", **item})"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 271,
+        "text": "if \"objects\" in item[\"categories\"]:"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 272,
+        "text": "self.report[\"objects\"].append({\"kind\": \"topic\", **item})"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 273,
+        "text": "if \"targets\" in item[\"categories\"]:"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 274,
+        "text": "self.report[\"targets\"].append({\"kind\": \"topic\", **item})"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 284,
+        "text": "if \"robot_control\" in item[\"categories\"]:"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 285,
+        "text": "self.report[\"robot_control\"][\"services\"].append(item)"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 286,
+        "text": "if \"reset\" in item[\"categories\"]:"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 287,
+        "text": "self.report[\"reset\"][\"interfaces\"].append({\"kind\": \"service\", **item})"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 289,
+        "text": "# rclpy action discovery is not consistently exposed; CLI fallback is recorded separately."
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 311,
+        "text": "camera_topics: list[dict[str, Any]] = []"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 312,
+        "text": "state_topics: list[dict[str, Any]] = []"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 313,
+        "text": "pose_topics: list[dict[str, Any]] = []"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 320,
+        "text": "is_camera = \"camera\" in cats and msg_type in ("
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 321,
+        "text": "\"sensor_msgs/msg/Image\","
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 322,
+        "text": "\"sensor_msgs/msg/CompressedImage\","
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 324,
+        "text": "is_state = msg_type == \"sensor_msgs/msg/JointState\" or (\"robot_state\" in cats and \"state\" in cats)"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 325,
+        "text": "is_pose = msg_type in ("
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 326,
+        "text": "\"geometry_msgs/msg/PoseStamped\","
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 327,
+        "text": "\"geometry_msgs/msg/PoseArray\","
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 330,
+        "text": ") and (cats & {\"objects\", \"targets\", \"robot_state\"})"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 331,
+        "text": "if is_camera:"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 332,
+        "text": "camera_topics.append(item)"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 333,
+        "text": "if is_state:"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 334,
+        "text": "state_topics.append(item)"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 335,
+        "text": "if is_pose:"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 336,
+        "text": "pose_topics.append(item)"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 345,
+        "text": "s.first_summary = image_summary(msg) if \"Image\" in msg.__class__.__name__ else summarize_msg(msg)"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 350,
+        "text": "for item in camera_topics + state_topics + pose_topics:"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 370,
+        "text": "for i, item in enumerate(camera_topics):"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 382,
+        "text": "if self.save_images and s.first_msg is not None:"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 383,
+        "text": "data, ext_or_error = msg_to_image_bytes(s.first_msg)"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 385,
+        "text": "path = self.output_dir / f\"camera_{len(self.report['cameras'])}.{ext_or_error}\""
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 389,
+        "text": "entry[\"save_image_error\"] = ext_or_error"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 390,
+        "text": "self.report[\"cameras\"].append(entry)"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 392,
+        "text": "for item in state_topics:"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 407,
+        "text": "sample[\"joint_names\"] = names"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 408,
+        "text": "sample[\"joint_count\"] = len(names)"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 413,
+        "text": "self.report[\"robot_state\"][\"samples\"].append(sample)"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 414,
+        "text": "self.report[\"robot_state\"][\"topics\"] = state_topics"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 415,
+        "text": "self.report[\"frequencies\"][\"robot_state_topics\"] = ["
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 416,
+        "text": "{\"topic\": x[\"topic\"], **x[\"fps\"]} for x in self.report[\"robot_state\"][\"samples\"]"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 418,
+        "text": "self.report[\"frequencies\"][\"camera_topics\"] = ["
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 419,
+        "text": "{\"topic\": x[\"topic\"], **x[\"fps\"]} for x in self.report[\"cameras\"]"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 427,
+        "text": "\"control_examples\": [],"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 428,
+        "text": "\"reset_examples\": [],"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 446,
+        "text": "if any(k in low for k in (\"move_joints\", \"move_to\", \"clench\", \"grasp_force\", \"setentitypose\", \".set(\")):"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 447,
+        "text": "out[\"control_examples\"].append(record)"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 448,
+        "text": "if \"reset\" in low or \"restart\" in low:"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 449,
+        "text": "out[\"reset_examples\"].append(record)"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 451,
+        "text": "arm_demo = root / \"agents\" / \"arm_hand_demo\" / \"__init__.py\""
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 452,
+        "text": "if arm_demo.exists():"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 453,
+        "text": "text = arm_demo.read_text(encoding=\"utf-8\", errors=\"ignore\")"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 456,
+        "text": "\"NUT_A_ID\","
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 457,
+        "text": "\"NUT_B_ID\","
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 458,
+        "text": "\"NUT_C_ID\","
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 459,
+        "text": "\"RIGHT_ARM_ID\","
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 460,
+        "text": "\"RIGHT_HAND_ID\","
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 461,
+        "text": "\"LEFT_ARM_ID\","
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 462,
+        "text": "\"LEFT_HAND_ID\","
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 474,
+        "text": "for name in (\"LinkerArmA7\", \"LinkerHandO6Right\", \"LinkerHandO6Left\", \"SetEntityPose\", \"RemoteControl\"):"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 507,
+        "text": "control_topics = data[\"ros_probe\"][\"robot_control\"].get(\"topics\", [])"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 508,
+        "text": "control_services = data[\"ros_probe\"][\"robot_control\"].get(\"services\", [])"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 509,
+        "text": "control_actions = data[\"ros_probe\"].get(\"actions\", [])"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 510,
+        "text": "can_control_arm = any(\"arm\" in x.get(\"name\", \"\").lower() for x in control_topics + control_services)"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 511,
+        "text": "can_control_hand = any((\"hand\" in x.get(\"name\", \"\").lower() or \"o6\" in x.get(\"name\", \"\").lower()) for x in control_topics + control_services)"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 512,
+        "text": "nut_ids = data[\"static_source\"][\"known_ids\"]"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 513,
+        "text": "can_read_nut_pose = any("
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 514,
+        "text": "item.get(\"status\") == \"AVAILABLE\" for item in data[\"ros_probe\"].get(\"objects\", []) if \"pose\" in item.get(\"name\", \"\").lower()"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 516,
+        "text": "# Static IDs are object names, not proof that pose can be read."
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 518,
+        "text": "\"camera_count\": len(data[\"ros_probe\"].get(\"cameras\", [])),"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 519,
+        "text": "\"robot_state_topic_count\": len(data[\"ros_probe\"][\"robot_state\"].get(\"topics\", [])),"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 520,
+        "text": "\"robot_control_interface_count\": len(control_topics) + len(control_services) + len(control_actions),"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 521,
+        "text": "\"known_nut_ids\": {k: v for k, v in nut_ids.items() if k.startswith(\"NUT_\")},"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 522,
+        "text": "\"can_read_nut_pose\": \"YES\" if can_read_nut_pose else \"NO\","
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 523,
+        "text": "\"can_control_arm\": \"INTERFACE FOUND\" if can_control_arm else \"NOT FOUND\","
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 524,
+        "text": "\"can_control_hand\": \"INTERFACE FOUND\" if can_control_hand else \"NOT FOUND\","
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 548,
+        "text": "f\"- Cameras discovered: `{summary['camera_count']}`\","
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 549,
+        "text": "f\"- Robot state topics: `{summary['robot_state_topic_count']}`\","
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 550,
+        "text": "f\"- Robot control interfaces: `{summary['robot_control_interface_count']}`\","
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 551,
+        "text": "f\"- Can read nut ground-truth pose: `{summary['can_read_nut_pose']}`\","
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 552,
+        "text": "f\"- Can control arm: `{summary['can_control_arm']}`\","
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 553,
+        "text": "f\"- Can control hand: `{summary['can_control_hand']}`\","
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 555,
+        "text": "\"## Cameras\","
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 558,
+        "text": "if ros.get(\"cameras\"):"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 559,
+        "text": "for cam in ros[\"cameras\"]:"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 568,
+        "text": "lines.append(\"- No RGB camera frames discovered.\")"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 570,
+        "text": "lines += [\"\", \"## Robot State\", \"\"]"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 571,
+        "text": "if ros[\"robot_state\"].get(\"samples\"):"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 572,
+        "text": "for st in ros[\"robot_state\"][\"samples\"]:"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 575,
+        "text": "f\"joint_count=`{st.get('joint_count')}` position_shape=`{st.get('position_shape')}` \""
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 578,
+        "text": "if st.get(\"joint_names\"):"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 579,
+        "text": "lines.append(f\"  - joint_names: `{st['joint_names']}`\")"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 581,
+        "text": "lines.append(\"- No sampled robot state topic.\")"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 583,
+        "text": "lines += [\"\", \"## Robot Control Interfaces (Read-Only Discovery)\", \"\"]"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 585,
+        "text": "items = ros[\"robot_control\"].get(kind, []) if kind != \"actions\" else ros.get(\"actions\", [])"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 590,
+        "text": "if not any(ros[\"robot_control\"].get(k) for k in (\"topics\", \"services\")) and not ros.get(\"actions\"):"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 591,
+        "text": "lines.append(\"- No command/control interfaces found by ROS discovery.\")"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 593,
+        "text": "lines.append(\"No command/control/reset interface was called by this probe.\")"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 610,
+        "text": "lines += [\"\", \"## Known Object IDs From Source\", \"\"]"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 611,
+        "text": "if summary[\"known_nut_ids\"]:"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 612,
+        "text": "for k, v in summary[\"known_nut_ids\"].items():"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 615,
+        "text": "lines.append(\"- No nut IDs found in source.\")"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 617,
+        "text": "lines += [\"\", \"## Object / Target Runtime Discovery\", \"\"]"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 618,
+        "text": "lines.append(f\"- Object candidates: `{len(ros.get('objects', []))}`\")"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 619,
+        "text": "lines.append(f\"- Target candidates: `{len(ros.get('targets', []))}`\")"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 620,
+        "text": "lines.append(\"- Runtime pose availability is recorded in `outputs/runtime_probe/runtime_probe.json`.\")"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 622,
+        "text": "lines += [\"\", \"## Reset / Episode Interfaces\", \"\"]"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 623,
+        "text": "if ros[\"reset\"].get(\"interfaces\"):"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 624,
+        "text": "for item in ros[\"reset\"][\"interfaces\"]:"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 627,
+        "text": "lines.append(\"- No reset interface found by ROS discovery.\")"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 628,
+        "text": "if static.get(\"reset_examples\"):"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 629,
+        "text": "lines.append(\"- Static reset-related source matches exist; inspect JSON for exact file/line.\")"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 633,
+        "text": "lines.append(f\"- Control/example matches: `{len(static.get('control_examples', []))}`\")"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 648,
+        "text": "print(\"Cameras:\")"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 649,
+        "text": "for cam in ros.get(\"cameras\", []):"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 653,
+        "text": "if not ros.get(\"cameras\"):"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 655,
+        "text": "print(\"Robot state:\")"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 656,
+        "text": "for st in ros[\"robot_state\"].get(\"samples\", []):"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 657,
+        "text": "print(f\"  {st['topic']} joints={st.get('joint_count')} pos_shape={st.get('position_shape')} fps={st.get('fps', {}).get('avg_fps')} status={st.get('status')}\")"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 658,
+        "text": "if not ros[\"robot_state\"].get(\"samples\"):"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 660,
+        "text": "print(\"Robot control:\")"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 661,
+        "text": "for item in ros[\"robot_control\"].get(\"topics\", []):"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 663,
+        "text": "for item in ros[\"robot_control\"].get(\"services\", []):"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 665,
+        "text": "if not ros[\"robot_control\"].get(\"topics\") and not ros[\"robot_control\"].get(\"services\"):"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 667,
+        "text": "print(\"Nut objects:\")"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 668,
+        "text": "for k, v in summary[\"known_nut_ids\"].items():"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 670,
+        "text": "if not summary[\"known_nut_ids\"]:"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 672,
+        "text": "print(\"Target regions:\")"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 673,
+        "text": "for item in ros.get(\"targets\", [])[:20]:"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 675,
+        "text": "if not ros.get(\"targets\"):"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 677,
+        "text": "print(\"Reset:\")"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 678,
+        "text": "for item in ros[\"reset\"].get(\"interfaces\", []):"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 680,
+        "text": "if not ros[\"reset\"].get(\"interfaces\"):"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 682,
+        "text": "print(\"Camera FPS:\")"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 683,
+        "text": "print(f\"  {data['ros_probe']['frequencies'].get('camera_topics', [])}\")"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 684,
+        "text": "print(\"State FPS:\")"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 685,
+        "text": "print(f\"  {data['ros_probe']['frequencies'].get('robot_state_topics', [])}\")"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 686,
+        "text": "print(f\"Can read nut pose: {summary['can_read_nut_pose']}\")"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 687,
+        "text": "print(f\"Can control arm: {summary['can_control_arm']}\")"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 688,
+        "text": "print(f\"Can control hand: {summary['can_control_hand']}\")"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 695,
+        "text": "parser.add_argument(\"--save-images\", action=\"store_true\", help=\"Save first safe RGB/mono frame per camera.\")"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 711,
+        "text": "data[\"ros_probe\"] = RosRuntimeProbe(args.duration, output_dir, args.save_images, args.verbose).run()"
+      }
+    ],
+    "known_ids": {
+      "WORLD_ID": "ww4b1e6f8392584c89902a6783a9f53075",
+      "NUT_A_ID": "thing_3eb64241-4166-4c4e-9144-edf733c885f1",
+      "NUT_B_ID": "thing_e937f633-faed-4b2e-b609-a7b80825a64a",
+      "NUT_C_ID": "thing_4a38ffae-a85b-43c9-8b20-abb0cf6dcac7",
+      "RIGHT_ARM_ID": "r412d237980e3167577d7aece10f7aedb",
+      "RIGHT_HAND_ID": "rcd72e2daf71f064c29aa45d4eeceeca9",
+      "LEFT_ARM_ID": "rbd03ebf4ebf83c6a6a64754454bc520a",
+      "LEFT_HAND_ID": "r136d7b4b6e527ea3875679b4bf7eeb7d"
+    },
+    "control_examples": [
+      {
+        "file": "README.md",
+        "line": 308,
+        "text": "4. 在 `tools.py` 写工具 handler 直接用 `agent.arm.move_to(...)` 即可"
+      },
+      {
+        "file": "README.md",
+        "line": 326,
+        "text": "然后在 `tools.py` 的 handler 里调 `agent.arm.move_to(...)` / `agent.gripper.grasp()`。"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 6,
+        "text": "from rabo_dev_kit import SetEntityPose"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 36,
+        "text": "pose_setter = SetEntityPose(world=WORLD_ID)"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 37,
+        "text": "pose_setter.set("
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 56,
+        "text": "right_arm.move_joints([-1.57, -1.5, 0, -1.57, 0, -1, 0])"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 57,
+        "text": "right_arm.move_joints([0, 0, 0, -2, 0, 1, 0])"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 61,
+        "text": "left_arm.move_joints([0, -1.57, 0, 0, 0, 0, 0])"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 62,
+        "text": "left_arm.move_joints([-1.57, -0.7, 0, 0, 0, 0, 0])"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 78,
+        "text": "right_arm.move_to(target_x, target_y, -0.33, roll=0, pitch=0.8, yaw=0)"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 85,
+        "text": "right_hand.clench(thumb_rotation=1.0)"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 90,
+        "text": "right_hand.grasp_force(strength=1, fingers=[1, 3, 4])"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 98,
+        "text": "right_arm.move_to(-0.4, 0.12, -0.03, roll=0, pitch=0.8, yaw=0)"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 99,
+        "text": "right_arm.move_to(-0.4, 0, -0.03, roll=0, pitch=0.8, yaw=0)"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 102,
+        "text": "left_arm.move_to(0.43, 0.3, -0.1, roll=0, pitch=1.3, yaw=1.57)"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 115,
+        "text": "left_arm.move_to(0.44, 0.06, -0.2, roll=0, pitch=1.3, yaw=1.57)"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 116,
+        "text": "left_hand.clench(0.3, 0, 0.3, 0.3, 0.3, 0.3)  # 左手指微张预备"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 122,
+        "text": "right_hand.clench(0, 0, 0, 0, 0, 0)            # 右手完全张开释放"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 123,
+        "text": "right_arm.move_to(-0.4, 0, 0.12, roll=0, pitch=0.8, yaw=0)"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 129,
+        "text": "left_hand.clench(1, 0, 0.3, 0.3, 0.3, 0.3)    # 拇指内扣, 四指微合"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 130,
+        "text": "left_hand.grasp_force(strength=0.5)"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 136,
+        "text": "left_arm.move_to(0.43, 0.25, -0.2, roll=0, pitch=0, yaw=0)"
+      },
+      {
+        "file": "agents/arm_hand_demo/__init__.py",
+        "line": 137,
+        "text": "left_hand.clench(0, 0, 0, 0, 0, 0)             # 左手张开释放"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 446,
+        "text": "if any(k in low for k in (\"move_joints\", \"move_to\", \"clench\", \"grasp_force\", \"setentitypose\", \".set(\")):"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 474,
+        "text": "for name in (\"LinkerArmA7\", \"LinkerHandO6Right\", \"LinkerHandO6Left\", \"SetEntityPose\", \"RemoteControl\"):"
+      }
+    ],
+    "reset_examples": [
+      {
+        "file": "docs/RABO_RUNTIME_REPORT.md",
+        "line": 35,
+        "text": "No command/control/reset interface was called by this probe."
+      },
+      {
+        "file": "docs/RABO_RUNTIME_REPORT.md",
+        "line": 49,
+        "text": "## Reset / Episode Interfaces"
+      },
+      {
+        "file": "docs/RABO_RUNTIME_REPORT.md",
+        "line": 51,
+        "text": "- No reset interface found by ROS discovery."
+      },
+      {
+        "file": "docs/RABO_RUNTIME_REPORT.md",
+        "line": 52,
+        "text": "- Static reset-related source matches exist; inspect JSON for exact file/line."
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 28,
+        "text": "\"reset\": [\"reset\", \"reset_scene\", \"reset_env\", \"reset_episode\", \"restart\"],"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 32,
+        "text": "\"camera|image|rgb|joint|qpos|state|command|control|arm|hand|o6|a7|p7|nut|object|pose|target|reset|expert|demo|pick|place\""
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 199,
+        "text": "\"reset\": {\"interfaces\": []},"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 269,
+        "text": "if \"reset\" in item[\"categories\"]:"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 270,
+        "text": "self.report[\"reset\"][\"interfaces\"].append({\"kind\": \"topic\", **item})"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 286,
+        "text": "if \"reset\" in item[\"categories\"]:"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 287,
+        "text": "self.report[\"reset\"][\"interfaces\"].append({\"kind\": \"service\", **item})"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 428,
+        "text": "\"reset_examples\": [],"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 448,
+        "text": "if \"reset\" in low or \"restart\" in low:"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 449,
+        "text": "out[\"reset_examples\"].append(record)"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 593,
+        "text": "lines.append(\"No command/control/reset interface was called by this probe.\")"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 622,
+        "text": "lines += [\"\", \"## Reset / Episode Interfaces\", \"\"]"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 623,
+        "text": "if ros[\"reset\"].get(\"interfaces\"):"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 624,
+        "text": "for item in ros[\"reset\"][\"interfaces\"]:"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 627,
+        "text": "lines.append(\"- No reset interface found by ROS discovery.\")"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 628,
+        "text": "if static.get(\"reset_examples\"):"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 629,
+        "text": "lines.append(\"- Static reset-related source matches exist; inspect JSON for exact file/line.\")"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 677,
+        "text": "print(\"Reset:\")"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 678,
+        "text": "for item in ros[\"reset\"].get(\"interfaces\", []):"
+      },
+      {
+        "file": "tools/inspect_rabo_runtime.py",
+        "line": 680,
+        "text": "if not ros[\"reset\"].get(\"interfaces\"):"
+      }
+    ],
+    "sdk_imports": {
+      "rabo_robocap": {
+        "available": false,
+        "error": "ModuleNotFoundError(\"No module named 'rabo_robocap'\")"
+      },
+      "rabo_dev_kit": {
+        "available": false,
+        "error": "ModuleNotFoundError(\"No module named 'rabo_dev_kit'\")"
+      }
+    }
+  },
+  "ros_probe": {
+    "ros": {
+      "available": true,
+      "errors": [],
+      "nodes": [
+        "rabo_runtime_readonly_probe"
+      ]
+    },
+    "topics": [
+      {
+        "name": "/parameter_events",
+        "types": [
+          "rcl_interfaces/msg/ParameterEvent"
+        ],
+        "categories": [],
+        "publishers": [
+          {
+            "node_name": "rabo_runtime_readonly_probe",
+            "node_namespace": "/",
+            "topic_type": "rcl_interfaces/msg/ParameterEvent",
+            "endpoint_type": "TopicEndpointTypeEnum.PUBLISHER",
+            "gid": "[1, 15, 49, 87, 158, 217, 176, 6, 0, 0, 0, 0, 0, 0, 4, 3, 0, 0, 0, 0, 0, 0, 0, 0]",
+            "qos": {
+              "reliability": "ReliabilityPolicy.RELIABLE",
+              "durability": "DurabilityPolicy.VOLATILE",
+              "history": "HistoryPolicy.UNKNOWN",
+              "depth": 0
+            }
+          }
+        ],
+        "subscribers": [],
+        "publisher_count": 1,
+        "subscriber_count": 0
+      },
+      {
+        "name": "/rosout",
+        "types": [
+          "rcl_interfaces/msg/Log"
+        ],
+        "categories": [],
+        "publishers": [
+          {
+            "node_name": "rabo_runtime_readonly_probe",
+            "node_namespace": "/",
+            "topic_type": "rcl_interfaces/msg/Log",
+            "endpoint_type": "TopicEndpointTypeEnum.PUBLISHER",
+            "gid": "[1, 15, 49, 87, 158, 217, 176, 6, 0, 0, 0, 0, 0, 0, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0]",
+            "qos": {
+              "reliability": "ReliabilityPolicy.RELIABLE",
+              "durability": "DurabilityPolicy.TRANSIENT_LOCAL",
+              "history": "HistoryPolicy.UNKNOWN",
+              "depth": 0
+            }
+          }
+        ],
+        "subscribers": [],
+        "publisher_count": 1,
+        "subscriber_count": 0
+      }
+    ],
+    "services": [
+      {
+        "name": "/rabo_runtime_readonly_probe/describe_parameters",
+        "types": [
+          "rcl_interfaces/srv/DescribeParameters"
+        ],
+        "categories": []
+      },
+      {
+        "name": "/rabo_runtime_readonly_probe/get_parameter_types",
+        "types": [
+          "rcl_interfaces/srv/GetParameterTypes"
+        ],
+        "categories": []
+      },
+      {
+        "name": "/rabo_runtime_readonly_probe/get_parameters",
+        "types": [
+          "rcl_interfaces/srv/GetParameters"
+        ],
+        "categories": []
+      },
+      {
+        "name": "/rabo_runtime_readonly_probe/list_parameters",
+        "types": [
+          "rcl_interfaces/srv/ListParameters"
+        ],
+        "categories": []
+      },
+      {
+        "name": "/rabo_runtime_readonly_probe/set_parameters",
+        "types": [
+          "rcl_interfaces/srv/SetParameters"
+        ],
+        "categories": []
+      },
+      {
+        "name": "/rabo_runtime_readonly_probe/set_parameters_atomically",
+        "types": [
+          "rcl_interfaces/srv/SetParametersAtomically"
+        ],
+        "categories": []
+      }
+    ],
+    "actions": [],
+    "cameras": [],
+    "robot_state": {
+      "topics": [],
+      "samples": []
+    },
+    "robot_control": {
+      "topics": [],
+      "services": [],
+      "actions": []
+    },
+    "objects": [],
+    "targets": [],
+    "reset": {
+      "interfaces": []
+    },
+    "frequencies": {
+      "robot_state_topics": [],
+      "camera_topics": []
+    }
+  },
+  "summary": {
+    "camera_count": 0,
+    "robot_state_topic_count": 0,
+    "robot_control_interface_count": 0,
+    "known_nut_ids": {
+      "NUT_A_ID": "thing_3eb64241-4166-4c4e-9144-edf733c885f1",
+      "NUT_B_ID": "thing_e937f633-faed-4b2e-b609-a7b80825a64a",
+      "NUT_C_ID": "thing_4a38ffae-a85b-43c9-8b20-abb0cf6dcac7"
+    },
+    "can_read_nut_pose": "NO",
+    "can_control_arm": "NOT FOUND",
+    "can_control_hand": "NOT FOUND"
+  }
+}
