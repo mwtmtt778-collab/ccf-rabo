@@ -27,9 +27,16 @@ import sys
 
 # 平台无参启动时运行的 agent —— 换 agent 就改这里(本地调试也可用命令行参数覆盖)。
 DEFAULT_AGENT = "arm_hand_demo"
+RUN_ROBOT_STATE_TEST_ON_DEFAULT_START = True
 
 
 def main():
+    if len(sys.argv) == 1 and RUN_ROBOT_STATE_TEST_ON_DEFAULT_START:
+        from tools.test_robot_state import main as test_robot_state_main
+
+        test_robot_state_main()
+        return
+
     name = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_AGENT
 
     try:
