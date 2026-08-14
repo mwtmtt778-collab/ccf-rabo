@@ -1,0 +1,77 @@
+# Rabo Three-Nut Expert Implementation Report
+
+## 1. Result
+
+Overall: PASS
+
+## 2. Safety Mode
+
+- Execute: `False`
+- Default runner mode is dry-run. Robot motion requires explicit `--execute`.
+
+## 3. Source Of Truth
+
+- agents/arm_hand_demo/__init__.py and docs/legacy/arm_hand_demo_legacy_snapshot.py
+- The legacy `agents/arm_hand_demo/__init__.py` file was not rewritten.
+- Snapshot: `docs/legacy/arm_hand_demo_legacy_snapshot.py`
+
+## 4. Device IDs
+
+- RIGHT_ARM: `r412d237980e3167577d7aece10f7aedb`
+- RIGHT_HAND: `rcd72e2daf71f064c29aa45d4eeceeca9`
+- LEFT_ARM: `rbd03ebf4ebf83c6a6a64754454bc520a`
+- LEFT_HAND: `r136d7b4b6e527ea3875679b4bf7eeb7d`
+
+## 5. Single-Nut Contract
+
+- Proven nut: `B`
+- Right arm base XY: `[-0.6816, -0.004]`
+- Grasp transform: `target_x = base_x - nut_x + 0.06; target_y = base_y - nut_y - 0.01; z=-0.33; rpy=(0,0.8,0)`
+- Right grasp force: `{'strength': 1.0, 'fingers': [1, 3, 4]}`
+- Left grasp force: `{'strength': 0.5, 'fingers': None}`
+
+## 6. Gates
+
+- dry-run plan renders without importing Rabo SDK
+- cloud single B execute succeeds 5-10 times
+- only then run A/C single validation
+- only then run three-nut sequence
+- camera gate must pass before Recorder
+
+## 7. Current Run Results
+
+| Mode | Nuts | Execute | Success | Steps Planned | Steps Executed | Error |
+| --- | --- | --- | --- | ---: | ---: | --- |
+| three | A,B,C | False | True | 57 | 0 |  |
+
+## 8. Unknowns
+
+- A/C staged spawn/place poses are not proven
+- RGB camera frames are unstable in latest runtime map
+- no read-only object pose API has been confirmed
+
+## 9. Cloud Commands
+
+Dry-run contract:
+
+```bash
+python3 tools/run_three_nut_expert.py --mode contract
+```
+
+Single B execute gate:
+
+```bash
+python3 tools/run_three_nut_expert.py --mode single --nut B --trials 1 --execute
+```
+
+Three-nut execute only after single gates pass:
+
+```bash
+python3 tools/run_three_nut_expert.py --mode three --order A,B,C --execute
+```
+
+## 10. Final Decision
+
+- READY_FOR_SINGLE_NUT_CLOUD_TEST: YES
+- READY_FOR_THREE_NUT_BATCH: NO until single B and A/C gates pass.
+- READY_FOR_RECORDER: NO until camera gate is fixed.
