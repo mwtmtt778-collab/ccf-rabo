@@ -694,13 +694,15 @@ def main() -> int:
     parser.add_argument("--duration", type=float, default=8.0, help="Read-only sampling duration in seconds.")
     parser.add_argument("--save-images", action="store_true", help="Save first safe RGB/mono frame per camera.")
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/runtime_probe"))
+    parser.add_argument("--report-path", type=Path, default=Path("outputs/runtime_probe/latest_report.md"))
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
     root = repo_root()
     output_dir = args.output_dir if args.output_dir.is_absolute() else root / args.output_dir
+    report_path = args.report_path if args.report_path.is_absolute() else root / args.report_path
     output_dir.mkdir(parents=True, exist_ok=True)
-    (root / "docs").mkdir(parents=True, exist_ok=True)
+    report_path.parent.mkdir(parents=True, exist_ok=True)
 
     data: dict[str, Any] = {
         "environment": collect_environment(root),
@@ -715,10 +717,10 @@ def main() -> int:
 
     json_path = output_dir / "runtime_probe.json"
     json_path.write_text(json.dumps(ensure_jsonable(data), indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    write_markdown(data, root / "docs" / "RABO_RUNTIME_REPORT.md")
+    write_markdown(data, report_path)
     print_summary(data)
     print(f"Saved JSON: {json_path}")
-    print(f"Saved Markdown: {root / 'docs' / 'RABO_RUNTIME_REPORT.md'}")
+    print(f"Saved Markdown: {report_path}")
     return 0
 
 

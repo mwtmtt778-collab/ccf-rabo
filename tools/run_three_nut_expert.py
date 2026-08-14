@@ -18,7 +18,7 @@ from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "outputs" / "three_nut_expert"
-DEFAULT_REPORT = PROJECT_ROOT / "docs" / "RABO_THREE_NUT_EXPERT_IMPLEMENTATION_REPORT.md"
+DEFAULT_REPORT = DEFAULT_OUTPUT_DIR / "latest_report.md"
 DEFAULT_LOG = PROJECT_ROOT / "logs" / "three_nut_expert.log"
 
 if str(PROJECT_ROOT) not in sys.path:

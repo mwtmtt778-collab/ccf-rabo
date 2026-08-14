@@ -18,7 +18,7 @@ from typing import Any, Callable
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "outputs" / "camera_test"
 DEFAULT_LOG_PATH = PROJECT_ROOT / "logs" / "camera_test.log"
-DEFAULT_REPORT_PATH = PROJECT_ROOT / "docs" / "RABO_CAMERA_TEST_REPORT.md"
+DEFAULT_REPORT_PATH = DEFAULT_OUTPUT_DIR / "latest_report.md"
 
 KNOWN_CAMERAS = {
     "fixed_rgb": "r6ef2dc_tp_cam_303d2b1ce0",

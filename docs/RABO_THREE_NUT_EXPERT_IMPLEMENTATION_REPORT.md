@@ -1,4 +1,16 @@
-# Rabo Three-Nut Expert Implementation Report
+# Rabo Three-Nut Expert Implementation
+
+> 注意：
+> 本文件为实现设计/阶段说明，不再由运行脚本自动覆盖。
+>
+> 最新运行报告：
+> `outputs/three_nut_expert/latest_report.md`
+>
+> 原始日志：
+> `logs/three_nut_expert.log`
+>
+> 最新结构化结果：
+> `outputs/three_nut_expert/three_nut_expert_result.json`
 
 ## 1. Result
 

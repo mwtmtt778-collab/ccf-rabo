@@ -31,7 +31,7 @@ from typing import Any, Callable
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "outputs" / "runtime_interface_map"
 DEFAULT_LOG_PATH = PROJECT_ROOT / "logs" / "runtime_interface_map.log"
-DEFAULT_REPORT_PATH = PROJECT_ROOT / "docs" / "RABO_RUNTIME_INTERFACE_MAP_REPORT.md"
+DEFAULT_REPORT_PATH = DEFAULT_OUTPUT_DIR / "latest_report.md"
 DEFAULT_JSON_PATH = DEFAULT_OUTPUT_DIR / "runtime_interface_map.json"
 ARM_HAND_DEMO = PROJECT_ROOT / "agents" / "arm_hand_demo" / "__init__.py"
 

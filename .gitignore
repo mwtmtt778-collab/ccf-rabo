@@ -32,3 +32,14 @@ node_modules/
 # Logs / 临时
 *.log
 *.tmp
+
+# ==========================================================
+# Runtime generated artifacts
+# ==========================================================
+logs/
+outputs/
+
+# Python runtime
+__pycache__/
+*.pyc
+*.pyo
