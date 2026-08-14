@@ -1,27 +1,29 @@
 {
   "environment": {
-    "generated_at": "2026-08-13T18:17:54+0800",
-    "hostname": "liyi",
-    "pwd": "/home/liyi/agent_system",
-    "python_version": "3.10.12 (main, Jun 22 2026, 18:55:27) [GCC 11.4.0]",
-    "platform": "Linux-6.8.0-124-generic-x86_64-with-glibc2.35",
-    "ros_distro": "humble",
+    "generated_at": "2026-08-13T18:19:53+0800",
+    "hostname": "cp-uf600987oh3955agnbz0-n6nf4",
+    "pwd": "/workspace/agent_system",
+    "python_version": "3.12.3 (main, Jun 19 2026, 12:46:00) [GCC 13.3.0]",
+    "platform": "Linux-5.10.134-18.0.12.lifsea8.x86_64-x86_64-with-glibc2.39",
+    "ros_distro": "jazzy",
     "ros_domain_id": null,
-    "rmw_implementation": null,
-    "pythonpath": "/opt/ros/humble/lib/python3.10/site-packages:/opt/ros/humble/local/lib/python3.10/dist-packages",
+    "rmw_implementation": "rmw_cyclonedds_cpp",
+    "pythonpath": "/opt/ros/jazzy/lib/python3.12/site-packages",
     "ros2_cli": {
       "which": {
         "available": true,
         "returncode": 0,
         "stdout": [
-          "/opt/ros/humble/bin/ros2"
+          "/opt/ros/jazzy/bin/ros2"
         ],
         "stderr": []
       },
       "node_list": {
         "available": true,
         "returncode": 0,
-        "stdout": [],
+        "stdout": [
+          "/gs_1eebee6f37512bbc1d125b25511e912c/a_e255522bcca5aa8fca2b94d0f0344c77"
+        ],
         "stderr": []
       },
       "topic_list": {
@@ -675,62 +677,62 @@
       },
       {
         "file": "docs/RABO_RUNTIME_REPORT.md",
-        "line": 37,
+        "line": 52,
         "text": "## Known Object IDs From Source"
       },
       {
         "file": "docs/RABO_RUNTIME_REPORT.md",
-        "line": 39,
+        "line": 54,
         "text": "- `NUT_A_ID`: `thing_3eb64241-4166-4c4e-9144-edf733c885f1`"
       },
       {
         "file": "docs/RABO_RUNTIME_REPORT.md",
-        "line": 40,
+        "line": 55,
         "text": "- `NUT_B_ID`: `thing_e937f633-faed-4b2e-b609-a7b80825a64a`"
       },
       {
         "file": "docs/RABO_RUNTIME_REPORT.md",
-        "line": 41,
+        "line": 56,
         "text": "- `NUT_C_ID`: `thing_4a38ffae-a85b-43c9-8b20-abb0cf6dcac7`"
       },
       {
         "file": "docs/RABO_RUNTIME_REPORT.md",
-        "line": 43,
+        "line": 58,
         "text": "## Object / Target Runtime Discovery"
       },
       {
         "file": "docs/RABO_RUNTIME_REPORT.md",
-        "line": 45,
+        "line": 60,
         "text": "- Object candidates: `0`"
       },
       {
         "file": "docs/RABO_RUNTIME_REPORT.md",
-        "line": 46,
+        "line": 61,
         "text": "- Target candidates: `0`"
       },
       {
         "file": "docs/RABO_RUNTIME_REPORT.md",
-        "line": 47,
+        "line": 62,
         "text": "- Runtime pose availability is recorded in `outputs/runtime_probe/runtime_probe.json`."
       },
       {
         "file": "docs/RABO_RUNTIME_REPORT.md",
-        "line": 49,
+        "line": 64,
         "text": "## Reset / Episode Interfaces"
       },
       {
         "file": "docs/RABO_RUNTIME_REPORT.md",
-        "line": 51,
+        "line": 66,
         "text": "- No reset interface found by ROS discovery."
       },
       {
         "file": "docs/RABO_RUNTIME_REPORT.md",
-        "line": 52,
+        "line": 67,
         "text": "- Static reset-related source matches exist; inspect JSON for exact file/line."
       },
       {
         "file": "docs/RABO_RUNTIME_REPORT.md",
-        "line": 57,
+        "line": 72,
         "text": "- Control/example matches: `25`"
       },
       {
@@ -1759,17 +1761,17 @@
       },
       {
         "file": "docs/RABO_RUNTIME_REPORT.md",
-        "line": 49,
+        "line": 64,
         "text": "## Reset / Episode Interfaces"
       },
       {
         "file": "docs/RABO_RUNTIME_REPORT.md",
-        "line": 51,
+        "line": 66,
         "text": "- No reset interface found by ROS discovery."
       },
       {
         "file": "docs/RABO_RUNTIME_REPORT.md",
-        "line": 52,
+        "line": 67,
         "text": "- Static reset-related source matches exist; inspect JSON for exact file/line."
       },
       {
@@ -1875,12 +1877,384 @@
     ],
     "sdk_imports": {
       "rabo_robocap": {
-        "available": false,
-        "error": "ModuleNotFoundError(\"No module named 'rabo_robocap'\")"
+        "available": true,
+        "file": "/opt/rabo-venvs/agent_system/lib/python3.12/site-packages/rabo_robocap/__init__.py",
+        "classes": {
+          "LinkerArmA7": {
+            "methods": [
+              "add_on_set_parameters_callback",
+              "add_post_set_parameters_callback",
+              "add_pre_set_parameters_callback",
+              "add_waitable",
+              "count_clients",
+              "count_publishers",
+              "count_services",
+              "count_subscribers",
+              "create_client",
+              "create_guard_condition",
+              "create_publisher",
+              "create_rate",
+              "create_service",
+              "create_subscription",
+              "create_timer",
+              "declare_parameter",
+              "declare_parameters",
+              "describe_parameter",
+              "describe_parameters",
+              "destroy_client",
+              "destroy_guard_condition",
+              "destroy_node",
+              "destroy_publisher",
+              "destroy_rate",
+              "destroy_service",
+              "destroy_subscription",
+              "destroy_timer",
+              "get_client_names_and_types_by_node",
+              "get_clock",
+              "get_fully_qualified_name",
+              "get_fully_qualified_node_names",
+              "get_joint_angles",
+              "get_logger",
+              "get_name",
+              "get_namespace",
+              "get_node_names",
+              "get_node_names_and_namespaces",
+              "get_node_names_and_namespaces_with_enclaves",
+              "get_parameter",
+              "get_parameter_or",
+              "get_parameter_type",
+              "get_parameter_types",
+              "get_parameters",
+              "get_parameters_by_prefix",
+              "get_pose",
+              "get_publisher_names_and_types_by_node",
+              "get_publishers_info_by_topic",
+              "get_service_names_and_types",
+              "get_service_names_and_types_by_node",
+              "get_subscriber_names_and_types_by_node",
+              "get_subscriptions_info_by_topic",
+              "get_topic_names_and_types",
+              "has_parameter",
+              "home",
+              "is_moving",
+              "list_parameters",
+              "move_joints",
+              "move_to",
+              "pose_check",
+              "remove_on_set_parameters_callback",
+              "remove_post_set_parameters_callback",
+              "remove_pre_set_parameters_callback",
+              "remove_waitable",
+              "resolve_service_name",
+              "resolve_topic_name",
+              "set_descriptor",
+              "set_parameters",
+              "set_parameters_atomically",
+              "shutdown",
+              "stop",
+              "undeclare_parameter",
+              "wait_for_node"
+            ]
+          },
+          "LinkerHandO6Right": {
+            "methods": [
+              "add_on_set_parameters_callback",
+              "add_post_set_parameters_callback",
+              "add_pre_set_parameters_callback",
+              "add_waitable",
+              "close",
+              "count_clients",
+              "count_publishers",
+              "count_services",
+              "count_subscribers",
+              "create_client",
+              "create_guard_condition",
+              "create_publisher",
+              "create_rate",
+              "create_service",
+              "create_subscription",
+              "create_timer",
+              "declare_parameter",
+              "declare_parameters",
+              "describe_parameter",
+              "describe_parameters",
+              "destroy_client",
+              "destroy_guard_condition",
+              "destroy_node",
+              "destroy_publisher",
+              "destroy_rate",
+              "destroy_service",
+              "destroy_subscription",
+              "destroy_timer",
+              "get_client_names_and_types_by_node",
+              "get_clock",
+              "get_fully_qualified_name",
+              "get_fully_qualified_node_names",
+              "get_joint_angles",
+              "get_joint_forces",
+              "get_logger",
+              "get_name",
+              "get_namespace",
+              "get_node_names",
+              "get_node_names_and_namespaces",
+              "get_node_names_and_namespaces_with_enclaves",
+              "get_parameter",
+              "get_parameter_or",
+              "get_parameter_type",
+              "get_parameter_types",
+              "get_parameters",
+              "get_parameters_by_prefix",
+              "get_publisher_names_and_types_by_node",
+              "get_publishers_info_by_topic",
+              "get_service_names_and_types",
+              "get_service_names_and_types_by_node",
+              "get_subscriber_names_and_types_by_node",
+              "get_subscriptions_info_by_topic",
+              "get_topic_names_and_types",
+              "grasp_force",
+              "has_parameter",
+              "home",
+              "is_moving",
+              "list_parameters",
+              "move_joints",
+              "open",
+              "remove_on_set_parameters_callback",
+              "remove_post_set_parameters_callback",
+              "remove_pre_set_parameters_callback",
+              "remove_waitable",
+              "resolve_service_name",
+              "resolve_topic_name",
+              "set_descriptor",
+              "set_parameters",
+              "set_parameters_atomically",
+              "shutdown",
+              "stop",
+              "undeclare_parameter",
+              "wait_for_node"
+            ]
+          },
+          "LinkerHandO6Left": {
+            "methods": [
+              "add_on_set_parameters_callback",
+              "add_post_set_parameters_callback",
+              "add_pre_set_parameters_callback",
+              "add_waitable",
+              "close",
+              "count_clients",
+              "count_publishers",
+              "count_services",
+              "count_subscribers",
+              "create_client",
+              "create_guard_condition",
+              "create_publisher",
+              "create_rate",
+              "create_service",
+              "create_subscription",
+              "create_timer",
+              "declare_parameter",
+              "declare_parameters",
+              "describe_parameter",
+              "describe_parameters",
+              "destroy_client",
+              "destroy_guard_condition",
+              "destroy_node",
+              "destroy_publisher",
+              "destroy_rate",
+              "destroy_service",
+              "destroy_subscription",
+              "destroy_timer",
+              "get_client_names_and_types_by_node",
+              "get_clock",
+              "get_fully_qualified_name",
+              "get_fully_qualified_node_names",
+              "get_joint_angles",
+              "get_joint_forces",
+              "get_logger",
+              "get_name",
+              "get_namespace",
+              "get_node_names",
+              "get_node_names_and_namespaces",
+              "get_node_names_and_namespaces_with_enclaves",
+              "get_parameter",
+              "get_parameter_or",
+              "get_parameter_type",
+              "get_parameter_types",
+              "get_parameters",
+              "get_parameters_by_prefix",
+              "get_publisher_names_and_types_by_node",
+              "get_publishers_info_by_topic",
+              "get_service_names_and_types",
+              "get_service_names_and_types_by_node",
+              "get_subscriber_names_and_types_by_node",
+              "get_subscriptions_info_by_topic",
+              "get_topic_names_and_types",
+              "grasp_force",
+              "has_parameter",
+              "home",
+              "is_moving",
+              "list_parameters",
+              "move_joints",
+              "open",
+              "remove_on_set_parameters_callback",
+              "remove_post_set_parameters_callback",
+              "remove_pre_set_parameters_callback",
+              "remove_waitable",
+              "resolve_service_name",
+              "resolve_topic_name",
+              "set_descriptor",
+              "set_parameters",
+              "set_parameters_atomically",
+              "shutdown",
+              "stop",
+              "undeclare_parameter",
+              "wait_for_node"
+            ]
+          }
+        }
       },
       "rabo_dev_kit": {
-        "available": false,
-        "error": "ModuleNotFoundError(\"No module named 'rabo_dev_kit'\")"
+        "available": true,
+        "file": "/opt/rabo-venvs/agent_system/lib/python3.12/site-packages/rabo_dev_kit/__init__.py",
+        "classes": {
+          "SetEntityPose": {
+            "methods": [
+              "add_on_set_parameters_callback",
+              "add_post_set_parameters_callback",
+              "add_pre_set_parameters_callback",
+              "add_waitable",
+              "count_clients",
+              "count_publishers",
+              "count_services",
+              "count_subscribers",
+              "create_client",
+              "create_guard_condition",
+              "create_publisher",
+              "create_rate",
+              "create_service",
+              "create_subscription",
+              "create_timer",
+              "declare_parameter",
+              "declare_parameters",
+              "describe_parameter",
+              "describe_parameters",
+              "destroy",
+              "destroy_client",
+              "destroy_guard_condition",
+              "destroy_node",
+              "destroy_publisher",
+              "destroy_rate",
+              "destroy_service",
+              "destroy_subscription",
+              "destroy_timer",
+              "get_client_names_and_types_by_node",
+              "get_clock",
+              "get_fully_qualified_name",
+              "get_fully_qualified_node_names",
+              "get_logger",
+              "get_name",
+              "get_namespace",
+              "get_node_names",
+              "get_node_names_and_namespaces",
+              "get_node_names_and_namespaces_with_enclaves",
+              "get_parameter",
+              "get_parameter_or",
+              "get_parameter_type",
+              "get_parameter_types",
+              "get_parameters",
+              "get_parameters_by_prefix",
+              "get_publisher_names_and_types_by_node",
+              "get_publishers_info_by_topic",
+              "get_service_names_and_types",
+              "get_service_names_and_types_by_node",
+              "get_subscriber_names_and_types_by_node",
+              "get_subscriptions_info_by_topic",
+              "get_topic_names_and_types",
+              "has_parameter",
+              "list_parameters",
+              "remove_on_set_parameters_callback",
+              "remove_post_set_parameters_callback",
+              "remove_pre_set_parameters_callback",
+              "remove_waitable",
+              "resolve_service_name",
+              "resolve_topic_name",
+              "set",
+              "set_descriptor",
+              "set_parameters",
+              "set_parameters_atomically",
+              "undeclare_parameter",
+              "wait_for_node"
+            ]
+          },
+          "RemoteControl": {
+            "methods": [
+              "add_on_set_parameters_callback",
+              "add_post_set_parameters_callback",
+              "add_pre_set_parameters_callback",
+              "add_waitable",
+              "count_clients",
+              "count_publishers",
+              "count_services",
+              "count_subscribers",
+              "create_client",
+              "create_guard_condition",
+              "create_publisher",
+              "create_rate",
+              "create_service",
+              "create_subscription",
+              "create_timer",
+              "declare_parameter",
+              "declare_parameters",
+              "describe_parameter",
+              "describe_parameters",
+              "destroy_client",
+              "destroy_guard_condition",
+              "destroy_node",
+              "destroy_publisher",
+              "destroy_rate",
+              "destroy_service",
+              "destroy_subscription",
+              "destroy_timer",
+              "get_client_names_and_types_by_node",
+              "get_clock",
+              "get_fully_qualified_name",
+              "get_fully_qualified_node_names",
+              "get_latest",
+              "get_logger",
+              "get_name",
+              "get_namespace",
+              "get_node_names",
+              "get_node_names_and_namespaces",
+              "get_node_names_and_namespaces_with_enclaves",
+              "get_parameter",
+              "get_parameter_or",
+              "get_parameter_type",
+              "get_parameter_types",
+              "get_parameters",
+              "get_parameters_by_prefix",
+              "get_publisher_names_and_types_by_node",
+              "get_publishers_info_by_topic",
+              "get_service_names_and_types",
+              "get_service_names_and_types_by_node",
+              "get_subscriber_names_and_types_by_node",
+              "get_subscriptions_info_by_topic",
+              "get_topic_names_and_types",
+              "has_parameter",
+              "list_parameters",
+              "remove_on_set_parameters_callback",
+              "remove_post_set_parameters_callback",
+              "remove_pre_set_parameters_callback",
+              "remove_waitable",
+              "resolve_service_name",
+              "resolve_topic_name",
+              "send",
+              "set_descriptor",
+              "set_parameters",
+              "set_parameters_atomically",
+              "undeclare_parameter",
+              "wait_for_node"
+            ]
+          }
+        }
       }
     }
   },
@@ -1889,6 +2263,7 @@
       "available": true,
       "errors": [],
       "nodes": [
+        "a_e255522bcca5aa8fca2b94d0f0344c77",
         "rabo_runtime_readonly_probe"
       ]
     },
@@ -1902,15 +2277,15 @@
         "publishers": [
           {
             "node_name": "rabo_runtime_readonly_probe",
-            "node_namespace": "/",
+            "node_namespace": "/gs_1eebee6f37512bbc1d125b25511e912c",
             "topic_type": "rcl_interfaces/msg/ParameterEvent",
-            "endpoint_type": "TopicEndpointTypeEnum.PUBLISHER",
-            "gid": "[1, 15, 49, 87, 158, 217, 176, 6, 0, 0, 0, 0, 0, 0, 4, 3, 0, 0, 0, 0, 0, 0, 0, 0]",
+            "endpoint_type": "1",
+            "gid": "[1, 16, 242, 117, 243, 149, 81, 30, 203, 91, 244, 47, 0, 0, 7, 3]",
             "qos": {
-              "reliability": "ReliabilityPolicy.RELIABLE",
-              "durability": "DurabilityPolicy.VOLATILE",
-              "history": "HistoryPolicy.UNKNOWN",
-              "depth": 0
+              "reliability": "1",
+              "durability": "2",
+              "history": "1",
+              "depth": 1000
             }
           }
         ],
@@ -1927,15 +2302,15 @@
         "publishers": [
           {
             "node_name": "rabo_runtime_readonly_probe",
-            "node_namespace": "/",
+            "node_namespace": "/gs_1eebee6f37512bbc1d125b25511e912c",
             "topic_type": "rcl_interfaces/msg/Log",
-            "endpoint_type": "TopicEndpointTypeEnum.PUBLISHER",
-            "gid": "[1, 15, 49, 87, 158, 217, 176, 6, 0, 0, 0, 0, 0, 0, 3, 3, 0, 0, 0, 0, 0, 0, 0, 0]",
+            "endpoint_type": "1",
+            "gid": "[1, 16, 242, 117, 243, 149, 81, 30, 203, 91, 244, 47, 0, 0, 6, 3]",
             "qos": {
-              "reliability": "ReliabilityPolicy.RELIABLE",
-              "durability": "DurabilityPolicy.TRANSIENT_LOCAL",
-              "history": "HistoryPolicy.UNKNOWN",
-              "depth": 0
+              "reliability": "1",
+              "durability": "1",
+              "history": "1",
+              "depth": 1000
             }
           }
         ],
@@ -1946,42 +2321,49 @@
     ],
     "services": [
       {
-        "name": "/rabo_runtime_readonly_probe/describe_parameters",
+        "name": "/gs_1eebee6f37512bbc1d125b25511e912c/rabo_runtime_readonly_probe/describe_parameters",
         "types": [
           "rcl_interfaces/srv/DescribeParameters"
         ],
         "categories": []
       },
       {
-        "name": "/rabo_runtime_readonly_probe/get_parameter_types",
+        "name": "/gs_1eebee6f37512bbc1d125b25511e912c/rabo_runtime_readonly_probe/get_parameter_types",
         "types": [
           "rcl_interfaces/srv/GetParameterTypes"
         ],
         "categories": []
       },
       {
-        "name": "/rabo_runtime_readonly_probe/get_parameters",
+        "name": "/gs_1eebee6f37512bbc1d125b25511e912c/rabo_runtime_readonly_probe/get_parameters",
         "types": [
           "rcl_interfaces/srv/GetParameters"
         ],
         "categories": []
       },
       {
-        "name": "/rabo_runtime_readonly_probe/list_parameters",
+        "name": "/gs_1eebee6f37512bbc1d125b25511e912c/rabo_runtime_readonly_probe/get_type_description",
+        "types": [
+          "type_description_interfaces/srv/GetTypeDescription"
+        ],
+        "categories": []
+      },
+      {
+        "name": "/gs_1eebee6f37512bbc1d125b25511e912c/rabo_runtime_readonly_probe/list_parameters",
         "types": [
           "rcl_interfaces/srv/ListParameters"
         ],
         "categories": []
       },
       {
-        "name": "/rabo_runtime_readonly_probe/set_parameters",
+        "name": "/gs_1eebee6f37512bbc1d125b25511e912c/rabo_runtime_readonly_probe/set_parameters",
         "types": [
           "rcl_interfaces/srv/SetParameters"
         ],
         "categories": []
       },
       {
-        "name": "/rabo_runtime_readonly_probe/set_parameters_atomically",
+        "name": "/gs_1eebee6f37512bbc1d125b25511e912c/rabo_runtime_readonly_probe/set_parameters_atomically",
         "types": [
           "rcl_interfaces/srv/SetParametersAtomically"
         ],
