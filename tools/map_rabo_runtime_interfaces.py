@@ -1097,6 +1097,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log-path", type=Path, default=DEFAULT_LOG_PATH)
     parser.add_argument("--report-path", type=Path, default=DEFAULT_REPORT_PATH)
     parser.add_argument("--json-path", type=Path, default=DEFAULT_JSON_PATH)
+    parser.add_argument(
+        "--cli-info",
+        action="store_true",
+        help="Also run ros2 topic info -v for every relevant topic. This can be slow on large live runtimes.",
+    )
     parser.add_argument("--verbose", action="store_true")
     return parser
 
@@ -1135,10 +1140,13 @@ def main(argv: list[str] | None = None) -> int:
         annotate_topics(topics, namespace)
         logger.log(f"Runtime Namespace: {namespace}")
 
-        for t in topics:
-            if t.category != "OTHER":
-                info = run_ros_topic(["info", "-v", t.name], logger, timeout=8)
-                commands.setdefault("topic_info_verbose", {})[t.name] = info
+        if args.cli_info:
+            for t in topics:
+                if t.category != "OTHER":
+                    info = run_ros_topic(["info", "-v", t.name], logger, timeout=8)
+                    commands.setdefault("topic_info_verbose", {})[t.name] = info
+        else:
+            logger.log("SKIP ros2 topic info -v full scan by default; QoS is collected via rclpy endpoint discovery.")
 
         sample_set = choose_sample_topics(topics)
         sample_topics(sample_set, args.duration, args.output_dir, logger)
