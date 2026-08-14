@@ -8,6 +8,8 @@ Overall: PASS
 
 - Execute: `False`
 - Default runner mode is dry-run. Robot motion requires explicit `--execute`.
+- `success` in this report means SDK/API completion only; physical task success must be verified visually until perception checks are added.
+- Raw log: `/home/liyi/agent_system/logs/three_nut_expert.log`
 
 ## 3. Source Of Truth
 
@@ -40,9 +42,10 @@ Overall: PASS
 
 ## 7. Current Run Results
 
-| Mode | Nuts | Execute | Success | Steps Planned | Steps Executed | Error |
-| --- | --- | --- | --- | ---: | ---: | --- |
-| three | A,B,C | False | True | 57 | 0 |  |
+| Mode | Nuts | Execute | API Success | Task Success | Steps Planned | Steps Executed | Error |
+| --- | --- | --- | --- | --- | ---: | ---: | --- |
+| single | B | False | True | UNVERIFIED_BY_SCRIPT | 19 | 0 |  |
+| single | B | False | True | UNVERIFIED_BY_SCRIPT | 19 | 0 |  |
 
 ## 8. Unknowns
 
@@ -61,7 +64,13 @@ python3 tools/run_three_nut_expert.py --mode contract
 Single B execute gate:
 
 ```bash
-python3 tools/run_three_nut_expert.py --mode single --nut B --trials 1 --execute
+python3 tools/run_three_nut_expert.py --mode single --nut B --trials 1 --no-jitter --execute
+```
+
+Diagnostic single B with extra settling:
+
+```bash
+python3 tools/run_three_nut_expert.py --mode single --nut B --trials 5 --no-jitter --settle-after-pose-s 1.0 --hold-after-grasp-s 1.0 --step-delay-s 0.2 --execute
 ```
 
 Three-nut execute only after single gates pass:

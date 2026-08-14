@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import random
-import threading
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -56,6 +55,7 @@ class ExpertRunResult:
     steps_executed: int
     error: str | None
     samples: dict[str, Any]
+    task_success: str = "UNVERIFIED"
 
 
 class ExpertExecutionError(RuntimeError):
@@ -230,12 +230,16 @@ def execute_single_nut(
     execute: bool = False,
     enable_jitter: bool = True,
     stop_on_failure: bool = True,
+    step_delay_s: float = 0.0,
+    settle_after_pose_s: float = 0.0,
+    hold_after_grasp_s: float = 0.0,
+    log_event: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> tuple[ExpertRunResult, dict[str, Any]]:
     started = time.time()
     started_text = time.strftime("%Y-%m-%d %H:%M:%S %z")
     nut_pose, steps = build_single_nut_plan(nut_key, seed=seed, enable_jitter=enable_jitter)
     plan = plan_to_dict(nut_key, nut_pose, steps)
-    samples: dict[str, Any] = {}
+    samples: dict[str, Any] = {"step_records": []}
     executed = 0
     error = None
     success = True
@@ -245,13 +249,42 @@ def execute_single_nut(
         try:
             bundle = RaboDeviceBundle()
             samples["before"] = bundle.read_state()
-            for step in steps:
+            for index, step in enumerate(steps, start=1):
+                step_started = time.time()
+                record = {
+                    "index": index,
+                    "phase": step.phase,
+                    "target": step.target,
+                    "method": step.method,
+                    "args": step.args,
+                    "kwargs": step.kwargs,
+                    "started_at": time.strftime("%Y-%m-%d %H:%M:%S %z"),
+                    "status": "STARTED",
+                }
+                samples["step_records"].append(record)
+                if log_event:
+                    log_event("STEP_START", record)
                 execute_step(bundle, step)
                 executed += 1
+                if step.method == "set_entity_pose" and settle_after_pose_s > 0:
+                    time.sleep(settle_after_pose_s)
+                if step.phase == "grasp" and step.method == "grasp_force" and hold_after_grasp_s > 0:
+                    time.sleep(hold_after_grasp_s)
+                if step_delay_s > 0:
+                    time.sleep(step_delay_s)
+                record["status"] = "OK"
+                record["duration_s"] = time.time() - step_started
+                if log_event:
+                    log_event("STEP_OK", record)
             samples["after"] = bundle.read_state()
         except Exception as exc:
             error = repr(exc)
             success = False
+            if samples.get("step_records"):
+                samples["step_records"][-1]["status"] = "ERROR"
+                samples["step_records"][-1]["error"] = error
+            if log_event:
+                log_event("RUN_ERROR", {"error": error, "steps_executed": executed})
             if stop_on_failure:
                 pass
         finally:
@@ -274,6 +307,7 @@ def execute_single_nut(
         steps_executed=executed,
         error=error,
         samples=samples,
+        task_success="UNVERIFIED_BY_SCRIPT",
     )
     return result, plan
 
@@ -284,6 +318,10 @@ def execute_three_nut(
     seed: int | None = None,
     execute: bool = False,
     enable_jitter: bool = True,
+    step_delay_s: float = 0.0,
+    settle_after_pose_s: float = 0.0,
+    hold_after_grasp_s: float = 0.0,
+    log_event: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> tuple[ExpertRunResult, dict[str, Any]]:
     order = [x.upper() for x in (order or ["A", "B", "C"])]
     started = time.time()
@@ -303,6 +341,10 @@ def execute_three_nut(
             execute=execute,
             enable_jitter=enable_jitter,
             stop_on_failure=True,
+            step_delay_s=step_delay_s,
+            settle_after_pose_s=settle_after_pose_s,
+            hold_after_grasp_s=hold_after_grasp_s,
+            log_event=log_event,
         )
         all_plans.append(plan)
         total_steps += result.steps_planned
@@ -324,6 +366,7 @@ def execute_three_nut(
         steps_executed=executed_steps,
         error=error,
         samples=samples,
+        task_success="UNVERIFIED_BY_SCRIPT",
     )
     return result, {"order": order, "plans": all_plans}
 

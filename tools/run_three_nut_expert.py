@@ -19,6 +19,7 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT_DIR = PROJECT_ROOT / "outputs" / "three_nut_expert"
 DEFAULT_REPORT = PROJECT_ROOT / "docs" / "RABO_THREE_NUT_EXPERT_IMPLEMENTATION_REPORT.md"
+DEFAULT_LOG = PROJECT_ROOT / "logs" / "three_nut_expert.log"
 
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
@@ -37,9 +38,34 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=20260814)
     parser.add_argument("--no-jitter", action="store_true")
     parser.add_argument("--execute", action="store_true", help="Actually call SetEntityPose and robot motion APIs.")
+    parser.add_argument("--step-delay-s", type=float, default=0.0, help="Sleep after every executed step.")
+    parser.add_argument("--settle-after-pose-s", type=float, default=0.5, help="Sleep after SetEntityPose before moving.")
+    parser.add_argument("--hold-after-grasp-s", type=float, default=0.5, help="Sleep after grasp_force before lifting.")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--report-path", type=Path, default=DEFAULT_REPORT)
+    parser.add_argument("--log-path", type=Path, default=DEFAULT_LOG)
     return parser
+
+
+class RunLogger:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._file = self.path.open("a", encoding="utf-8")
+
+    def close(self) -> None:
+        self._file.close()
+
+    def log(self, event: str, payload: dict[str, Any]) -> None:
+        line = {
+            "time": time.strftime("%Y-%m-%d %H:%M:%S %z"),
+            "event": event,
+            **payload,
+        }
+        text = json.dumps(line, ensure_ascii=False)
+        self._file.write(text + "\n")
+        self._file.flush()
+        print(text)
 
 
 def markdown_report(payload: dict[str, Any]) -> str:
@@ -56,6 +82,8 @@ def markdown_report(payload: dict[str, Any]) -> str:
         "",
         f"- Execute: `{payload['execute']}`",
         "- Default runner mode is dry-run. Robot motion requires explicit `--execute`.",
+        "- `success` in this report means SDK/API completion only; physical task success must be verified visually until perception checks are added.",
+        f"- Raw log: `{payload['log_path']}`",
         "",
         "## 3. Source Of Truth",
         "",
@@ -85,17 +113,18 @@ def markdown_report(payload: dict[str, Any]) -> str:
     if results:
         lines.extend(
             [
-                "| Mode | Nuts | Execute | Success | Steps Planned | Steps Executed | Error |",
-                "| --- | --- | --- | --- | ---: | ---: | --- |",
+                "| Mode | Nuts | Execute | API Success | Task Success | Steps Planned | Steps Executed | Error |",
+                "| --- | --- | --- | --- | --- | ---: | ---: | --- |",
             ]
         )
         for item in results:
             lines.append(
-                "| {mode} | {nuts} | {execute} | {success} | {planned} | {executed} | {error} |".format(
+                "| {mode} | {nuts} | {execute} | {success} | {task_success} | {planned} | {executed} | {error} |".format(
                     mode=item["mode"],
                     nuts=",".join(item["nut_keys"]),
                     execute=item["execute"],
                     success=item["success"],
+                    task_success=item.get("task_success", "UNVERIFIED"),
                     planned=item["steps_planned"],
                     executed=item["steps_executed"],
                     error=item.get("error") or "",
@@ -121,7 +150,13 @@ def markdown_report(payload: dict[str, Any]) -> str:
             "Single B execute gate:",
             "",
             "```bash",
-            "python3 tools/run_three_nut_expert.py --mode single --nut B --trials 1 --execute",
+            "python3 tools/run_three_nut_expert.py --mode single --nut B --trials 1 --no-jitter --execute",
+            "```",
+            "",
+            "Diagnostic single B with extra settling:",
+            "",
+            "```bash",
+            "python3 tools/run_three_nut_expert.py --mode single --nut B --trials 5 --no-jitter --settle-after-pose-s 1.0 --hold-after-grasp-s 1.0 --step-delay-s 0.2 --execute",
             "```",
             "",
             "Three-nut execute only after single gates pass:",
@@ -145,8 +180,10 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     args.output_dir = resolve(args.output_dir)
     args.report_path = resolve(args.report_path)
+    args.log_path = resolve(args.log_path)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     args.report_path.parent.mkdir(parents=True, exist_ok=True)
+    args.log_path.parent.mkdir(parents=True, exist_ok=True)
 
     from agents.three_nut_expert.expert import (
         build_demo_contract,
@@ -160,36 +197,71 @@ def main(argv: list[str] | None = None) -> int:
     results: list[dict[str, Any]] = []
     plans: list[dict[str, Any]] = []
     overall = "PASS"
+    logger = RunLogger(args.log_path)
 
-    if args.mode == "contract":
-        print_contract(contract)
-    elif args.mode == "single":
-        for i in range(args.trials):
-            result, plan = execute_single_nut(
-                args.nut,
-                seed=args.seed + i,
+    try:
+        logger.log(
+            "RUN_START",
+            {
+                "mode": args.mode,
+                "nut": args.nut,
+                "order": args.order,
+                "trials": args.trials,
+                "seed": args.seed,
+                "execute": args.execute,
+                "no_jitter": args.no_jitter,
+                "step_delay_s": args.step_delay_s,
+                "settle_after_pose_s": args.settle_after_pose_s,
+                "hold_after_grasp_s": args.hold_after_grasp_s,
+            },
+        )
+
+        def log_event(event: str, payload: dict[str, Any]) -> None:
+            logger.log(event, payload)
+
+        if args.mode == "contract":
+            print_contract(contract)
+        elif args.mode == "single":
+            for i in range(args.trials):
+                logger.log("TRIAL_START", {"trial": i + 1, "nut": args.nut})
+                result, plan = execute_single_nut(
+                    args.nut,
+                    seed=args.seed + i,
+                    execute=args.execute,
+                    enable_jitter=not args.no_jitter,
+                    step_delay_s=args.step_delay_s,
+                    settle_after_pose_s=args.settle_after_pose_s,
+                    hold_after_grasp_s=args.hold_after_grasp_s,
+                    log_event=log_event if args.execute else None,
+                )
+                result_dict = asdict(result)
+                results.append(result_dict)
+                plans.append(plan)
+                logger.log("TRIAL_RESULT", {"trial": i + 1, **result_dict})
+                if not result.success:
+                    overall = "FAIL"
+                    break
+        elif args.mode == "three":
+            order = [item.strip().upper() for item in args.order.split(",") if item.strip()]
+            result, plan = execute_three_nut(
+                order=order,
+                seed=args.seed,
                 execute=args.execute,
                 enable_jitter=not args.no_jitter,
+                step_delay_s=args.step_delay_s,
+                settle_after_pose_s=args.settle_after_pose_s,
+                hold_after_grasp_s=args.hold_after_grasp_s,
+                log_event=log_event if args.execute else None,
             )
-            results.append(asdict(result))
+            result_dict = asdict(result)
+            results.append(result_dict)
             plans.append(plan)
-            print(json.dumps(asdict(result), ensure_ascii=False))
+            logger.log("THREE_RESULT", result_dict)
             if not result.success:
                 overall = "FAIL"
-                break
-    elif args.mode == "three":
-        order = [item.strip().upper() for item in args.order.split(",") if item.strip()]
-        result, plan = execute_three_nut(
-            order=order,
-            seed=args.seed,
-            execute=args.execute,
-            enable_jitter=not args.no_jitter,
-        )
-        results.append(asdict(result))
-        plans.append(plan)
-        print(json.dumps(asdict(result), ensure_ascii=False))
-        if not result.success:
-            overall = "FAIL"
+    finally:
+        logger.log("RUN_END", {"overall": overall})
+        logger.close()
 
     payload: dict[str, Any] = {
         "generated": time.strftime("%Y-%m-%d %H:%M:%S %z"),
@@ -199,11 +271,16 @@ def main(argv: list[str] | None = None) -> int:
         "contract": contract,
         "results": results,
         "plans": plans,
+        "log_path": str(args.log_path),
+        "step_delay_s": args.step_delay_s,
+        "settle_after_pose_s": args.settle_after_pose_s,
+        "hold_after_grasp_s": args.hold_after_grasp_s,
     }
     write_json(args.output_dir / "three_nut_expert_result.json", payload)
     args.report_path.write_text(markdown_report(payload), encoding="utf-8")
     print(f"Report: {args.report_path}")
     print(f"JSON: {args.output_dir / 'three_nut_expert_result.json'}")
+    print(f"Log: {args.log_path}")
     return 0 if overall == "PASS" else 1
 
 
