@@ -32,8 +32,8 @@ git rev-parse HEAD
 
 ## 同步风险
 
-- [VERIFIED] 当前本地有未提交修改和未跟踪源码。
+- [VERIFIED] 当前本地有未提交修改：`expert/transforms.py`、`tools/resolve_workspace_coordinates.py`。
+- [VERIFIED] 当前 `git ls-files --others --exclude-standard` 无输出，即没有未忽略的未跟踪文件。
 - [VERIFIED] 不应在未确认前执行 `pull`、`push`、`reset`、`clean`。
-- [PENDING] `agent_system_backup.tar.gz` 当前被 Git 跟踪，建议后续评估是否从 Git 移除。
+- [VERIFIED] `agent_system_backup.tar.gz` 当前未被 Git 跟踪，且已被 `.gitignore` 覆盖。
 - [PENDING] Rabo HTML、WPS、旧 Codex 文档是否纳入 GitHub 需单独判断。
-

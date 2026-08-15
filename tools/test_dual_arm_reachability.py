@@ -12,16 +12,16 @@ import json
 import platform
 import sys
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-OUTPUT_DIR = PROJECT_ROOT / "outputs" / "arm_strategy"
-LOG_PATH = PROJECT_ROOT / "logs" / "arm_strategy.log"
-JSON_PATH = OUTPUT_DIR / "arm_strategy_summary.json"
-REPORT_PATH = OUTPUT_DIR / "ARM_STRATEGY_EVALUATION_REPORT.md"
+OUTPUT_DIR = PROJECT_ROOT / "outputs" / "arm_workspace_v2"
+LOG_PATH = PROJECT_ROOT / "logs" / "arm_workspace_v2.log"
+JSON_PATH = OUTPUT_DIR / "工作空间测试V2结果.json"
+REPORT_PATH = OUTPUT_DIR / "工作空间测试V2报告.md"
 COORD_JSON_PATH = PROJECT_ROOT / "outputs" / "arm_workspace_v2" / "坐标解析结果.json"
 
 if str(PROJECT_ROOT) not in sys.path:
@@ -29,25 +29,25 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from agents.three_nut_expert.config import (  # noqa: E402
     DEVICE_IDS,
-    GRASP_TARGET_OFFSETS,
-    LEFT_PLACE_POSES,
-    NUT_SPECS,
-    RIGHT_ARM_BASE_XY,
     Pose6,
 )
-from agents.three_nut_expert.expert import compute_right_grasp_pose, pose_to_list  # noqa: E402
+from agents.three_nut_expert.expert import pose_to_list  # noqa: E402
+from expert.transforms import transform_pose_base_to_world, transform_pose_world_to_base  # noqa: E402
 from tools.resolve_workspace_coordinates import CONFIRMED_SCENE_UI, build_coordinate_db  # noqa: E402
 
 
 @dataclass(frozen=True)
 class ArmTarget:
     target: str
+    key: str
     kind: str
     arm: str
-    pose: Pose6 | None
+    world_task_pose: list[float]
+    pose: Pose6
     source: str
     confidence: str
     note: str
+    regression_expected_pass: bool
 
 
 def ensure_dirs() -> None:
@@ -100,97 +100,113 @@ def normalize_pose_check_result(raw: Any) -> tuple[str, str, Any]:
     return "CHECK", text, value
 
 
-def build_arm_targets() -> list[ArmTarget]:
-    targets: list[ArmTarget] = []
-
-    for key, spec in NUT_SPECS.items():
-        targets.append(
-            ArmTarget(
-                target=f"Nut {key} hover",
-                kind="nut_hover",
-                arm="RIGHT_ARM",
-                pose=compute_right_grasp_pose(spec.nominal_pose),
-                source=(
-                    "agents/three_nut_expert/config.py:53-72 and "
-                    "agents/three_nut_expert/expert.py:76-85"
-                ),
-                confidence="CONFIRMED_FOR_RIGHT_ARM_FORMULA",
-                note="Right-arm hover uses the legacy world-to-right-arm formula.",
-            )
-        )
-        targets.append(
-            ArmTarget(
-                target=f"Nut {key} hover",
-                kind="nut_hover",
-                arm="LEFT_ARM",
-                pose=None,
-                source="UNKNOWN",
-                confidence="UNKNOWN",
-                note="No confirmed world-to-left-arm transform for nut hover was found.",
-            )
-        )
-
-    for key, pose in LEFT_PLACE_POSES.items():
-        targets.append(
-            ArmTarget(
-                target=f"Box {key} hover",
-                kind="box_hover",
-                arm="LEFT_ARM",
-                pose=pose,
-                source="agents/three_nut_expert/config.py:93-97",
-                confidence="INFERRED_STAGED_TARGET",
-                note="Existing left-arm place pose; target-box coordinate is not independently confirmed.",
-            )
-        )
-        targets.append(
-            ArmTarget(
-                target=f"Box {key} hover",
-                kind="box_hover",
-                arm="RIGHT_ARM",
-                pose=None,
-                source="UNKNOWN",
-                confidence="UNKNOWN",
-                note="No confirmed right-arm base-frame target-box pose was found.",
-            )
-        )
-
-    return targets
-
-
-def load_or_build_coordinate_gate(include_runtime_tf: bool) -> dict[str, Any]:
-    if COORD_JSON_PATH.exists():
-        try:
-            return json.loads(COORD_JSON_PATH.read_text(encoding="utf-8"))
-        except Exception as exc:
-            return {
-                "blocked": True,
-                "unknowns": [f"坐标解析结果读取失败：{repr(exc)}"],
-                "validation": {"right_arm_legacy": {"status": "BLOCKED"}},
-            }
-    return build_coordinate_db(include_runtime_tf=include_runtime_tf)
+def pose6_from_list(pose: list[float]) -> Pose6:
+    return Pose6(pose[0], pose[1], pose[2], pose[3], pose[4], pose[5])
 
 
 def coordinate_gate_passed(coordinates: dict[str, Any]) -> bool:
     validation = coordinates.get("validation", {}).get("right_arm_legacy", {})
-    return not coordinates.get("blocked") and validation.get("status") == "PASS"
+    official_place = coordinates.get("official_place_verification", {})
+    return (
+        not coordinates.get("blocked")
+        and validation.get("status") == "PASS"
+        and validation.get("geometry_transform_validation") == "PASS"
+        and validation.get("task_target_validation") == "PASS"
+        and official_place.get("status") == "PASS"
+    )
+
+
+def base_pose(coordinates: dict[str, Any], side: str) -> list[float]:
+    return list(coordinates["frames"][f"{side}_arm_base"]["world_pose"])
+
+
+def nut_task_world_poses(coordinates: dict[str, Any]) -> dict[str, list[float]]:
+    right_base = base_pose(coordinates, "right")
+    rows = coordinates["validation"]["right_arm_legacy"]["rows"]
+    return {row["nut"]: transform_pose_base_to_world(list(row["v2_final_target"]), right_base) for row in rows}
+
+
+def official_place_world_poses(coordinates: dict[str, Any]) -> dict[str, list[float]]:
+    places = coordinates["official_place_verification"]["places"]
+    return {key: list(item["world_task_pose"]) for key, item in places.items()}
+
+
+def build_arm_targets(coordinates: dict[str, Any]) -> list[ArmTarget]:
+    targets: list[ArmTarget] = []
+    bases = {
+        "LEFT_ARM": base_pose(coordinates, "left"),
+        "RIGHT_ARM": base_pose(coordinates, "right"),
+    }
+    nut_world = nut_task_world_poses(coordinates)
+    place_world = official_place_world_poses(coordinates)
+
+    for key in ("A", "B", "C"):
+        for arm in ("RIGHT_ARM", "LEFT_ARM"):
+            target_base = transform_pose_world_to_base(nut_world[key], bases[arm])
+            targets.append(
+                ArmTarget(
+                    target=f"Nut {key} hover",
+                    key=key,
+                    kind="nut_hover",
+                    arm=arm,
+                    world_task_pose=nut_world[key],
+                    pose=pose6_from_list(target_base),
+                    source=(
+                        "Nut task world pose derived from legacy right-arm final target after "
+                        "GEOMETRY_TRANSFORM_VALIDATION and TASK_TARGET_VALIDATION"
+                    ),
+                    confidence="DERIVED_FROM_VALIDATED_LEGACY_TASK_TARGET",
+                    note="World task pose is transformed into each arm's own base_link frame; numeric right target is not copied to left.",
+                    regression_expected_pass=arm == "RIGHT_ARM",
+                )
+            )
+
+    for key in ("A", "B", "C"):
+        for arm in ("LEFT_ARM", "RIGHT_ARM"):
+            target_base = transform_pose_world_to_base(place_world[key], bases[arm])
+            targets.append(
+                ArmTarget(
+                    target=f"Official Place {key}",
+                    key=key,
+                    kind="official_place",
+                    arm=arm,
+                    world_task_pose=place_world[key],
+                    pose=pose6_from_list(target_base),
+                    source=(
+                        "agents/three_nut_expert/config.py:93-97; "
+                        "agents/three_nut_expert/expert.py:128,156"
+                    ),
+                    confidence="CONFIRMED_TASK_TARGETS",
+                    note="Official Place is the task target used by left_arm.move_to; it is not a Box geometric center.",
+                    regression_expected_pass=arm == "LEFT_ARM",
+                )
+            )
+
+    return targets
 
 
 def build_blocked_summary(coordinates: dict[str, Any]) -> dict[str, Any]:
     validation = coordinates.get("validation", {}).get("right_arm_legacy", {})
+    official_place = coordinates.get("official_place_verification", {})
     unknowns = list(coordinates.get("unknowns", []))
     if validation.get("status") != "PASS":
         unknowns.append("LEGACY_RIGHT_ARM_CROSS_VALIDATION_NOT_PASS：Legacy 右臂坐标交叉验证未通过")
+    if official_place.get("status") != "PASS":
+        unknowns.append("OFFICIAL_PLACE_SOURCE_VERIFICATION_NOT_PASS：Official Place 源码确认未通过")
     return {
         "generated": time.strftime("%Y-%m-%d %H:%M:%S %z"),
         "host": platform.node(),
         "python": sys.version.replace("\n", " "),
         "overall": "CHECK",
         "phase": "workspace_v2_coordinate_gate",
-        "source_coordinates": source_coordinates(),
+        "source_coordinates": source_coordinates(coordinates),
         "coordinate_gate": {
             "passed": False,
             "coordinate_json": str(COORD_JSON_PATH.relative_to(PROJECT_ROOT)),
             "legacy_right_arm_validation": validation.get("status", "UNKNOWN"),
+            "legacy_geometry_transform_validation": validation.get("geometry_transform_validation", "UNKNOWN"),
+            "legacy_task_target_validation": validation.get("task_target_validation", "UNKNOWN"),
+            "official_place_source_verification": official_place.get("status", "UNKNOWN"),
             "unknowns": unknowns,
             "confirmed_scene_ui": coordinates.get("confirmed_scene_ui", CONFIRMED_SCENE_UI),
             "storage_box": coordinates.get("storage_box"),
@@ -227,15 +243,15 @@ def call_pose_check(arm_obj: Any, pose: Pose6) -> Any:
 
 def run_reachability(skip_runtime: bool = False) -> dict[str, Any]:
     ensure_dirs()
-    log_event("REACHABILITY_START", {"skip_runtime": skip_runtime})
-    coordinate_gate = load_or_build_coordinate_gate(include_runtime_tf=not skip_runtime)
+    log_event("WORKSPACE_V2_START", {"skip_runtime": skip_runtime})
+    coordinate_gate = build_coordinate_db(include_runtime_tf=False)
     if not coordinate_gate_passed(coordinate_gate):
         summary = build_blocked_summary(coordinate_gate)
         write_outputs(summary)
-        log_event("REACHABILITY_BLOCKED_BY_COORDINATES", summary["coordinate_gate"])
+        log_event("WORKSPACE_V2_BLOCKED_BY_COORDINATES", summary["coordinate_gate"])
         return summary
 
-    targets = build_arm_targets()
+    targets = build_arm_targets(coordinate_gate)
     results: list[dict[str, Any]] = []
     arms: dict[str, Any] = {}
     runtime_error: str | None = None
@@ -251,20 +267,21 @@ def run_reachability(skip_runtime: bool = False) -> dict[str, Any]:
     for target in targets:
         row = {
             "target": target.target,
+            "key": target.key,
             "kind": target.kind,
             "arm": target.arm,
-            "pose": pose_to_list(target.pose) if target.pose else None,
+            "world_task_pose": target.world_task_pose,
+            "base_link_target": pose_to_list(target.pose),
             "source": target.source,
             "confidence": target.confidence,
             "note": target.note,
+            "regression_expected_pass": target.regression_expected_pass,
+            "regression": "NOT_RUN",
             "result": "UNKNOWN",
             "reason": "",
             "raw": None,
         }
-        if target.pose is None:
-            row["result"] = "UNKNOWN"
-            row["reason"] = "BLOCKED_MISSING_CONFIRMED_ARM_FRAME_TARGET"
-        elif skip_runtime:
+        if skip_runtime:
             row["result"] = "CHECK"
             row["reason"] = "SKIPPED_RUNTIME"
         elif runtime_error:
@@ -287,8 +304,17 @@ def run_reachability(skip_runtime: bool = False) -> dict[str, Any]:
                 row["result"] = "FAIL"
                 row["reason"] = repr(exc)
                 row["duration_s"] = time.time() - started
+        if target.regression_expected_pass:
+            if row["result"] == "PASS":
+                row["regression"] = "PASS"
+            elif row["result"] == "CHECK":
+                row["regression"] = "CHECK"
+            else:
+                row["regression"] = "FAIL"
+        else:
+            row["regression"] = "N/A"
         results.append(row)
-        log_event("POSE_CHECK_RESULT", row)
+        log_event("WORKSPACE_V2_POSE_CHECK_RESULT", row)
 
     for arm_obj in arms.values():
         if hasattr(arm_obj, "shutdown"):
@@ -297,9 +323,9 @@ def run_reachability(skip_runtime: bool = False) -> dict[str, Any]:
             except Exception as exc:
                 log_event("ARM_SHUTDOWN_ERROR", {"error": repr(exc)})
 
-    summary = build_summary(results, runtime_error)
+    summary = build_summary(results, runtime_error, coordinate_gate, skip_runtime)
     write_outputs(summary)
-    log_event("REACHABILITY_END", {"overall": summary["overall"]})
+    log_event("WORKSPACE_V2_END", {"overall": summary["overall"], "workspace_matrix": summary["workspace_matrix_status"]})
     return summary
 
 
@@ -307,54 +333,56 @@ def _result_for(results: list[dict[str, Any]], arm: str, target: str) -> dict[st
     return next((r for r in results if r["arm"] == arm and r["target"] == target), None)
 
 
-def strategy_status(results: list[dict[str, Any]]) -> dict[str, Any]:
+def strategy_status(results: list[dict[str, Any]], allow_final: bool) -> dict[str, Any]:
     nut_targets = [f"Nut {k} hover" for k in ("A", "B", "C")]
-    box_targets = [f"Box {k} hover" for k in ("A", "B", "C")]
+    place_targets = [f"Official Place {k}" for k in ("A", "B", "C")]
+
+    if not allow_final:
+        return {
+            "single_right": "无法判断",
+            "single_left": "无法判断",
+            "dual_independent": "无法判断",
+            "handoff_required": "无法判断",
+            "assignments": {"A": [], "B": [], "C": []},
+            "recommended_strategy": "BLOCKED_BEFORE_FINAL_STRATEGY",
+        }
 
     def arm_covers(arm: str) -> str:
-        rows = [_result_for(results, arm, t) for t in nut_targets + box_targets]
+        rows = [_result_for(results, arm, t) for t in nut_targets + place_targets]
         if all(row and row["result"] == "PASS" for row in rows):
-            return "PASS"
-        if any(row is None or row["result"] == "UNKNOWN" for row in rows):
-            return "CHECK"
-        return "FAIL"
+            return "可行"
+        return "不可行"
 
     single_right = arm_covers("RIGHT_ARM")
     single_left = arm_covers("LEFT_ARM")
     assignments: dict[str, list[str]] = {}
-    unknown_assignment = False
 
     for key in ("A", "B", "C"):
         choices = []
         for arm in ("LEFT_ARM", "RIGHT_ARM"):
             nut = _result_for(results, arm, f"Nut {key} hover")
-            box = _result_for(results, arm, f"Box {key} hover")
-            if nut and box and nut["result"] == "PASS" and box["result"] == "PASS":
+            place = _result_for(results, arm, f"Official Place {key}")
+            if nut and place and nut["result"] == "PASS" and place["result"] == "PASS":
                 choices.append(arm)
-            elif nut is None or box is None or nut["result"] == "UNKNOWN" or box["result"] == "UNKNOWN":
-                unknown_assignment = True
         assignments[key] = choices
 
     if all(assignments[k] for k in ("A", "B", "C")):
-        dual = "PASS"
-        handoff = "NO"
-    elif unknown_assignment:
-        dual = "CHECK"
-        handoff = "UNKNOWN"
+        dual = "可行"
+        handoff = "否"
     else:
-        dual = "FAIL"
-        handoff = "YES"
+        dual = "不可行"
+        handoff = "是"
 
-    if single_right == "PASS":
+    if single_right == "可行":
         recommended = "SINGLE_RIGHT"
-    elif single_left == "PASS":
+    elif single_left == "可行":
         recommended = "SINGLE_LEFT"
-    elif dual == "PASS":
+    elif dual == "可行":
         recommended = "DUAL_INDEPENDENT"
-    elif handoff == "YES":
+    elif handoff == "是":
         recommended = "HANDOFF_REQUIRED"
     else:
-        recommended = "UNKNOWN_NEEDS_COORDINATES_AND_RUNTIME_DATA"
+        recommended = "NO_GEOMETRIC_STRATEGY_FOUND"
 
     return {
         "single_right": single_right,
@@ -366,15 +394,32 @@ def strategy_status(results: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def build_summary(results: list[dict[str, Any]], runtime_error: str | None) -> dict[str, Any]:
-    strategy = strategy_status(results)
+def build_summary(
+    results: list[dict[str, Any]], runtime_error: str | None, coordinates: dict[str, Any], skip_runtime: bool
+) -> dict[str, Any]:
+    pose_checks_complete = bool(results) and all(r["result"] in ("PASS", "FAIL") for r in results)
+    regression_status = workspace_regression_status(results, skip_runtime)
+    matrix_status = workspace_matrix_status(results, skip_runtime)
+    validation = coordinates["validation"]["right_arm_legacy"]
+    transform_validation = validation.get("geometry_transform_validation", "UNKNOWN")
+    task_validation = validation.get("task_target_validation", "UNKNOWN")
+    official_place_status = coordinates.get("official_place_verification", {}).get("status", "UNKNOWN")
+    base_frame_status = base_frame_status_text(coordinates)
+    allow_final = (
+        transform_validation == "PASS"
+        and task_validation == "PASS"
+        and regression_status == "PASS"
+        and matrix_status in ("PASS", "FAIL")
+        and pose_checks_complete
+    )
+    strategy = strategy_status(results, allow_final)
     unknowns = []
     if runtime_error:
         unknowns.append(f"RUNTIME_INIT_FAILED: {runtime_error}")
-    if any(r["result"] == "UNKNOWN" for r in results):
-        unknowns.append("BLOCKED_MISSING_CONFIRMED_ARM_FRAME_TARGET")
-    if any(r["confidence"].startswith("INFERRED") for r in results):
-        unknowns.append("BOX_TARGET_COORDINATES_ARE_INFERRED_FROM_EXISTING_PLACE_POSES")
+    if skip_runtime:
+        unknowns.append("SKIPPED_RUNTIME：未真实执行 12 个 pose_check")
+    if regression_status == "FAIL":
+        unknowns.append("WORKSPACE_V2_REGRESSION = FAIL")
 
     overall = "PASS"
     if unknowns or any(r["result"] == "CHECK" for r in results):
@@ -388,12 +433,20 @@ def build_summary(results: list[dict[str, Any]], runtime_error: str | None) -> d
         "python": sys.version.replace("\n", " "),
         "overall": overall,
         "phase": "reachability",
-        "source_coordinates": source_coordinates(),
+        "source_coordinates": source_coordinates(coordinates),
+        "base_frame_evidence": base_frame_status,
+        "official_place_source_verification": official_place_status,
+        "legacy_geometry_transform_validation": transform_validation,
+        "legacy_task_target_validation": task_validation,
+        "workspace_v2_regression": regression_status,
+        "workspace_matrix_status": matrix_status,
+        "coordinate_json": str(COORD_JSON_PATH.relative_to(PROJECT_ROOT)),
+        "legacy_validation": validation,
         "reachability": results,
         "repeatability": {},
-        "single_right_feasible": strategy["single_right"] == "PASS",
-        "single_left_feasible": strategy["single_left"] == "PASS",
-        "dual_independent_feasible": strategy["dual_independent"] == "PASS",
+        "single_right_feasible": strategy["single_right"] == "可行",
+        "single_left_feasible": strategy["single_left"] == "可行",
+        "dual_independent_feasible": strategy["dual_independent"] == "可行",
         "handoff_required": strategy["handoff_required"],
         "strategy": strategy,
         "recommended_strategy": strategy["recommended_strategy"],
@@ -401,49 +454,50 @@ def build_summary(results: list[dict[str, Any]], runtime_error: str | None) -> d
     }
 
 
-def source_coordinates() -> dict[str, Any]:
+def base_frame_status_text(coordinates: dict[str, Any]) -> str:
+    frames = coordinates.get("frames", {})
+    left = frames.get("left_arm_base", {})
+    right = frames.get("right_arm_base", {})
+    if "CONFIRMED" in str(left.get("confidence", "")) and "CONFIRMED" in str(right.get("confidence", "")):
+        return "PASS"
+    return "FAIL"
+
+
+def workspace_regression_status(results: list[dict[str, Any]], skip_runtime: bool) -> str:
+    regression_rows = [r for r in results if r.get("regression_expected_pass")]
+    if not regression_rows:
+        return "BLOCKED"
+    if skip_runtime or any(r["result"] == "CHECK" for r in regression_rows):
+        return "CHECK"
+    if all(r["result"] == "PASS" for r in regression_rows):
+        return "PASS"
+    return "FAIL"
+
+
+def workspace_matrix_status(results: list[dict[str, Any]], skip_runtime: bool) -> str:
+    if len(results) != 12:
+        return "BLOCKED"
+    if skip_runtime or any(r["result"] == "CHECK" for r in results):
+        return "BLOCKED"
+    if all(r["result"] == "PASS" for r in results):
+        return "PASS"
+    return "FAIL"
+
+
+def source_coordinates(coordinates: dict[str, Any]) -> dict[str, Any]:
     return {
-        "nuts": {
-            key: {
-                "thing_id": spec.thing_id,
-                "nominal_pose": pose_to_list(spec.nominal_pose),
-                "source": "agents/three_nut_expert/config.py:53-57",
-            }
-            for key, spec in NUT_SPECS.items()
+        "official_facts": {
+            "nuts": coordinates.get("nuts", {}),
+            "official_place": coordinates.get("official_place_verification", {}),
+            "a7_frame": coordinates.get("official_place_verification", {}).get("A7_FRAME_EVIDENCE"),
         },
-        "arm_base": {
-            "right_arm_base_xy": {
-                "value": list(RIGHT_ARM_BASE_XY),
-                "source": "agents/arm_hand_demo/__init__.py:25-28 and agents/three_nut_expert/config.py:59-60",
-            },
-            "left_arm_base_xy": {
-                "value": None,
-                "robot_root_world_pose": CONFIRMED_SCENE_UI["left_robot_root"]["world_pose"],
-                "source": "Rabo scene UI, user supplied",
-                "status": "ROOT_TO_BASE_LINK_TRANSFORM_UNCONFIRMED",
-            },
-            "right_robot_root_pose": {
-                "value": CONFIRMED_SCENE_UI["right_robot_root"]["world_pose"],
-                "source": "Rabo scene UI, user supplied",
-                "status": "ROOT_TO_BASE_LINK_TRANSFORM_UNCONFIRMED",
-            },
+        "rabo_ui_facts": {
+            "frames": coordinates.get("frames", {}),
+            "storage_box": coordinates.get("storage_box", CONFIRMED_SCENE_UI["storage_box"]),
         },
-        "storage_box": CONFIRMED_SCENE_UI["storage_box"],
-        "hover": {
-            "right_nut_hover": {
-                "offsets": GRASP_TARGET_OFFSETS,
-                "source": "agents/arm_hand_demo/__init__.py:75-78 and agents/three_nut_expert/config.py:62-72",
-            },
-            "left_box_hover": {
-                "poses": {key: pose_to_list(pose) for key, pose in LEFT_PLACE_POSES.items()},
-                "source": "agents/three_nut_expert/config.py:93-97",
-                "status": "INFERRED_STAGED_TARGET",
-            },
-        },
-        "target_regions": {
-            "box_A": "BLOCKED_BOX_ABC_CENTER_POSE",
-            "box_B": "BLOCKED_BOX_ABC_CENTER_POSE",
-            "box_C": "BLOCKED_BOX_ABC_CENTER_POSE",
+        "mathematical_derivation": {
+            "box_geometric_center_status": coordinates.get("box_geometric_center_status"),
+            "legacy_validation": coordinates.get("validation", {}).get("right_arm_legacy", {}),
         },
     }
 
@@ -453,7 +507,7 @@ def matrix_rows(results: list[dict[str, Any]]) -> list[str]:
         "| Target | Left Arm | Right Arm | Left Reason | Right Reason |",
         "| --- | --- | --- | --- | --- |",
     ]
-    for target in [f"Nut {k} hover" for k in ("A", "B", "C")] + [f"Box {k} hover" for k in ("A", "B", "C")]:
+    for target in [f"Nut {k} hover" for k in ("A", "B", "C")] + [f"Official Place {k}" for k in ("A", "B", "C")]:
         left = _result_for(results, "LEFT_ARM", target) or {}
         right = _result_for(results, "RIGHT_ARM", target) or {}
         lines.append(
@@ -485,56 +539,87 @@ def markdown_report(summary: dict[str, Any]) -> str:
         "## 1. 总结",
         "",
         f"Overall: {summary['overall']}",
+        f"Base frame evidence：{summary['base_frame_evidence']}",
+        f"Official Place source verification：{summary['official_place_source_verification']}",
+        f"Legacy geometry transform validation：{summary['legacy_geometry_transform_validation']}",
+        f"Legacy task target validation：{summary['legacy_task_target_validation']}",
+        f"Workspace V2 regression：{summary['workspace_v2_regression']}",
+        f"完整 6×2 Matrix：{summary['workspace_matrix_status']}",
         "",
-        "本报告由工作空间可达性阶段生成。只有坐标系和 Box A/B/C 真实坐标已确认，并且 Legacy 右臂坐标交叉验证通过后，才允许运行完整 6×2 pose_check。",
+        "本报告只覆盖 Workspace V2：统一坐标系、legacy 门禁、12 格 pose_check 和几何策略判断；未运行 move_to 稳定性实验。",
         "",
-        "## 2. 坐标来源",
+        "## 2. 官方来源事实",
         "",
         "- Nut A/B/C: `agents/three_nut_expert/config.py:53-57`",
-        "- Right arm base: `agents/arm_hand_demo/__init__.py:25-28` and `agents/three_nut_expert/config.py:59-60`",
-        "- Right nut hover formula: `agents/arm_hand_demo/__init__.py:75-78`",
-        "- Left staged place poses: `agents/three_nut_expert/config.py:93-97`",
-        "- Box A/B/C 真实目标区坐标：`UNKNOWN`",
-        "- 左臂 world → base_link 变换：`UNKNOWN`",
+        "- Legacy right nut target formula: `docs/legacy/arm_hand_demo_legacy_snapshot.py:75-78`",
+        "- Official Place A/B/C: `agents/three_nut_expert/config.py:93-97`",
+        "- Official Place enters `left_arm.move_to`: `agents/three_nut_expert/expert.py:128,156`",
+        "- A7 API frame: LinkerArmA7 `move_to/get_pose/pose_check` use this node's `base_link` frame.",
+        "- `CONFIRMED_TASK_TARGETS` means task targets, not Box geometric centers.",
         "",
-        "## 3. 可达性矩阵",
+        "## 3. Rabo UI 实测事实",
+        "",
+        f"- LEFT base_link world pose: `{summary['source_coordinates']['rabo_ui_facts']['frames']['left_arm_base']['world_pose']}`",
+        f"- RIGHT base_link world pose: `{summary['source_coordinates']['rabo_ui_facts']['frames']['right_arm_base']['world_pose']}`",
+        "- TF / omni.usd / root-base runtime check is optional cross-validation, not a hard blocker in this round.",
+        "",
+        "## 4. 数学推导与工程门限",
+        "",
+        "- Nut world pose -> pure world->right_base SE(3) -> legacy strategy offset -> V2 final target.",
+        "- Official Place left_base target -> world task pose -> right_base equivalent target.",
+        "- Position error threshold: <= 0.01 m.",
+        "- Orientation error threshold: <= 0.02 rad.",
+        "- Thresholds are engineering validation gates, not official specifications.",
+        "",
+        "### Legacy 右臂验证明细",
+        "",
+        "| Nut | Position error | Orientation error | Result |",
+        "| --- | --- | --- | --- |",
+    ]
+    for row in summary["legacy_validation"].get("rows", []):
+        lines.append(
+            f"| {row['nut']} | {row['position_error']:.6f} | {row['orientation_error']:.6f} | {row['result']} |"
+        )
+    lines.extend(
+        [
+        "",
+        "## 5. 完整 6×2 工作空间矩阵",
         "",
         *matrix_rows(summary["reachability"]),
         "",
-        "## 4. 左臂 Hover 重复性",
-        "",
-        "本轮未运行。工作空间测试 V2 不允许运动机器人。",
-        "",
-        "## 5. 右臂 Hover 重复性",
-        "",
-        "本轮未运行。工作空间测试 V2 不允许运动机器人。",
-        "",
-        "## 6. 关节重复性",
-        "",
-        "本轮未运行稳定性实验，因此无关节重复性数据。",
-        "",
-        "## 7. 运动耗时",
-        "",
-        "本轮未运行运动测试，因此无运动耗时数据。",
-        "",
-        "## 8. 候选策略",
-        "",
-        "| 策略 | 可行性 | 复杂度 | ACT 适配性 | 原因 |",
-        "| --- | --- | --- | --- | --- |",
-        f"| 单右臂 | {strategy['single_right']} | LOW | GOOD | 需要右臂同时覆盖全部螺母 hover 和 Box hover。 |",
-        f"| 单左臂 | {strategy['single_left']} | LOW | GOOD | 需要左臂同时覆盖全部螺母 hover 和 Box hover。 |",
-        f"| 双臂独立分工 | {strategy['dual_independent']} | MEDIUM | GOOD | 需要每个螺母至少有一只手能同时覆盖抓取区和对应放置区。 |",
-        f"| 右手到左手交接 | {strategy['handoff_required']} | HIGH | POOR | 只有单臂或双臂独立分工都无法覆盖工作空间时才需要。 |",
-        "",
-        "## 9. 推荐策略",
-        "",
-        f"第一选择：`{strategy['recommended_strategy']}`",
-        "",
-        f"是否需要 handoff：`{strategy['handoff_required']}`",
-        "",
-        "## 10. 剩余未知项",
+        "## 6. pose_check 实验结果明细",
         "",
     ]
+    )
+    for row in summary["reachability"]:
+        lines.extend(
+            [
+                f"### {row['target']} / {row['arm']}",
+                "",
+                f"- 目标来源：{row['source']}",
+                f"- world task pose：`{row['world_task_pose']}`",
+                f"- base_link target：`{row['base_link_target']}`",
+                f"- pose_check：{row['result']}",
+                f"- raw message：`{row['raw']}`",
+                f"- confidence：{row['confidence']}",
+                f"- regression：{row['regression']}",
+                "",
+            ]
+        )
+    lines.extend(
+        [
+        "## 7. 最终策略判断",
+        "",
+        f"- 单右臂：{strategy['single_right']}",
+        f"- 单左臂：{strategy['single_left']}",
+        f"- 双臂独立：{strategy['dual_independent']}",
+        f"- handoff 几何必要性：{strategy['handoff_required']}",
+        f"- 首选策略：`{strategy['recommended_strategy']}`",
+        "",
+        "## 8. 剩余未知项",
+        "",
+        ]
+    )
     if summary["unknowns"]:
         lines.extend(f"- {item}" for item in summary["unknowns"])
     else:
@@ -542,9 +627,9 @@ def markdown_report(summary: dict[str, Any]) -> str:
     lines.extend(
         [
             "",
-            "## 11. 下一步",
+            "## 9. 安全状态",
             "",
-            "先补齐坐标系和 Box A/B/C 真实坐标，通过 Legacy 右臂坐标交叉验证以后，再运行完整 6×2 pose_check。本阶段不要运行稳定性实验、抓取、Recorder 或 ACT。",
+            "未调用 move_to、move_joints、home、SetEntityPose、clench、grasp_force、抓取、handoff、reset、Recorder、Replay 或 ACT。",
             "",
         ]
     )
@@ -567,8 +652,8 @@ def markdown_blocked_report(summary: dict[str, Any]) -> str:
         "- Nut A/B/C：`agents/three_nut_expert/config.py:53-57`",
         "- Legacy 右臂 base XY：`agents/arm_hand_demo/__init__.py:25-28` 和 `agents/three_nut_expert/config.py:59-60`",
         "- Legacy 右臂 world → arm target 公式：`agents/arm_hand_demo/__init__.py:75-78`",
-        f"- 已确认左机器人 root UI world pose：`{CONFIRMED_SCENE_UI['left_robot_root']['world_pose']}`，但 root→base_link 未确认",
-        f"- 已确认右机器人 root UI world pose：`{CONFIRMED_SCENE_UI['right_robot_root']['world_pose']}`，但 root→base_link 未确认",
+        f"- 已确认左臂 base_link world pose：`{CONFIRMED_SCENE_UI['left_robot_root']['world_pose']}`",
+        f"- 已确认右臂 base_link world pose：`{CONFIRMED_SCENE_UI['right_robot_root']['world_pose']}`",
         f"- 已确认收纳盒整体 root UI world pose：`{CONFIRMED_SCENE_UI['storage_box']['world_pose']}`",
         f"- 收纳盒 ID：`{CONFIRMED_SCENE_UI['storage_box']['thing_id']}`",
         "- 当前左臂 staged place pose：`agents/three_nut_expert/config.py:93-97`，不能当作 Box A/B/C 真实世界坐标",
@@ -576,7 +661,7 @@ def markdown_blocked_report(summary: dict[str, Any]) -> str:
         "",
         "## 3. 可达性矩阵",
         "",
-        "未生成完整 6×2 矩阵。原因：坐标系和 Box A/B/C 真实坐标尚未补齐，Legacy 右臂坐标交叉验证未通过。",
+        "未生成完整 6×2 矩阵。原因：base frame、Official Place 或 Legacy 右臂验证门禁未通过。",
         "",
         "## 4. 左臂 Hover 重复性",
         "",
@@ -598,8 +683,8 @@ def markdown_blocked_report(summary: dict[str, Any]) -> str:
         "",
         "| 策略 | 可行性 | 复杂度 | ACT 适配性 | 原因 |",
         "| --- | --- | --- | --- | --- |",
-        "| 单右臂 | CHECK | LOW | GOOD | Box A/B/C 真实坐标和完整右臂目标未确认。 |",
-        "| 单左臂 | CHECK | LOW | GOOD | 左臂 base_link 世界位姿和螺母 hover 目标未确认。 |",
+        "| 单右臂 | CHECK | LOW | GOOD | 需要完整 6×2 pose_check 后判断。 |",
+        "| 单左臂 | CHECK | LOW | GOOD | 需要完整 6×2 pose_check 后判断。 |",
         "| 双臂独立分工 | CHECK | MEDIUM | GOOD | 需要完整 6×2 pose_check 后才能判断。 |",
         "| 右手到左手交接 | UNKNOWN | HIGH | POOR | 只有前面方案失败后才允许判断是否需要。 |",
         "",
@@ -620,9 +705,8 @@ def markdown_blocked_report(summary: dict[str, Any]) -> str:
             "",
             "先补齐以下信息：",
             "",
-            "1. 左机器人 root -> left base_link 的固定变换，或直接确认 left base_link world pose。",
-            "2. 右机器人 root -> right base_link 的固定变换，或直接确认 right base_link world pose。",
-            "3. Box A/B/C 三个格子中心的真实 world pose，或可严格计算三格中心的模型/尺寸/局部坐标。",
+            "1. 修正门禁中失败的 base frame、Official Place source 或 Legacy validation 项。",
+            "2. 不把 Box A/B/C geometry center 作为硬 blocker。",
             "",
             "补齐后先通过 Legacy 右臂坐标交叉验证，再运行完整 6×2 pose_check。不要提前运行 hover motion、抓取、handoff、Recorder 或 ACT。",
             "",
@@ -641,18 +725,41 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     summary = run_reachability(skip_runtime=args.skip_runtime)
     print("========================================")
-    print("RABO ARM STRATEGY EVALUATION")
+    print("Workspace V2 最终验证")
     print("========================================")
     print()
-    print(f"Single Right:\n{summary['strategy']['single_right']}")
+    print(f"Base frame evidence：\n{summary.get('base_frame_evidence', 'FAIL')}")
     print()
-    print(f"Single Left:\n{summary['strategy']['single_left']}")
+    print(f"Official Place source verification：\n{summary.get('official_place_source_verification', 'FAIL')}")
     print()
-    print(f"Dual Independent:\n{summary['strategy']['dual_independent']}")
+    print(f"Legacy geometry transform validation：\n{summary.get('legacy_geometry_transform_validation', 'FAIL')}")
     print()
-    print(f"Handoff Required:\n{summary['strategy']['handoff_required']}")
+    print(f"Legacy task target validation：\n{summary.get('legacy_task_target_validation', 'FAIL')}")
     print()
-    print(f"Recommended Strategy:\n{summary['strategy']['recommended_strategy']}")
+    print(f"Workspace V2 regression：\n{summary.get('workspace_v2_regression', 'FAIL')}")
+    print()
+    print(f"完整 6×2 Matrix：\n{summary.get('workspace_matrix_status', 'BLOCKED')}")
+    print()
+    print(f"单右臂：\n{summary['strategy']['single_right']}")
+    print()
+    print(f"单左臂：\n{summary['strategy']['single_left']}")
+    print()
+    print(f"双臂独立：\n{summary['strategy']['dual_independent']}")
+    print()
+    print(f"handoff 几何必要性：\n{summary['strategy']['handoff_required']}")
+    print()
+    print(f"首选策略：\n{summary['strategy']['recommended_strategy']}")
+    print()
+    allow_move_to = (
+        summary.get("legacy_geometry_transform_validation") == "PASS"
+        and summary.get("legacy_task_target_validation") == "PASS"
+        and summary.get("workspace_v2_regression") == "PASS"
+        and summary.get("workspace_matrix_status") in ("PASS", "FAIL")
+    )
+    print(f"是否允许进入 move_to 稳定性测试：\n{'YES' if allow_move_to else 'NO'}")
+    if allow_move_to:
+        print()
+        print("下一阶段建议代表目标：优先测试首选策略中最小覆盖路径的一个 PASS 目标；本轮不执行。")
     print()
     print(f"Report:\n{REPORT_PATH.relative_to(PROJECT_ROOT)}")
     print()

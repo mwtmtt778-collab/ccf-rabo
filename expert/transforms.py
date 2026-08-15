@@ -103,6 +103,13 @@ def transform_pose_world_to_base(target_world: Iterable[float], base_world: Iter
     return matrix_to_pose6(t_base_target)
 
 
+def transform_pose_base_to_world(target_base: Iterable[float], base_world: Iterable[float]) -> Pose6:
+    t_base_target = pose6_to_matrix(target_base)
+    t_world_base = pose6_to_matrix(base_world)
+    t_world_target = compose_transform(t_world_base, t_base_target)
+    return matrix_to_pose6(t_world_target)
+
+
 def pose_position_error(a: Iterable[float], b: Iterable[float]) -> float:
     pa = _pose6(a)[:3]
     pb = _pose6(b)[:3]
@@ -114,3 +121,11 @@ def pose_orientation_error(a: Iterable[float], b: Iterable[float]) -> float:
     pb = _pose6(b)[3:]
     return math.sqrt(sum((pa[i] - pb[i]) ** 2 for i in range(3)))
 
+
+def pose_rotation_angle_error(a: Iterable[float], b: Iterable[float]) -> float:
+    ra = rpy_to_matrix(*_pose6(a)[3:])
+    rb = rpy_to_matrix(*_pose6(b)[3:])
+    r_delta = matmul([[ra[j][i] for j in range(3)] for i in range(3)], rb)
+    trace = r_delta[0][0] + r_delta[1][1] + r_delta[2][2]
+    cos_angle = max(-1.0, min(1.0, (trace - 1.0) / 2.0))
+    return math.acos(cos_angle)

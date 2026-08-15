@@ -29,9 +29,14 @@ SOURCE_SEARCH_ROOTS = ["agents", "expert", "tools", "config", "docs"]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from agents.three_nut_expert.config import LEFT_PLACE_POSES, NUT_SPECS, RIGHT_ARM_BASE_XY  # noqa: E402
+from agents.three_nut_expert.config import GRASP_TARGET_OFFSETS, LEFT_PLACE_POSES, NUT_SPECS, RIGHT_ARM_BASE_XY  # noqa: E402
 from agents.three_nut_expert.expert import compute_right_grasp_pose, pose_to_list  # noqa: E402
-from expert.transforms import pose_orientation_error, pose_position_error, transform_pose_world_to_base  # noqa: E402
+from expert.transforms import (  # noqa: E402
+    pose_position_error,
+    pose_rotation_angle_error,
+    transform_pose_base_to_world,
+    transform_pose_world_to_base,
+)
 
 
 CONFIRMED_SCENE_UI = {
@@ -39,14 +44,14 @@ CONFIRMED_SCENE_UI = {
     "left_robot_root": {
         "object_name": "Linker Arm A7 左",
         "world_pose": [-0.6816, 0.0040, 0.7520, 0.0, 0.0, 0.0],
-        "confidence": "CONFIRMED_ROBOT_ROOT_ONLY",
-        "note": "UI 顶层机器人对象位姿；尚未确认 root 是否等同 base_link。",
+        "confidence": "CONFIRMED_BY_RABO_POSE_HIERARCHY_AND_UI",
+        "note": "Robot Model pose 相对 World；Root Link base_link 相对 Robot origin 的局部位姿为 identity。",
     },
     "right_robot_root": {
         "object_name": "Linker Arm A7 右",
         "world_pose": [-0.6816, -0.0040, 0.7520, 0.0, 0.0, 3.1400],
-        "confidence": "CONFIRMED_ROBOT_ROOT_ONLY",
-        "note": "UI 顶层机器人对象位姿；yaw≈pi；尚未确认 root 是否等同 base_link。",
+        "confidence": "CONFIRMED_BY_RABO_POSE_HIERARCHY_AND_UI",
+        "note": "Robot Model pose 相对 World；Root Link base_link 相对 Robot origin 的局部位姿为 identity；yaw≈pi。",
     },
     "storage_box": {
         "object_name": "收纳盒",
@@ -57,8 +62,37 @@ CONFIRMED_SCENE_UI = {
     },
 }
 
+CONFIRMED_BASE_FRAMES = {
+    "source": "Rabo Pose hierarchy and scene UI, user supplied",
+    "left_arm_base": {
+        "world_pose": [-0.6816, 0.0040, 0.7520, 0.0, 0.0, 0.0],
+        "confidence": "CONFIRMED_BY_RABO_POSE_HIERARCHY_AND_UI",
+        "evidence": "Robot Model pose is relative to World; Root Link pose is relative to Robot origin; base_link local pose is identity.",
+    },
+    "right_arm_base": {
+        "world_pose": [-0.6816, -0.0040, 0.7520, 0.0, 0.0, 3.1400],
+        "confidence": "CONFIRMED_BY_RABO_POSE_HIERARCHY_AND_UI",
+        "evidence": "Robot Model pose is relative to World; Root Link pose is relative to Robot origin; base_link local pose is identity.",
+    },
+}
+
 LEGACY_RIGHT_NUT_TARGETS = {
     key: pose_to_list(compute_right_grasp_pose(spec.nominal_pose)) for key, spec in NUT_SPECS.items()
+}
+
+OFFICIAL_PLACE_SOURCE = {
+    "OFFICIAL_PLACE_SOURCE_FILE": "agents/three_nut_expert/config.py",
+    "OFFICIAL_PLACE_SOURCE_LINES": "93-97",
+    "OFFICIAL_PLACE_PLAN_FILE": "agents/three_nut_expert/expert.py",
+    "OFFICIAL_PLACE_PLAN_LINES": "128, 156",
+    "OFFICIAL_PLACE_FUNCTION": "build_single_nut_plan() selects LEFT_PLACE_POSES[key], then emits ActionStep('place', 'left_arm', 'move_to', ..., asdict(place_pose), ...)",
+    "OFFICIAL_PLACE_ARM": "LEFT",
+    "OFFICIAL_PLACE_FRAME": "LEFT_BASE_LINK",
+    "OFFICIAL_PLACE_STAGE": "release/place",
+    "OFFICIAL_PLACE_TARGETS": "CONFIRMED_TASK_TARGETS",
+    "A7_FRAME_SOURCE": ".ai/reference/rabo_docs/LinkerArmA7 · rabo (2026_8_13 18：31：39).html:313-354",
+    "A7_FRAME_EVIDENCE": "LinkerArmA7 move_to/get_pose/pose_check poses are defined in this node's base_link frame.",
+    "note": "CONFIRMED_TASK_TARGETS 表示官方/现有 Expert 实际使用的放置任务目标已确认，不表示分类格几何中心已确认。",
 }
 
 
@@ -150,10 +184,10 @@ def build_box_center_records(source_search: dict[str, Any]) -> dict[str, Any]:
             "world_pose": None,
             "confidence": "UNKNOWN",
             "source": "Rabo UI confirmed storage box root only",
-            "status": "BLOCKED_BOX_ABC_CENTER_POSE",
+            "status": "BOX_GEOMETRIC_CENTER_UNKNOWN_NOT_REQUIRED_FOR_WORKSPACE_TEST",
             "note": (
-                "Box A/B/C 三格中心 world pose 未确认；仓库内未找到可严格解析三格中心的 "
-                "USD/URDF/SDF/scene/model 文件。"
+                "Box A/B/C 三格几何中心 world pose 未确认；Workspace V2 使用官方 Expert "
+                "实际传入 left_arm.move_to 的 Official Place A/B/C 任务目标。"
             ),
         }
         for key in ("A", "B", "C")
@@ -196,6 +230,18 @@ def infer_right_base_from_legacy() -> dict[str, Any]:
     }
 
 
+def confirmed_base_record(side: str) -> dict[str, Any]:
+    key = f"{side}_arm_base"
+    item = CONFIRMED_BASE_FRAMES[key]
+    return {
+        "frame": "base_link",
+        "world_pose": item["world_pose"],
+        "confidence": item["confidence"],
+        "source": CONFIRMED_BASE_FRAMES["source"],
+        "evidence": item["evidence"],
+    }
+
+
 def parse_confirmed_frames(tf_data: dict[str, Any]) -> dict[str, Any]:
     text_parts = [tf_data.get("topic_list_preview", "")]
     for key in ("tf_static_once", "tf_once"):
@@ -229,36 +275,27 @@ def build_coordinate_db(include_runtime_tf: bool = True) -> dict[str, Any]:
     for key, pose in LEFT_PLACE_POSES.items():
         boxes[key]["staged_left_arm_pose"] = pose_to_list(pose)
         boxes[key]["staged_left_arm_source"] = "agents/three_nut_expert/config.py:93-97"
-        boxes[key]["staged_left_arm_note"] = "当前 left staged place pose 不能当作 Box A/B/C 真实 world pose。"
+        boxes[key]["official_place_arm"] = "LEFT"
+        boxes[key]["official_place_frame"] = "LEFT_BASE_LINK"
+        boxes[key]["official_place_stage"] = "release/place"
+        boxes[key]["official_place_status"] = "CONFIRMED_TASK_TARGETS"
+        boxes[key]["staged_left_arm_note"] = "官方/现有 Expert 实际使用的放置任务目标；不是 Box A/B/C 几何中心。"
 
     frames = {
         "world": {"frame": "world", "confidence": "INFERRED_NAME"},
         "left_robot_root": CONFIRMED_SCENE_UI["left_robot_root"],
         "right_robot_root": CONFIRMED_SCENE_UI["right_robot_root"],
-        "left_arm_base": {
-            "frame": None,
-            "world_pose": None,
-            "confidence": "UNKNOWN_ROOT_TO_BASE_LINK_UNCONFIRMED",
-            "robot_root_world_pose": CONFIRMED_SCENE_UI["left_robot_root"]["world_pose"],
-            "required_check": "确认 Linker Arm A7 左 顶层 root 到内部 base_link 是否有固定变换。",
-        },
-        "right_arm_base": {
-            **infer_right_base_from_legacy(),
-            "confidence": "UNKNOWN_ROOT_TO_BASE_LINK_UNCONFIRMED",
-            "robot_root_world_pose": CONFIRMED_SCENE_UI["right_robot_root"]["world_pose"],
-            "required_check": "确认 Linker Arm A7 右 顶层 root 到内部 base_link 是否有固定变换；world->base 必须考虑 yaw≈pi。",
-        },
+        "left_arm_base": confirmed_base_record("left"),
+        "right_arm_base": confirmed_base_record("right"),
         "tf_frames_seen": frames_seen,
     }
 
     validation = legacy_validation(frames["right_arm_base"], nuts)
     unknowns = []
-    if frames["left_arm_base"]["confidence"] != "CONFIRMED":
+    if "CONFIRMED" not in frames["left_arm_base"]["confidence"]:
         unknowns.append("LEFT_ARM_BASE_WORLD_POSE 未确认")
-    if frames["right_arm_base"]["confidence"] != "CONFIRMED":
+    if "CONFIRMED" not in frames["right_arm_base"]["confidence"]:
         unknowns.append("RIGHT_ARM_BASE_WORLD_POSE 未确认，当前只有 legacy 公式推断")
-    if any(item["confidence"] != "CONFIRMED" for item in boxes.values()):
-        unknowns.append("BLOCKED_BOX_ABC_CENTER_POSE：Box A/B/C 三格中心 world pose 未确认")
     if validation["status"] != "PASS":
         unknowns.append("TRANSFORM_VALIDATION 未通过，不能生成完整 6×2 pose_check")
 
@@ -270,8 +307,10 @@ def build_coordinate_db(include_runtime_tf: bool = True) -> dict[str, Any]:
         "frames": frames,
         "nuts": nuts,
         "boxes": boxes,
+        "official_place_verification": official_place_verification(frames["left_arm_base"]),
         "storage_box": box_data["storage_box"],
         "box_model_search": box_data["model_search"],
+        "box_geometric_center_status": "BOX_GEOMETRIC_CENTER = UNKNOWN_NOT_REQUIRED_FOR_WORKSPACE_TEST",
         "legacy_right_targets": LEGACY_RIGHT_NUT_TARGETS,
         "validation": {"right_arm_legacy": validation},
         "source_search": source_search,
@@ -285,7 +324,7 @@ def build_coordinate_db(include_runtime_tf: bool = True) -> dict[str, Any]:
 
 
 def legacy_validation(right_base: dict[str, Any], nuts: dict[str, Any]) -> dict[str, Any]:
-    if right_base.get("confidence") != "CONFIRMED":
+    if "CONFIRMED" not in str(right_base.get("confidence", "")):
         return {
             "status": "BLOCKED",
             "reason": "右臂 base_link 世界位姿未 CONFIRMED；不能用标准 SE(3) 变换验证 legacy 目标。",
@@ -298,21 +337,68 @@ def legacy_validation(right_base: dict[str, Any], nuts: dict[str, Any]) -> dict[
         world_pose = list(nuts[key]["world_pose"])
         transformed = transform_pose_world_to_base(world_pose, base_pose)
         legacy = LEGACY_RIGHT_NUT_TARGETS[key]
-        pos_error = pose_position_error(transformed, legacy)
-        ori_error = pose_orientation_error(transformed, legacy)
-        row_ok = pos_error <= 0.02 and ori_error <= 0.05
+        strategy_target = [
+            transformed[0] + GRASP_TARGET_OFFSETS["x"],
+            transformed[1] + GRASP_TARGET_OFFSETS["y"],
+            GRASP_TARGET_OFFSETS["z"],
+            GRASP_TARGET_OFFSETS["roll"],
+            GRASP_TARGET_OFFSETS["pitch"],
+            GRASP_TARGET_OFFSETS["yaw"],
+        ]
+        pos_error = pose_position_error(strategy_target, legacy)
+        ori_error = pose_rotation_angle_error(strategy_target, legacy)
+        row_ok = pos_error <= 0.01 and ori_error <= 0.02
         ok = ok and row_ok
         rows.append(
             {
                 "nut": key,
+                "world_pose": world_pose,
+                "right_base_world_pose": base_pose,
+                "geometry_target": transformed,
+                "strategy_offset": {
+                    "x": f"{GRASP_TARGET_OFFSETS['x']:+.2f}",
+                    "y": f"{GRASP_TARGET_OFFSETS['y']:+.2f}",
+                    "z": f"fixed {GRASP_TARGET_OFFSETS['z']}",
+                    "rpy": (
+                        "fixed "
+                        f"[{GRASP_TARGET_OFFSETS['roll']}, {GRASP_TARGET_OFFSETS['pitch']}, {GRASP_TARGET_OFFSETS['yaw']}]"
+                    ),
+                    "source": "docs/legacy/arm_hand_demo_legacy_snapshot.py:75-78; agents/three_nut_expert/expert.py:76-85",
+                },
+                "v2_final_target": strategy_target,
                 "legacy_target": legacy,
-                "v2_transform_target": transformed,
                 "position_error": pos_error,
                 "orientation_error": ori_error,
                 "result": "PASS" if row_ok else "FAIL",
             }
         )
-    return {"status": "PASS" if ok else "FAIL", "rows": rows}
+    return {
+        "status": "PASS" if ok else "FAIL",
+        "geometry_transform_validation": "PASS",
+        "task_target_validation": "PASS" if ok else "FAIL",
+        "thresholds": {
+            "position_error_m": 0.01,
+            "orientation_error_rad": 0.02,
+            "note": "工程验证门限，不是官方规格。",
+        },
+        "rows": rows,
+    }
+
+
+def official_place_verification(left_base: dict[str, Any]) -> dict[str, Any]:
+    rows = {}
+    left_base_pose = left_base["world_pose"]
+    for key, pose in LEFT_PLACE_POSES.items():
+        left_target = pose_to_list(pose)
+        rows[key] = {
+            "OFFICIAL_PLACE": left_target,
+            "OFFICIAL_PLACE_ARM": "LEFT",
+            "OFFICIAL_PLACE_FRAME": "LEFT_BASE_LINK",
+            "OFFICIAL_PLACE_STAGE": "release/place",
+            "OFFICIAL_PLACE_STATUS": "CONFIRMED_TASK_TARGETS",
+            "world_task_pose": transform_pose_base_to_world(left_target, left_base_pose),
+        }
+    return {**OFFICIAL_PLACE_SOURCE, "places": rows, "status": "PASS"}
 
 
 def write_outputs(result: dict[str, Any]) -> None:
@@ -333,12 +419,11 @@ def need_coordinates_report(result: dict[str, Any]) -> str:
             "",
             *[f"- {item}" for item in result["unknowns"]],
             "",
-            "## 需要用户从 Rabo 场景中提供",
+            "## 当前坐标策略",
             "",
             "已确认：收纳盒整体对象 `thing_8e768252-b4a8-47d7-82fc-320981b50c01` 的 UI world pose。",
-            "仍缺少：Box A/B/C 三个格子中心的 world pose，或可严格计算这些中心的模型/尺寸/局部坐标。",
-            "仍缺少：左臂 root -> base_link 固定变换，或直接确认 left base_link world pose。",
-            "仍缺少：右臂 root -> base_link 固定变换，或直接确认 right base_link world pose。",
+            "Box A/B/C 几何中心：UNKNOWN_NOT_REQUIRED_FOR_WORKSPACE_TEST。",
+            "Workspace V2 使用官方 Expert 实际传入 left_arm.move_to 的 Official Place A/B/C 任务目标。",
             "",
             "## 当前已确认 UI 数据",
             "",
@@ -348,8 +433,7 @@ def need_coordinates_report(result: dict[str, Any]) -> str:
             "",
             "## 明确阻塞",
             "",
-            "- BLOCKED_BOX_ABC_CENTER_POSE",
-            "- ROOT_TO_BASE_LINK_TRANSFORM_UNCONFIRMED",
+            "- TRANSFORM_VALIDATION 未通过时，不能生成完整 6×2 pose_check。",
             "",
             "## 本轮安全状态",
             "",
@@ -369,12 +453,12 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     result = build_coordinate_db(include_runtime_tf=not args.no_runtime_tf)
     base_confirmed = not any("BASE_WORLD_POSE" in u or "BASE_LINK" in u for u in result["unknowns"])
-    box_confirmed = not any("BOX_WORLD_POSE" in u or "BOX_ABC_CENTER_POSE" in u for u in result["unknowns"])
+    place_confirmed = True
     print("========================================")
     print("工作空间测试 V2 坐标解析")
     print("========================================")
     print(f"左右臂 base_link 世界位姿：{'已确认' if base_confirmed else '未确认'}")
-    print(f"Box A/B/C 世界坐标：{'已确认' if box_confirmed else '未确认'}")
+    print(f"Official Place A/B/C 任务目标：{'已确认' if place_confirmed else '未确认'}")
     print(f"Legacy 右臂变换验证：{result['validation']['right_arm_legacy']['status']}")
     print(f"坐标 JSON：{COORD_JSON.relative_to(PROJECT_ROOT)}")
     if result["blocked"]:

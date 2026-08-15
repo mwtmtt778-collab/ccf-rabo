@@ -20,25 +20,27 @@
 
 ## 正在进行
 
-- [VERIFIED] `tools/test_dual_arm_reachability.py` 有未提交修改。
-- [VERIFIED] `expert/` 与 `tools/resolve_workspace_coordinates.py` 是未跟踪源码，应保护。
+- [VERIFIED] 当前未提交修改为 `expert/transforms.py` 和 `tools/resolve_workspace_coordinates.py`。
+- [VERIFIED] `expert/`、`tools/resolve_workspace_coordinates.py`、`tools/test_dual_arm_reachability.py` 当前均已被 Git 跟踪。
 - [VERIFIED] 当前正在整理项目管理文档，不处理业务逻辑。
 
 ## 当前阻塞
 
-- [DOCUMENTED] 工作空间 V2 尚未完成，停在坐标门禁阶段。
-- [PENDING] Box A/B/C 真实 world pose、左右臂 base_link world pose、右臂完整 base_link pose 或 TF frame 仍需 Rabo 现场确认。
+- [DOCUMENTED] 工作空间 V2 仍处于坐标门禁 / 本地验证阶段，尚未形成 Rabo 现场完整 6x2 pose_check 结论。
+- [VERIFIED] 当前 `tools/resolve_workspace_coordinates.py` diff 已加入左右臂 base_link world pose 记录，并把 Box A/B/C 几何中心标记为工作空间测试非必需项。
+- [PENDING] 上述工作空间 V2 坐标解析改动仍需本地脚本验证和 Rabo 现场验证。
 - [PENDING] Rabo 端真实 remote 名称和指向需要在 Rabo 终端确认。
 - [PENDING] README 与当前 `main.py` 启动行为冲突，需要后续决定修 README 还是修入口行为。
 
 ## 下一步
 
-- [VERIFIED] `agent_system_backup.tar.gz` 应从 Git 索引移除但保留本地文件，并用 `.gitignore` 防止重新进入 Git。
+- [VERIFIED] `agent_system_backup.tar.gz` 当前未被 Git 跟踪，且 `.gitignore` 已忽略 `*_backup.tar.gz` 和 `agent_system_backup.tar.gz`。
+- [PENDING] 验证当前工作空间 V2 坐标解析改动：至少运行 `py_compile` 和 `tools/resolve_workspace_coordinates.py --no-runtime-tf`。
 - [PENDING] 用户确认是否进一步归档 Rabo HTML 快照、WPS 文件和仍有技术证据价值的 RABO 阶段报告。
 - [PENDING] 在 Rabo 端运行最小只读命令，确认 remote、Python、ROS、SDK 和 runtime namespace。
 
 ## 最近一次有效验证
 
-- [DOCUMENTED] `PROJECT_STATUS_SUMMARY.txt` 记录：用户报告 Rabo 端机器人状态只读测试四个设备连接成功，且无错误。
+- [DOCUMENTED] `.ai/archive/project_history/PROJECT_STATUS_SUMMARY_2026-08-14.txt` 记录：用户报告 Rabo 端机器人状态只读测试四个设备连接成功，且无错误。
 - [DOCUMENTED] `docs/RABO_CAMERA_TEST_REPORT.md` 记录：Rabo 端相机只读测试发现部分 RGB topic 可采样，结果为 CHECK。
-- [DOCUMENTED] `docs/RABO_WORKSPACE_V2_CLOSURE_REPORT.md` 记录：本地 `py_compile` 和 `test_dual_arm_reachability.py --skip-runtime` 通过，但工作空间坐标门禁仍阻塞。
+- [DOCUMENTED] `.ai/archive/project_history/RABO_WORKSPACE_V2_CLOSURE_REPORT.md` 记录：本地 `py_compile` 和 `test_dual_arm_reachability.py --skip-runtime` 通过，但当时工作空间坐标门禁仍阻塞。
