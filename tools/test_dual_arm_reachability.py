@@ -36,7 +36,7 @@ from agents.three_nut_expert.config import (  # noqa: E402
     Pose6,
 )
 from agents.three_nut_expert.expert import compute_right_grasp_pose, pose_to_list  # noqa: E402
-from tools.resolve_workspace_coordinates import build_coordinate_db  # noqa: E402
+from tools.resolve_workspace_coordinates import CONFIRMED_SCENE_UI, build_coordinate_db  # noqa: E402
 
 
 @dataclass(frozen=True)
@@ -192,6 +192,9 @@ def build_blocked_summary(coordinates: dict[str, Any]) -> dict[str, Any]:
             "coordinate_json": str(COORD_JSON_PATH.relative_to(PROJECT_ROOT)),
             "legacy_right_arm_validation": validation.get("status", "UNKNOWN"),
             "unknowns": unknowns,
+            "confirmed_scene_ui": coordinates.get("confirmed_scene_ui", CONFIRMED_SCENE_UI),
+            "storage_box": coordinates.get("storage_box"),
+            "box_model_search": coordinates.get("box_model_search"),
         },
         "reachability": [],
         "repeatability": {},
@@ -415,10 +418,17 @@ def source_coordinates() -> dict[str, Any]:
             },
             "left_arm_base_xy": {
                 "value": None,
-                "source": "UNKNOWN",
-                "status": "BLOCKED_LEFT_ARM_BASE_NOT_FOUND",
+                "robot_root_world_pose": CONFIRMED_SCENE_UI["left_robot_root"]["world_pose"],
+                "source": "Rabo scene UI, user supplied",
+                "status": "ROOT_TO_BASE_LINK_TRANSFORM_UNCONFIRMED",
+            },
+            "right_robot_root_pose": {
+                "value": CONFIRMED_SCENE_UI["right_robot_root"]["world_pose"],
+                "source": "Rabo scene UI, user supplied",
+                "status": "ROOT_TO_BASE_LINK_TRANSFORM_UNCONFIRMED",
             },
         },
+        "storage_box": CONFIRMED_SCENE_UI["storage_box"],
         "hover": {
             "right_nut_hover": {
                 "offsets": GRASP_TARGET_OFFSETS,
@@ -431,9 +441,9 @@ def source_coordinates() -> dict[str, Any]:
             },
         },
         "target_regions": {
-            "box_A": "UNKNOWN_EXPLICIT_REGION_NOT_FOUND",
-            "box_B": "UNKNOWN_EXPLICIT_REGION_NOT_FOUND",
-            "box_C": "UNKNOWN_EXPLICIT_REGION_NOT_FOUND",
+            "box_A": "BLOCKED_BOX_ABC_CENTER_POSE",
+            "box_B": "BLOCKED_BOX_ABC_CENTER_POSE",
+            "box_C": "BLOCKED_BOX_ABC_CENTER_POSE",
         },
     }
 
@@ -557,6 +567,10 @@ def markdown_blocked_report(summary: dict[str, Any]) -> str:
         "- Nut A/B/C：`agents/three_nut_expert/config.py:53-57`",
         "- Legacy 右臂 base XY：`agents/arm_hand_demo/__init__.py:25-28` 和 `agents/three_nut_expert/config.py:59-60`",
         "- Legacy 右臂 world → arm target 公式：`agents/arm_hand_demo/__init__.py:75-78`",
+        f"- 已确认左机器人 root UI world pose：`{CONFIRMED_SCENE_UI['left_robot_root']['world_pose']}`，但 root→base_link 未确认",
+        f"- 已确认右机器人 root UI world pose：`{CONFIRMED_SCENE_UI['right_robot_root']['world_pose']}`，但 root→base_link 未确认",
+        f"- 已确认收纳盒整体 root UI world pose：`{CONFIRMED_SCENE_UI['storage_box']['world_pose']}`",
+        f"- 收纳盒 ID：`{CONFIRMED_SCENE_UI['storage_box']['thing_id']}`",
         "- 当前左臂 staged place pose：`agents/three_nut_expert/config.py:93-97`，不能当作 Box A/B/C 真实世界坐标",
         f"- 坐标解析 JSON：`{gate['coordinate_json']}`",
         "",
@@ -606,11 +620,9 @@ def markdown_blocked_report(summary: dict[str, Any]) -> str:
             "",
             "先补齐以下信息：",
             "",
-            "1. 蓝色分类盒模型名称 / ID。",
-            "2. 蓝色分类盒模型 world pose。",
-            "3. Box A/B/C 三个目标格中心的真实 world pose，或三个独立 link 的 pose。",
-            "4. 左臂 base_link 的 world pose。",
-            "5. 右臂 base_link 的完整 world pose，或可从 TF 确认的 frame 名称。",
+            "1. 左机器人 root -> left base_link 的固定变换，或直接确认 left base_link world pose。",
+            "2. 右机器人 root -> right base_link 的固定变换，或直接确认 right base_link world pose。",
+            "3. Box A/B/C 三个格子中心的真实 world pose，或可严格计算三格中心的模型/尺寸/局部坐标。",
             "",
             "补齐后先通过 Legacy 右臂坐标交叉验证，再运行完整 6×2 pose_check。不要提前运行 hover motion、抓取、handoff、Recorder 或 ACT。",
             "",

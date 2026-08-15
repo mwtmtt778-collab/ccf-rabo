@@ -34,6 +34,29 @@ from agents.three_nut_expert.expert import compute_right_grasp_pose, pose_to_lis
 from expert.transforms import pose_orientation_error, pose_position_error, transform_pose_world_to_base  # noqa: E402
 
 
+CONFIRMED_SCENE_UI = {
+    "source": "Rabo scene UI, user supplied",
+    "left_robot_root": {
+        "object_name": "Linker Arm A7 左",
+        "world_pose": [-0.6816, 0.0040, 0.7520, 0.0, 0.0, 0.0],
+        "confidence": "CONFIRMED_ROBOT_ROOT_ONLY",
+        "note": "UI 顶层机器人对象位姿；尚未确认 root 是否等同 base_link。",
+    },
+    "right_robot_root": {
+        "object_name": "Linker Arm A7 右",
+        "world_pose": [-0.6816, -0.0040, 0.7520, 0.0, 0.0, 3.1400],
+        "confidence": "CONFIRMED_ROBOT_ROOT_ONLY",
+        "note": "UI 顶层机器人对象位姿；yaw≈pi；尚未确认 root 是否等同 base_link。",
+    },
+    "storage_box": {
+        "object_name": "收纳盒",
+        "thing_id": "thing_8e768252-b4a8-47d7-82fc-320981b50c01",
+        "world_pose": [-0.3104, 0.2586, 0.2996, 0.0, 0.0, 1.5700],
+        "confidence": "CONFIRMED_OBJECT_ROOT_ONLY",
+        "note": "UI 收纳盒整体对象位姿；Box A/B/C 三格中心位姿仍未确认。",
+    },
+}
+
 LEGACY_RIGHT_NUT_TARGETS = {
     key: pose_to_list(compute_right_grasp_pose(spec.nominal_pose)) for key, spec in NUT_SPECS.items()
 }
@@ -94,13 +117,55 @@ def search_sources() -> dict[str, Any]:
     model_config_files: list[str] = []
     for root in existing_roots:
         for path in (PROJECT_ROOT / root).rglob("*"):
-            if path.is_file() and path.suffix.lower() in {".sdf", ".urdf", ".xacro", ".xml", ".json", ".yaml", ".yml"}:
+            if path.is_file() and path.suffix.lower() in {
+                ".sdf",
+                ".urdf",
+                ".xacro",
+                ".xml",
+                ".json",
+                ".yaml",
+                ".yml",
+                ".usd",
+                ".usda",
+                ".usdc",
+            }:
                 model_config_files.append(str(path.relative_to(PROJECT_ROOT)))
     return {
         "rg_matches_preview": rg["stdout"][:20000],
         "rg_truncated": len(rg["stdout"]) > 20000,
         "model_config_files": model_config_files[:500],
         "errors": [rg["stderr"]] if rg["stderr"] else [],
+    }
+
+
+def build_box_center_records(source_search: dict[str, Any]) -> dict[str, Any]:
+    model_files = source_search.get("model_config_files", [])
+    model_candidates = [
+        path
+        for path in model_files
+        if any(k in path.lower() for k in ("box", "bin", "storage", "tray", "target", "收纳", "盒"))
+    ]
+    records = {
+        key: {
+            "world_pose": None,
+            "confidence": "UNKNOWN",
+            "source": "Rabo UI confirmed storage box root only",
+            "status": "BLOCKED_BOX_ABC_CENTER_POSE",
+            "note": (
+                "Box A/B/C 三格中心 world pose 未确认；仓库内未找到可严格解析三格中心的 "
+                "USD/URDF/SDF/scene/model 文件。"
+            ),
+        }
+        for key in ("A", "B", "C")
+    }
+    return {
+        "storage_box": CONFIRMED_SCENE_UI["storage_box"],
+        "box_centers": records,
+        "model_search": {
+            "candidate_files": model_candidates,
+            "all_model_config_files": model_files,
+            "status": "NO_MODEL_FILE_FOR_STRICT_BOX_CENTER_DERIVATION" if not model_candidates else "CANDIDATES_NEED_MANUAL_REVIEW",
+        },
     }
 
 
@@ -159,21 +224,30 @@ def build_coordinate_db(include_runtime_tf: bool = True) -> dict[str, Any]:
         }
         for key, spec in NUT_SPECS.items()
     }
-    boxes = {
-        key: {
-            "world_pose": None,
-            "staged_left_arm_pose": pose_to_list(pose),
-            "source": "agents/three_nut_expert/config.py:93-97",
-            "confidence": "INFERRED_ONLY",
-            "note": "当前仅找到左臂 staged place pose，不能当作 Box 世界坐标。",
-        }
-        for key, pose in LEFT_PLACE_POSES.items()
-    }
+    box_data = build_box_center_records(source_search)
+    boxes = box_data["box_centers"]
+    for key, pose in LEFT_PLACE_POSES.items():
+        boxes[key]["staged_left_arm_pose"] = pose_to_list(pose)
+        boxes[key]["staged_left_arm_source"] = "agents/three_nut_expert/config.py:93-97"
+        boxes[key]["staged_left_arm_note"] = "当前 left staged place pose 不能当作 Box A/B/C 真实 world pose。"
 
     frames = {
         "world": {"frame": "world", "confidence": "INFERRED_NAME"},
-        "left_arm_base": {"frame": None, "world_pose": None, "confidence": "UNKNOWN"},
-        "right_arm_base": infer_right_base_from_legacy(),
+        "left_robot_root": CONFIRMED_SCENE_UI["left_robot_root"],
+        "right_robot_root": CONFIRMED_SCENE_UI["right_robot_root"],
+        "left_arm_base": {
+            "frame": None,
+            "world_pose": None,
+            "confidence": "UNKNOWN_ROOT_TO_BASE_LINK_UNCONFIRMED",
+            "robot_root_world_pose": CONFIRMED_SCENE_UI["left_robot_root"]["world_pose"],
+            "required_check": "确认 Linker Arm A7 左 顶层 root 到内部 base_link 是否有固定变换。",
+        },
+        "right_arm_base": {
+            **infer_right_base_from_legacy(),
+            "confidence": "UNKNOWN_ROOT_TO_BASE_LINK_UNCONFIRMED",
+            "robot_root_world_pose": CONFIRMED_SCENE_UI["right_robot_root"]["world_pose"],
+            "required_check": "确认 Linker Arm A7 右 顶层 root 到内部 base_link 是否有固定变换；world->base 必须考虑 yaw≈pi。",
+        },
         "tf_frames_seen": frames_seen,
     }
 
@@ -184,7 +258,7 @@ def build_coordinate_db(include_runtime_tf: bool = True) -> dict[str, Any]:
     if frames["right_arm_base"]["confidence"] != "CONFIRMED":
         unknowns.append("RIGHT_ARM_BASE_WORLD_POSE 未确认，当前只有 legacy 公式推断")
     if any(item["confidence"] != "CONFIRMED" for item in boxes.values()):
-        unknowns.append("BLOCKED_BOX_WORLD_POSE：Box A/B/C 真实世界坐标未确认")
+        unknowns.append("BLOCKED_BOX_ABC_CENTER_POSE：Box A/B/C 三格中心 world pose 未确认")
     if validation["status"] != "PASS":
         unknowns.append("TRANSFORM_VALIDATION 未通过，不能生成完整 6×2 pose_check")
 
@@ -192,9 +266,12 @@ def build_coordinate_db(include_runtime_tf: bool = True) -> dict[str, Any]:
         "generated": now_text(),
         "host": platform.node(),
         "python": sys.version.replace("\n", " "),
+        "confirmed_scene_ui": CONFIRMED_SCENE_UI,
         "frames": frames,
         "nuts": nuts,
         "boxes": boxes,
+        "storage_box": box_data["storage_box"],
+        "box_model_search": box_data["model_search"],
         "legacy_right_targets": LEGACY_RIGHT_NUT_TARGETS,
         "validation": {"right_arm_legacy": validation},
         "source_search": source_search,
@@ -258,12 +335,21 @@ def need_coordinates_report(result: dict[str, Any]) -> str:
             "",
             "## 需要用户从 Rabo 场景中提供",
             "",
-            "1. 蓝色分类盒模型名称 / ID。",
-            "2. 蓝色分类盒模型 world pose。",
-            "3. 如果三个格子是独立 link：Box A/B/C 三个 link 的 pose。",
-            "4. 如果三个格子只是一个模型内部区域：Box A/B/C 三个目标格中心的 world pose。",
-            "5. 左臂 base_link 的 world pose。",
-            "6. 右臂 base_link 的 world pose，或可从 TF 中确认的 frame 名称。",
+            "已确认：收纳盒整体对象 `thing_8e768252-b4a8-47d7-82fc-320981b50c01` 的 UI world pose。",
+            "仍缺少：Box A/B/C 三个格子中心的 world pose，或可严格计算这些中心的模型/尺寸/局部坐标。",
+            "仍缺少：左臂 root -> base_link 固定变换，或直接确认 left base_link world pose。",
+            "仍缺少：右臂 root -> base_link 固定变换，或直接确认 right base_link world pose。",
+            "",
+            "## 当前已确认 UI 数据",
+            "",
+            f"- 左机器人 root：`{CONFIRMED_SCENE_UI['left_robot_root']['world_pose']}`",
+            f"- 右机器人 root：`{CONFIRMED_SCENE_UI['right_robot_root']['world_pose']}`",
+            f"- 收纳盒 root：`{CONFIRMED_SCENE_UI['storage_box']['world_pose']}`",
+            "",
+            "## 明确阻塞",
+            "",
+            "- BLOCKED_BOX_ABC_CENTER_POSE",
+            "- ROOT_TO_BASE_LINK_TRANSFORM_UNCONFIRMED",
             "",
             "## 本轮安全状态",
             "",
@@ -282,11 +368,13 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     result = build_coordinate_db(include_runtime_tf=not args.no_runtime_tf)
+    base_confirmed = not any("BASE_WORLD_POSE" in u or "BASE_LINK" in u for u in result["unknowns"])
+    box_confirmed = not any("BOX_WORLD_POSE" in u or "BOX_ABC_CENTER_POSE" in u for u in result["unknowns"])
     print("========================================")
     print("工作空间测试 V2 坐标解析")
     print("========================================")
-    print(f"左右臂 base_link 世界位姿：{'已确认' if not any('BASE_WORLD_POSE' in u for u in result['unknowns']) else '未确认'}")
-    print(f"Box A/B/C 世界坐标：{'已确认' if not any('BOX_WORLD_POSE' in u for u in result['unknowns']) else '未确认'}")
+    print(f"左右臂 base_link 世界位姿：{'已确认' if base_confirmed else '未确认'}")
+    print(f"Box A/B/C 世界坐标：{'已确认' if box_confirmed else '未确认'}")
     print(f"Legacy 右臂变换验证：{result['validation']['right_arm_legacy']['status']}")
     print(f"坐标 JSON：{COORD_JSON.relative_to(PROJECT_ROOT)}")
     if result["blocked"]:
