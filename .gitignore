@@ -33,6 +33,13 @@ node_modules/
 *.log
 *.tmp
 
+# Local AI working area
+.ai/
+
+# Local project backups
+*_backup.tar.gz
+agent_system_backup.tar.gz
+
 # ==========================================================
 # Runtime generated artifacts
 # ==========================================================
