@@ -183,7 +183,9 @@ def build_candidates(bounds: dict[str, Any], max_candidates: int | None = None) 
     return candidates
 
 
-def evaluate_candidates(candidates: list[dict[str, Any]], skip_runtime: bool) -> tuple[list[dict[str, Any]], str | None]:
+def evaluate_candidates(
+    candidates: list[dict[str, Any]], skip_runtime: bool, progress_every: int
+) -> tuple[list[dict[str, Any]], str | None]:
     runtime_error = None
     left_arm = None
     right_arm = None
@@ -195,7 +197,9 @@ def evaluate_candidates(candidates: list[dict[str, Any]], skip_runtime: bool) ->
             runtime_error = repr(exc)
             log_event("RUNTIME_INIT_ERROR", {"error": runtime_error})
 
-    for candidate in candidates:
+    total = len(candidates)
+    print(f"开始评估 handoff candidates: {total}", flush=True)
+    for index, candidate in enumerate(candidates, start=1):
         if skip_runtime:
             candidate.update(
                 {
@@ -235,6 +239,17 @@ def evaluate_candidates(candidates: list[dict[str, Any]], skip_runtime: bool) ->
         candidate["common_reachable"] = candidate["left_result"] == "PASS" and candidate["right_result"] == "PASS"
         candidate["cost"] = candidate["distance_to_right_arm"] + candidate["distance_to_left_arm"]
         log_event("HANDOFF_CANDIDATE_RESULT", candidate)
+        if progress_every > 0 and (index == 1 or index % progress_every == 0 or index == total):
+            print(
+                "进度 {}/{} | common={} | left={} | right={}".format(
+                    index,
+                    total,
+                    sum(1 for item in candidates[:index] if item.get("common_reachable")),
+                    sum(1 for item in candidates[:index] if item.get("left_result") == "PASS"),
+                    sum(1 for item in candidates[:index] if item.get("right_result") == "PASS"),
+                ),
+                flush=True,
+            )
 
     for arm_obj in (left_arm, right_arm):
         if hasattr(arm_obj, "shutdown"):
@@ -269,6 +284,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", type=Path, default=OUTPUT_JSON, help="Output JSON path.")
     parser.add_argument("--skip-runtime", action="store_true", help="Generate candidates without importing Rabo runtime.")
     parser.add_argument("--max-candidates", type=int, default=None, help="Limit candidates for quick smoke tests.")
+    parser.add_argument("--progress-every", type=int, default=25, help="Print progress every N candidates; use 0 to disable.")
     parser.add_argument("--x-min", type=float, default=defaults["x"][0])
     parser.add_argument("--x-max", type=float, default=defaults["x"][1])
     parser.add_argument("--x-step", type=float, default=defaults["x"][2])
@@ -290,9 +306,17 @@ def main(argv: list[str] | None = None) -> int:
         "y": [args.y_min, args.y_max, args.y_step],
         "z": [args.z_min, args.z_max, args.z_step],
     }
+    print("========================================", flush=True)
+    print("Workspace V3 Handoff Pose Search", flush=True)
+    print("========================================", flush=True)
+    print(f"搜索范围：{bounds}", flush=True)
+    print(f"skip_runtime：{args.skip_runtime}", flush=True)
     log_event("HANDOFF_SEARCH_START", {"bounds": bounds, "skip_runtime": args.skip_runtime})
     candidates = build_candidates(bounds, max_candidates=args.max_candidates)
-    candidates, runtime_error = evaluate_candidates(candidates, skip_runtime=args.skip_runtime)
+    print(f"候选生成完成：{len(candidates)}", flush=True)
+    candidates, runtime_error = evaluate_candidates(
+        candidates, skip_runtime=args.skip_runtime, progress_every=args.progress_every
+    )
     summary = summarize(candidates)
     result = {
         "generated": now_text(),
@@ -319,7 +343,7 @@ def main(argv: list[str] | None = None) -> int:
     log_event("HANDOFF_SEARCH_END", {**summary, "output": str(args.output)})
 
     print("========================================")
-    print("Workspace V3 Handoff Pose Search")
+    print("Workspace V3 Handoff Pose Search Result")
     print("========================================")
     print(f"候选总数：{len(candidates)}")
     print(f"RIGHT reachable：{summary['number_of_right_reachable']}")
