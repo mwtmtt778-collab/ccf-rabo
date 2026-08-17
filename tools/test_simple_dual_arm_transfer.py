@@ -41,13 +41,28 @@ from agents.three_nut_expert.expert import (  # noqa: E402
     pose_to_list,
     ActionStep,
 )
+from expert.transforms import transform_pose_base_to_world, transform_pose_world_to_base  # noqa: E402
+from tools.resolve_workspace_coordinates import CONFIRMED_BASE_FRAMES  # noqa: E402
 
 
 TABLE_DROP_RELEASE_POSE = Pose6(-0.40, 0.00, -0.20, 0.00, 0.80, 0.00)
-LEFT_GRASP_POSE_V1 = Pose6(0.46, -0.02, -0.33, 0.0, 0.8, 3.14)
-LEFT_APPROACH_POSE_V1 = Pose6(0.46, -0.02, -0.23, 0.0, 0.8, 3.14)
-LEFT_LIFT_POSE_V1 = Pose6(0.46, -0.02, -0.30, 0.0, 0.8, 3.14)
+LEFT_TABLE_GRASP_RPY_V1 = (0.0, 0.8, 0.0)
 LEFT_TABLE_PICK_V1_STATUS = "PROPOSED_FOR_RUNTIME_TEST"
+TABLE_NUT_Z_WORLD = NUT_SPECS["B"].nominal_pose.z
+LEFT_APPROACH_LIFT_DZ = 0.04
+STABLE_RIGHT_VERSION_SOURCE = {
+    "right_action_chain_source_commit": "10ed692 Update simple transfer calibration flow",
+    "wait_before_release_source_commit": "6c5f55b Add left table pick v1 candidate",
+    "current_regression_note": "1344175 changed failure handling and left lift gate; it did not change RIGHT ActionStep poses.",
+    "restored_scope": [
+        "RIGHT_PRE",
+        "RIGHT_APPROACH_NUT_B",
+        "RIGHT_GRASP_NUT_B",
+        "RIGHT_LIFT",
+        "RIGHT_MOVE_TRANSFER",
+        "RIGHT_RELEASE_TRANSFER",
+    ],
+}
 
 RIGHT_RETREAT_POSE = Pose6(
     TABLE_DROP_RELEASE_POSE.x,
@@ -64,13 +79,13 @@ TRANSFER_POINT = {
     "name": "manual_table_transfer_v1",
     "right_release_pose": TABLE_DROP_RELEASE_POSE,
     "right_retreat_pose": RIGHT_RETREAT_POSE,
-    "left_approach_pose": LEFT_APPROACH_POSE_V1,
-    "left_grasp_pose": LEFT_GRASP_POSE_V1,
-    "left_lift_pose": LEFT_LIFT_POSE_V1,
+    "left_approach_pose": None,
+    "left_grasp_pose": None,
+    "left_lift_pose": None,
     "left_table_pick_v1_status": LEFT_TABLE_PICK_V1_STATUS,
     "nut_transfer_world": None,
     "hand_to_nut_offset_source": None,
-    "source_note": "LEFT TABLE PICK V1 runtime-test candidate; adjust left_grasp_pose by hand only after observing Rabo behavior.",
+    "source_note": "LEFT TABLE PICK V1 mirrored from RIGHT successful table-grasp geometry; proposed for runtime test.",
 }
 
 
@@ -163,6 +178,78 @@ def make_move_step(phase: str, target: str, pose: Pose6, note: str = "") -> Acti
     return ActionStep(phase, target, "move_to", [], pose_kwargs(pose), True, note)
 
 
+def pose_from_values(values: list[float] | tuple[float, ...]) -> Pose6:
+    return Pose6(values[0], values[1], values[2], values[3], values[4], values[5])
+
+
+def xyz_delta(a: list[float], b: list[float]) -> list[float]:
+    return [a[i] - b[i] for i in range(3)]
+
+
+def xyz_add(a: list[float], b: list[float]) -> list[float]:
+    return [a[i] + b[i] for i in range(3)]
+
+
+def mirror_right_offset_for_left(offset_world_xyz: list[float]) -> list[float]:
+    return [-offset_world_xyz[0], -offset_world_xyz[1], offset_world_xyz[2]]
+
+
+def build_left_table_pick_v1(right_grasp_pose: Pose6) -> dict[str, Any]:
+    right_base_world = CONFIRMED_BASE_FRAMES["right_arm_base"]["world_pose"]
+    left_base_world = CONFIRMED_BASE_FRAMES["left_arm_base"]["world_pose"]
+    nut_world = pose_to_list(NUT_SPECS["B"].nominal_pose)
+    right_grasp_world = transform_pose_base_to_world(pose_to_list(right_grasp_pose), right_base_world)
+    right_grasp_offset_world_xyz = xyz_delta(right_grasp_world, nut_world)
+    right_release_world = transform_pose_base_to_world(pose_to_list(TABLE_DROP_RELEASE_POSE), right_base_world)
+
+    release_nut_xyz = xyz_delta(right_release_world, right_grasp_offset_world_xyz)
+    expected_transfer_nut_world = [
+        release_nut_xyz[0],
+        release_nut_xyz[1],
+        TABLE_NUT_Z_WORLD,
+        0.0,
+        0.0,
+        NUT_SPECS["B"].nominal_pose.yaw,
+    ]
+
+    left_mirrored_offset_world_xyz = mirror_right_offset_for_left(right_grasp_offset_world_xyz)
+    left_grasp_world_xyz = xyz_add(expected_transfer_nut_world, left_mirrored_offset_world_xyz)
+    left_grasp_world = [
+        left_grasp_world_xyz[0],
+        left_grasp_world_xyz[1],
+        left_grasp_world_xyz[2],
+        *LEFT_TABLE_GRASP_RPY_V1,
+    ]
+    left_grasp_base = transform_pose_world_to_base(left_grasp_world, left_base_world)
+    left_approach_base = [
+        left_grasp_base[0],
+        left_grasp_base[1],
+        left_grasp_base[2] + LEFT_APPROACH_LIFT_DZ,
+        left_grasp_base[3],
+        left_grasp_base[4],
+        left_grasp_base[5],
+    ]
+    left_lift_base = list(left_approach_base)
+    return {
+        "status": LEFT_TABLE_PICK_V1_STATUS,
+        "base_frame_source": CONFIRMED_BASE_FRAMES["source"],
+        "T_world_right_base": right_base_world,
+        "T_world_left_base": left_base_world,
+        "RIGHT_NUT_B_GRASP_BASE": pose_to_list(right_grasp_pose),
+        "RIGHT_GRASP_WORLD": right_grasp_world,
+        "RIGHT_GRASP_OFFSET_WORLD_XYZ": right_grasp_offset_world_xyz,
+        "TABLE_DROP_RELEASE_WORLD": right_release_world,
+        "EXPECTED_TRANSFER_NUT_WORLD": expected_transfer_nut_world,
+        "LEFT_MIRRORED_OFFSET_WORLD_XYZ": left_mirrored_offset_world_xyz,
+        "LEFT_TABLE_GRASP_RPY_V1": list(LEFT_TABLE_GRASP_RPY_V1),
+        "LEFT_GRASP_WORLD_V1": left_grasp_world,
+        "LEFT_GRASP_POSE_V1": left_grasp_base,
+        "LEFT_APPROACH_POSE_V1": left_approach_base,
+        "LEFT_LIFT_POSE_V1": left_lift_base,
+        "note": "V1 mirrors the RIGHT successful grasp offset across the left/right symmetric setup; not VERIFIED.",
+    }
+
+
 class StepExecutionError(RuntimeError):
     pass
 
@@ -229,16 +316,23 @@ def execute_checked_step(bundle: Any, step: ActionStep) -> Any:
 def make_plan() -> dict[str, Any]:
     nut_pose = NUT_SPECS["B"].nominal_pose
     right_grasp_pose = compute_right_grasp_pose(nut_pose)
+    left_pick_v1 = build_left_table_pick_v1(right_grasp_pose)
     right_release_pose = TRANSFER_POINT["right_release_pose"]
     right_retreat_pose = TRANSFER_POINT["right_retreat_pose"]
-    left_approach_pose = TRANSFER_POINT["left_approach_pose"]
-    left_grasp_pose = TRANSFER_POINT["left_grasp_pose"]
-    left_lift_pose = TRANSFER_POINT["left_lift_pose"]
+    left_approach_pose = pose_from_values(left_pick_v1["LEFT_APPROACH_POSE_V1"])
+    left_grasp_pose = pose_from_values(left_pick_v1["LEFT_GRASP_POSE_V1"])
+    left_lift_pose = pose_from_values(left_pick_v1["LEFT_LIFT_POSE_V1"])
     place_b_pose = LEFT_PLACE_POSES["B"]
+    TRANSFER_POINT["left_approach_pose"] = left_approach_pose
+    TRANSFER_POINT["left_grasp_pose"] = left_grasp_pose
+    TRANSFER_POINT["left_lift_pose"] = left_lift_pose
+    TRANSFER_POINT["nut_transfer_world"] = left_pick_v1["EXPECTED_TRANSFER_NUT_WORLD"]
 
     return {
+        "stable_right_version_source": STABLE_RIGHT_VERSION_SOURCE,
         "nut_b_pose": nut_pose,
         "right_grasp_pose": right_grasp_pose,
+        "left_pick_v1": left_pick_v1,
         "transfer_point": TRANSFER_POINT,
         "right_release_pose": right_release_pose,
         "right_retreat_pose": right_retreat_pose,
@@ -344,6 +438,25 @@ def transfer_pose_gates(plan: dict[str, Any]) -> list[tuple[str, str, Pose6]]:
         ("LEFT lift pose_check", "left_arm", plan["left_lift_pose"]),
         ("Official Place B pose_check", "left_arm", plan["place_b_pose"]),
     ]
+
+
+def left_pick_pose_gates(plan: dict[str, Any]) -> list[tuple[str, Pose6]]:
+    return [
+        ("LEFT approach pose_check", plan["left_approach_pose"]),
+        ("LEFT grasp pose_check", plan["left_grasp_pose"]),
+        ("LEFT lift pose_check", plan["left_lift_pose"]),
+    ]
+
+
+def run_left_pick_pose_gates(plan: dict[str, Any], left_arm: Any) -> bool:
+    passed = True
+    for label, pose in left_pick_pose_gates(plan):
+        result = check_pose(left_arm, pose)
+        print_json(label, result)
+        if result["status"] != "PASS":
+            passed = False
+    print(f"LEFT_PICK_POSE_CHECK_GATES: {'PASS' if passed else 'FAIL'}")
+    return passed
 
 
 def run_pose_gates(plan: dict[str, Any], right_arm: Any, left_arm: Any) -> bool:
@@ -531,9 +644,7 @@ def run_left_pick_calibration(args: argparse.Namespace, plan: dict[str, Any]) ->
     bundle = None
     try:
         bundle = make_left_calibration_bundle()
-        lift_check = check_pose(bundle.left_arm, plan["left_lift_pose"])
-        print_json("LEFT lift pose_check", lift_check)
-        if lift_check["status"] != "PASS":
+        if not run_left_pick_pose_gates(plan, bundle.left_arm):
             print("STOP_BEFORE_EXECUTE")
             return 2
         execute_named_groups(
@@ -627,8 +738,10 @@ def run_execute(args: argparse.Namespace, plan: dict[str, Any]) -> int:
 
 def print_targets(plan: dict[str, Any]) -> None:
     print(f"WORLD_ID: {WORLD_ID}")
+    print_json("STABLE_RIGHT_VERSION_SOURCE", plan["stable_right_version_source"])
     print_json("Nut B nominal pose", pose_to_list(plan["nut_b_pose"]))
     print_json("Right Nut B grasp pose", pose_to_list(plan["right_grasp_pose"]))
+    print_json("RIGHT_GRASP_TEMPLATE", plan["left_pick_v1"])
     print_json("TABLE_DROP_RELEASE_POSE", pose_to_list(plan["right_release_pose"]))
     print_json("Right retreat pose", pose_to_list(plan["right_retreat_pose"]))
     print_json("Left approach pose", pose_to_list(plan["left_approach_pose"]))
@@ -646,7 +759,7 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--left-pick-calibration", action="store_true", help="Run left-only table pick and lift, then stop before Place B.")
     mode.add_argument("--left-calibration", action="store_true", help="Run left-only table pick from manually configured LEFT_GRASP_POSE to Official Place B.")
     mode.add_argument("--execute", action="store_true", help="Run the full MVP motion sequence after transfer pose_check passes.")
-    parser.add_argument("--left-grasp-pose", type=float, nargs=6, metavar=("X", "Y", "Z", "ROLL", "PITCH", "YAW"), help="Override manual left_grasp_pose; left_approach_pose is set 0.10m above it. LEFT_LIFT remains independent.")
+    parser.add_argument("--left-grasp-pose", type=float, nargs=6, metavar=("X", "Y", "Z", "ROLL", "PITCH", "YAW"), help="Override manual left_grasp_pose; approach/lift are set 0.04m above it for this MVP.")
     parser.add_argument("--step-delay-s", type=float, default=0.0, help="Sleep after every executed ActionStep.")
     parser.add_argument("--settle-after-pose-s", type=float, default=0.5, help="Sleep after setting Nut B pose.")
     parser.add_argument("--hold-after-grasp-s", type=float, default=0.5, help="Sleep after grasp_force before lifting.")
@@ -657,18 +770,23 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    plan = make_plan()
     if args.left_grasp_pose is not None:
         left_grasp_pose = pose6_from_list(args.left_grasp_pose)
         TRANSFER_POINT["left_grasp_pose"] = left_grasp_pose
         TRANSFER_POINT["left_approach_pose"] = Pose6(
             left_grasp_pose.x,
             left_grasp_pose.y,
-            left_grasp_pose.z + 0.10,
+            left_grasp_pose.z + LEFT_APPROACH_LIFT_DZ,
             left_grasp_pose.roll,
             left_grasp_pose.pitch,
             left_grasp_pose.yaw,
         )
-    plan = make_plan()
+        TRANSFER_POINT["left_lift_pose"] = TRANSFER_POINT["left_approach_pose"]
+        plan["left_grasp_pose"] = TRANSFER_POINT["left_grasp_pose"]
+        plan["left_approach_pose"] = TRANSFER_POINT["left_approach_pose"]
+        plan["left_lift_pose"] = TRANSFER_POINT["left_lift_pose"]
+        plan["transfer_point"] = TRANSFER_POINT
     if args.right_calibration:
         return run_right_calibration(args, plan)
     if args.left_pick_calibration:
