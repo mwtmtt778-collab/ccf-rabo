@@ -38,7 +38,6 @@ from agents.three_nut_expert.config import (  # noqa: E402
 from agents.three_nut_expert.expert import (  # noqa: E402
     RaboDeviceBundle,
     compute_right_grasp_pose,
-    execute_step,
     pose_to_list,
     ActionStep,
 )
@@ -47,7 +46,7 @@ from agents.three_nut_expert.expert import (  # noqa: E402
 TABLE_DROP_RELEASE_POSE = Pose6(-0.40, 0.00, -0.20, 0.00, 0.80, 0.00)
 LEFT_GRASP_POSE_V1 = Pose6(0.46, -0.02, -0.33, 0.0, 0.8, 3.14)
 LEFT_APPROACH_POSE_V1 = Pose6(0.46, -0.02, -0.23, 0.0, 0.8, 3.14)
-LEFT_LIFT_POSE_V1 = LEFT_APPROACH_POSE_V1
+LEFT_LIFT_POSE_V1 = Pose6(0.46, -0.02, -0.30, 0.0, 0.8, 3.14)
 LEFT_TABLE_PICK_V1_STATUS = "PROPOSED_FOR_RUNTIME_TEST"
 
 RIGHT_RETREAT_POSE = Pose6(
@@ -162,6 +161,69 @@ def shutdown_available(bundle: Any | None) -> None:
 
 def make_move_step(phase: str, target: str, pose: Pose6, note: str = "") -> ActionStep:
     return ActionStep(phase, target, "move_to", [], pose_kwargs(pose), True, note)
+
+
+class StepExecutionError(RuntimeError):
+    pass
+
+
+def pose_step_kwargs(kwargs: dict[str, Any]) -> dict[str, float]:
+    return {
+        "x": kwargs["x"],
+        "y": kwargs["y"],
+        "z": kwargs["z"],
+        "roll": kwargs.get("roll", 0.0),
+        "pitch": kwargs.get("pitch", 0.0),
+        "yaw": kwargs.get("yaw", 0.0),
+    }
+
+
+def call_step(bundle: Any, step: ActionStep) -> Any:
+    # Reused from agents/three_nut_expert/expert.py execute_step(), with return
+    # value checking added for MVP runtime failures.
+    if step.method == "set_entity_pose":
+        thing_id, pose = step.args
+        return bundle.pose_setter.set(thing_id, tuple(pose))
+
+    target = getattr(bundle, step.target)
+    method = getattr(target, step.method)
+    if step.method == "move_to":
+        return method(**pose_step_kwargs(step.kwargs))
+    if step.method == "grasp_force":
+        if step.kwargs.get("fingers") is None:
+            return method(strength=step.kwargs["strength"])
+        return method(strength=step.kwargs["strength"], fingers=step.kwargs["fingers"])
+    return method(*step.args, **step.kwargs)
+
+
+def step_result_failed(result: Any) -> tuple[bool, str]:
+    value = jsonable(result)
+    if result is None:
+        return False, ""
+    if isinstance(result, bool):
+        return (not result), "returned_false"
+    if isinstance(value, dict):
+        lower = {str(k).lower(): v for k, v in value.items()}
+        ok = lower.get("success", lower.get("ok", lower.get("reachable", lower.get("result"))))
+        if isinstance(ok, bool):
+            return (not ok), str(lower.get("reason", lower.get("message", lower.get("error", "")))
+                                   or ("returned_false" if not ok else ""))
+        text = json.dumps(value, ensure_ascii=False)
+    else:
+        text = str(value)
+    low = text.lower()
+    failure_tokens = ("error", "failed", "fail", "false", "ik", "无解", "失败", "错误")
+    if any(token in low for token in failure_tokens):
+        return True, text
+    return False, ""
+
+
+def execute_checked_step(bundle: Any, step: ActionStep) -> Any:
+    result = call_step(bundle, step)
+    failed, reason = step_result_failed(result)
+    if failed:
+        raise StepExecutionError(f"{step.target}.{step.method} failed: {reason}; return={repr(result)}")
+    return result
 
 
 def make_plan() -> dict[str, Any]:
@@ -333,13 +395,14 @@ def execute_named_groups(
             print_json("STEP_NAME", name)
             print_json("TARGET_POSE", step_target_payload(step))
             try:
-                execute_step(bundle, step)
+                result = execute_checked_step(bundle, step)
             except Exception as exc:
+                print_json("RESULT", {"status": "FAILED", "target": step.target, "method": step.method, "error": repr(exc)})
                 print("FAILED_STEP")
                 print(name)
                 print(f"exception: {repr(exc)}")
                 raise
-            print_json("RESULT", {"status": "OK", "target": step.target, "method": step.method})
+            print_json("RESULT", {"status": "OK", "target": step.target, "method": step.method, "return": jsonable(result)})
             if step.method == "set_entity_pose" and settle_after_pose_s > 0:
                 time.sleep(settle_after_pose_s)
             if step.method == "grasp_force" and hold_after_grasp_s > 0:
@@ -468,6 +531,11 @@ def run_left_pick_calibration(args: argparse.Namespace, plan: dict[str, Any]) ->
     bundle = None
     try:
         bundle = make_left_calibration_bundle()
+        lift_check = check_pose(bundle.left_arm, plan["left_lift_pose"])
+        print_json("LEFT lift pose_check", lift_check)
+        if lift_check["status"] != "PASS":
+            print("STOP_BEFORE_EXECUTE")
+            return 2
         execute_named_groups(
             bundle,
             make_left_pick_calibration_groups(plan),
@@ -578,7 +646,7 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--left-pick-calibration", action="store_true", help="Run left-only table pick and lift, then stop before Place B.")
     mode.add_argument("--left-calibration", action="store_true", help="Run left-only table pick from manually configured LEFT_GRASP_POSE to Official Place B.")
     mode.add_argument("--execute", action="store_true", help="Run the full MVP motion sequence after transfer pose_check passes.")
-    parser.add_argument("--left-grasp-pose", type=float, nargs=6, metavar=("X", "Y", "Z", "ROLL", "PITCH", "YAW"), help="Override manual left_grasp_pose; left_approach_pose is set 0.10m above it.")
+    parser.add_argument("--left-grasp-pose", type=float, nargs=6, metavar=("X", "Y", "Z", "ROLL", "PITCH", "YAW"), help="Override manual left_grasp_pose; left_approach_pose is set 0.10m above it. LEFT_LIFT remains independent.")
     parser.add_argument("--step-delay-s", type=float, default=0.0, help="Sleep after every executed ActionStep.")
     parser.add_argument("--settle-after-pose-s", type=float, default=0.5, help="Sleep after setting Nut B pose.")
     parser.add_argument("--hold-after-grasp-s", type=float, default=0.5, help="Sleep after grasp_force before lifting.")
@@ -600,7 +668,6 @@ def main(argv: list[str] | None = None) -> int:
             left_grasp_pose.pitch,
             left_grasp_pose.yaw,
         )
-        TRANSFER_POINT["left_lift_pose"] = TRANSFER_POINT["left_approach_pose"]
     plan = make_plan()
     if args.right_calibration:
         return run_right_calibration(args, plan)
