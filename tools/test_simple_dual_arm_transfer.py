@@ -107,6 +107,44 @@ LEFT_GRASP_DIAGNOSIS_CASES = [
     ),
 ]
 
+LEFT_DRY_RUN_CANDIDATES = [
+    {
+        "name": "LEFT_DRY_RUN_CANDIDATE_1",
+        "approach": Pose6(0.43, 0.25, -0.16, 0.0, 0.0, 0.0),
+        "grasp": Pose6(0.43, 0.25, -0.20, 0.0, 0.0, 0.0),
+        "lift": Pose6(0.43, 0.25, -0.16, 0.0, 0.0, 0.0),
+        "note": "Centered on Official Place B reachable region.",
+    },
+    {
+        "name": "LEFT_DRY_RUN_CANDIDATE_2",
+        "approach": Pose6(0.41, 0.23, -0.16, 0.0, 0.0, 0.0),
+        "grasp": Pose6(0.41, 0.23, -0.20, 0.0, 0.0, 0.0),
+        "lift": Pose6(0.41, 0.23, -0.16, 0.0, 0.0, 0.0),
+        "note": "Slightly inward from Official Place B.",
+    },
+    {
+        "name": "LEFT_DRY_RUN_CANDIDATE_3",
+        "approach": Pose6(0.45, 0.27, -0.16, 0.0, 0.0, 0.0),
+        "grasp": Pose6(0.45, 0.27, -0.20, 0.0, 0.0, 0.0),
+        "lift": Pose6(0.45, 0.27, -0.16, 0.0, 0.0, 0.0),
+        "note": "Slightly outward from Official Place B.",
+    },
+    {
+        "name": "LEFT_DRY_RUN_CANDIDATE_4",
+        "approach": Pose6(0.39, 0.20, -0.16, 0.0, 0.0, 0.0),
+        "grasp": Pose6(0.39, 0.20, -0.20, 0.0, 0.0, 0.0),
+        "lift": Pose6(0.39, 0.20, -0.16, 0.0, 0.0, 0.0),
+        "note": "Official Place A neighborhood.",
+    },
+    {
+        "name": "LEFT_DRY_RUN_CANDIDATE_5",
+        "approach": Pose6(0.47, 0.30, -0.16, 0.0, 0.0, 0.0),
+        "grasp": Pose6(0.47, 0.30, -0.20, 0.0, 0.0, 0.0),
+        "lift": Pose6(0.47, 0.30, -0.16, 0.0, 0.0, 0.0),
+        "note": "Official Place C neighborhood.",
+    },
+]
+
 
 def jsonable(value: Any) -> Any:
     if isinstance(value, (str, int, float, bool)) or value is None:
@@ -433,6 +471,38 @@ def make_left_calibration_groups(plan: dict[str, Any]) -> list[tuple[str, list[A
     ]
 
 
+def make_left_dry_run_groups(pose_set: dict[str, Any]) -> list[tuple[str, list[ActionStep]]]:
+    return [
+        (
+            "LEFT_PRE",
+            [
+                ActionStep("pre_position", "left_arm", "move_joints", [joints], {}, True, "legacy left pre-position")
+                for joints in LEFT_PRE_JOINTS
+            ],
+        ),
+        ("LEFT_OPEN_HAND", [ActionStep("open", "left_hand", "clench", list(HAND_OPEN), {}, True, "legacy hand open before dry run")]),
+        ("LEFT_DRY_APPROACH", [make_move_step("dry_approach", "left_arm", pose_set["approach"], "left dry run approach")]),
+        ("LEFT_DRY_DESCEND", [make_move_step("dry_descend", "left_arm", pose_set["grasp"], "left dry run descend")]),
+        (
+            "LEFT_DRY_CLOSE",
+            [
+                ActionStep("dry_close", "left_hand", "clench", list(LEFT_GRASP), {}, True, "legacy left grasp posture, empty hand"),
+                ActionStep("dry_close", "left_hand", "grasp_force", [], {"strength": LEFT_GRASP_FORCE["strength"]}, True, "legacy left grasp force, empty hand"),
+            ],
+        ),
+        ("LEFT_DRY_LIFT", [make_move_step("dry_lift", "left_arm", pose_set["lift"], "left dry run lift")]),
+        ("LEFT_MOVE_PLACE_B", [make_move_step("place", "left_arm", LEFT_PLACE_POSES["B"], "Official Place B")]),
+        ("LEFT_DRY_RELEASE", [ActionStep("dry_release", "left_hand", "clench", list(HAND_OPEN), {}, True, "legacy hand open release")]),
+        (
+            "LEFT_RETURN_SAFE",
+            [
+                ActionStep("return_safe", "left_arm", "move_joints", [joints], {}, True, "legacy left pre-position")
+                for joints in LEFT_PRE_JOINTS
+            ],
+        ),
+    ]
+
+
 def pose6_from_list(pose: list[float]) -> Pose6:
     return Pose6(pose[0], pose[1], pose[2], pose[3], pose[4], pose[5])
 
@@ -488,6 +558,39 @@ def run_pose_gates(plan: dict[str, Any], right_arm: Any, left_arm: Any) -> bool:
             passed = False
     print(f"POSE_CHECK_GATES: {'PASS' if passed else 'FAIL'}")
     return passed
+
+
+def summarize_dry_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "name": candidate["name"],
+        "approach": pose_to_list(candidate["approach"]),
+        "grasp": pose_to_list(candidate["grasp"]),
+        "lift": pose_to_list(candidate["lift"]),
+        "note": candidate["note"],
+    }
+
+
+def check_left_dry_run_candidates(left_arm: Any) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    checked = []
+    for candidate in LEFT_DRY_RUN_CANDIDATES:
+        row = {"candidate": summarize_dry_candidate(candidate), "results": {}}
+        all_pass = True
+        for key in ("approach", "grasp", "lift"):
+            result = check_pose(left_arm, candidate[key])
+            row["results"][key] = {
+                "status": result["status"],
+                "reason": result["reason"],
+                "raw_result": result["raw"],
+            }
+            if result["status"] != "PASS":
+                all_pass = False
+        checked.append(row)
+        print_json(candidate["name"], row)
+        if all_pass:
+            print_json("SELECTED_LEFT_DRY_RUN_POSE_SET", summarize_dry_candidate(candidate))
+            return candidate, checked
+    print("LEFT_DRY_RUN_CHECK = FAIL")
+    return None, checked
 
 
 def run_check_only(plan: dict[str, Any]) -> int:
@@ -692,6 +795,61 @@ def run_left_pose_diagnosis() -> int:
             print(f"shutdown exception: {repr(exc)}")
 
 
+def run_left_dry_run_check() -> int:
+    print("MODE: LEFT_DRY_RUN_CHECK")
+    print("No move_to, move_joints, SetEntityPose, clench, or grasp_force will be called.")
+    print_json("LEFT_DRY_RUN_CANDIDATES", [summarize_dry_candidate(candidate) for candidate in LEFT_DRY_RUN_CANDIDATES])
+    bundle = None
+    try:
+        bundle = make_left_pose_check_bundle()
+        selected, _checked = check_left_dry_run_candidates(bundle.left_arm)
+        return 0 if selected is not None else 2
+    except Exception as exc:
+        print("FAILED_LEFT_DRY_RUN_CHECK")
+        print(f"exception: {repr(exc)}")
+        print_json("current_state", read_available_state(bundle))
+        return 1
+    finally:
+        try:
+            shutdown_available(bundle)
+        except Exception as exc:
+            print(f"shutdown exception: {repr(exc)}")
+
+
+def run_left_dry_run(args: argparse.Namespace) -> int:
+    print("MODE: LEFT_DRY_RUN")
+    print_json("LEFT_DRY_RUN_CANDIDATES", [summarize_dry_candidate(candidate) for candidate in LEFT_DRY_RUN_CANDIDATES])
+    bundle = None
+    try:
+        bundle = make_left_calibration_bundle()
+        selected, _checked = check_left_dry_run_candidates(bundle.left_arm)
+        place_check = check_pose(bundle.left_arm, LEFT_PLACE_POSES["B"])
+        print_json("Official Place B pose_check", place_check)
+        if selected is None or place_check["status"] != "PASS":
+            print("STOP_BEFORE_EXECUTE")
+            return 2
+        execute_named_groups(
+            bundle,
+            make_left_dry_run_groups(selected),
+            step_delay_s=args.step_delay_s,
+            settle_after_pose_s=args.settle_after_pose_s,
+            hold_after_grasp_s=args.hold_after_grasp_s,
+        )
+        print("[STEP 10] DONE")
+        print("LEFT_DRY_RUN_V0_SUCCESS")
+        return 0
+    except Exception as exc:
+        print("FAILED_STEP")
+        print(f"exception: {repr(exc)}")
+        print_json("current_state", read_available_state(bundle))
+        return 1
+    finally:
+        try:
+            shutdown_available(bundle)
+        except Exception as exc:
+            print(f"shutdown exception: {repr(exc)}")
+
+
 def run_left_calibration(args: argparse.Namespace, plan: dict[str, Any]) -> int:
     print("MODE: LEFT_CALIBRATION")
     print_targets(plan)
@@ -839,6 +997,8 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--right-calibration", action="store_true", help="Run right-only Nut B pick and table release, then stop for manual Nut B world-pose recording.")
     mode.add_argument("--left-pick-calibration", action="store_true", help="Run left-only table pick and lift, then stop before Place B.")
     mode.add_argument("--left-pose-diagnosis", action="store_true", help="Run four left grasp pose_check-only diagnosis cases; no robot motion.")
+    mode.add_argument("--left-dry-run-check", action="store_true", help="Find first all-PASS left dry-run pose candidate with pose_check only.")
+    mode.add_argument("--left-dry-run", action="store_true", help="Run left arm dry-run V0 after pose_check gates pass.")
     mode.add_argument("--left-calibration", action="store_true", help="Run left-only table pick from manually configured LEFT_GRASP_POSE to Official Place B.")
     mode.add_argument("--execute", action="store_true", help="Run the full MVP motion sequence after transfer pose_check passes.")
     parser.add_argument("--left-grasp-pose", type=float, nargs=6, metavar=("X", "Y", "Z", "ROLL", "PITCH", "YAW"), help="Override manual left_grasp_pose; approach/lift are set 0.04m above it for this MVP.")
@@ -873,6 +1033,10 @@ def main(argv: list[str] | None = None) -> int:
         return run_right_calibration(args, plan)
     if args.left_pose_diagnosis:
         return run_left_pose_diagnosis()
+    if args.left_dry_run_check:
+        return run_left_dry_run_check()
+    if args.left_dry_run:
+        return run_left_dry_run(args)
     if args.left_pick_calibration:
         return run_left_pick_calibration(args, plan)
     if args.left_calibration:
