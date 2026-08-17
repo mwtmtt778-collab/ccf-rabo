@@ -88,6 +88,25 @@ TRANSFER_POINT = {
     "source_note": "LEFT TABLE PICK V1 mirrored from RIGHT successful table-grasp geometry; proposed for runtime test.",
 }
 
+LEFT_GRASP_DIAGNOSIS_CASES = [
+    (
+        "CASE_A_CURRENT_V1",
+        Pose6(0.5205002967, -0.0277446182, -0.33, 0.0, 0.8, 0.0),
+    ),
+    (
+        "CASE_B_FAR_YAW_PI",
+        Pose6(0.5205002967, -0.0277446182, -0.33, 0.0, 0.8, 3.14),
+    ),
+    (
+        "CASE_C_NEAR_YAW_ZERO",
+        Pose6(0.46, -0.02, -0.33, 0.0, 0.8, 0.0),
+    ),
+    (
+        "CASE_D_NEAR_YAW_PI",
+        Pose6(0.46, -0.02, -0.33, 0.0, 0.8, 3.14),
+    ),
+]
+
 
 def jsonable(value: Any) -> Any:
     if isinstance(value, (str, int, float, bool)) or value is None:
@@ -558,6 +577,13 @@ def make_left_calibration_bundle() -> Any:
     )
 
 
+def make_left_pose_check_bundle() -> Any:
+    from rabo_robocap import LinkerArmA7
+    from agents.three_nut_expert.config import DEVICE_IDS
+
+    return SimpleNamespace(left_arm=LinkerArmA7(robot_id=DEVICE_IDS["LEFT_ARM"], mode="sim"))
+
+
 def run_right_calibration(args: argparse.Namespace, plan: dict[str, Any]) -> int:
     print("MODE: RIGHT_CALIBRATION")
     print_targets(plan)
@@ -601,6 +627,61 @@ def run_right_calibration(args: argparse.Namespace, plan: dict[str, Any]) -> int
         return 0
     except Exception as exc:
         print("FAILED_STEP")
+        print(f"exception: {repr(exc)}")
+        print_json("current_state", read_available_state(bundle))
+        return 1
+    finally:
+        try:
+            shutdown_available(bundle)
+        except Exception as exc:
+            print(f"shutdown exception: {repr(exc)}")
+
+
+def diagnose_left_grasp(results: dict[str, dict[str, Any]]) -> str:
+    statuses = {name: item["status"] for name, item in results.items()}
+    a_fail = statuses["CASE_A_CURRENT_V1"] == "FAIL"
+    b_fail = statuses["CASE_B_FAR_YAW_PI"] == "FAIL"
+    c_fail = statuses["CASE_C_NEAR_YAW_ZERO"] == "FAIL"
+    d_fail = statuses["CASE_D_NEAR_YAW_PI"] == "FAIL"
+    if a_fail and b_fail and not c_fail:
+        return "POSITION_LIMIT_DOMINANT"
+    if a_fail and not b_fail:
+        return "ORIENTATION_DOMINANT"
+    if a_fail and b_fail and c_fail and not d_fail:
+        return "POSITION_AND_ORIENTATION_COUPLED"
+    if a_fail and b_fail and c_fail and d_fail:
+        return "CURRENT_TEST_SET_INSUFFICIENT"
+    return "INCONCLUSIVE"
+
+
+def run_left_pose_diagnosis() -> int:
+    print("MODE: LEFT_POSE_DIAGNOSIS")
+    print("No move_to, move_joints, SetEntityPose, clench, or grasp_force will be called.")
+    print_json(
+        "LEFT_GRASP_DIAGNOSIS_CASES",
+        {name: pose_to_list(pose) for name, pose in LEFT_GRASP_DIAGNOSIS_CASES},
+    )
+    bundle = None
+    try:
+        bundle = make_left_pose_check_bundle()
+        results = {}
+        for name, pose in LEFT_GRASP_DIAGNOSIS_CASES:
+            result = check_pose(bundle.left_arm, pose)
+            row = {
+                "case_name": name,
+                "pose": pose_to_list(pose),
+                "status": result["status"],
+                "reason": result["reason"],
+                "raw_result": result["raw"],
+            }
+            results[name] = row
+            print_json(name, row)
+        summary = {name: row["status"] for name, row in results.items()}
+        print_json("LEFT_GRASP_DIAGNOSIS", summary)
+        print(f"DIAGNOSIS = {diagnose_left_grasp(results)}")
+        return 0
+    except Exception as exc:
+        print("FAILED_LEFT_POSE_DIAGNOSIS")
         print(f"exception: {repr(exc)}")
         print_json("current_state", read_available_state(bundle))
         return 1
@@ -757,6 +838,7 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--check-only", action="store_true", help="Initialize arms, pose_check transfer poses, and print targets only.")
     mode.add_argument("--right-calibration", action="store_true", help="Run right-only Nut B pick and table release, then stop for manual Nut B world-pose recording.")
     mode.add_argument("--left-pick-calibration", action="store_true", help="Run left-only table pick and lift, then stop before Place B.")
+    mode.add_argument("--left-pose-diagnosis", action="store_true", help="Run four left grasp pose_check-only diagnosis cases; no robot motion.")
     mode.add_argument("--left-calibration", action="store_true", help="Run left-only table pick from manually configured LEFT_GRASP_POSE to Official Place B.")
     mode.add_argument("--execute", action="store_true", help="Run the full MVP motion sequence after transfer pose_check passes.")
     parser.add_argument("--left-grasp-pose", type=float, nargs=6, metavar=("X", "Y", "Z", "ROLL", "PITCH", "YAW"), help="Override manual left_grasp_pose; approach/lift are set 0.04m above it for this MVP.")
@@ -789,6 +871,8 @@ def main(argv: list[str] | None = None) -> int:
         plan["transfer_point"] = TRANSFER_POINT
     if args.right_calibration:
         return run_right_calibration(args, plan)
+    if args.left_pose_diagnosis:
+        return run_left_pose_diagnosis()
     if args.left_pick_calibration:
         return run_left_pick_calibration(args, plan)
     if args.left_calibration:
