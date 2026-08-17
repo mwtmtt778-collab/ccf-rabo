@@ -45,6 +45,11 @@ from agents.three_nut_expert.expert import (  # noqa: E402
 
 
 TABLE_DROP_RELEASE_POSE = Pose6(-0.40, 0.00, -0.20, 0.00, 0.80, 0.00)
+LEFT_GRASP_POSE_V1 = Pose6(0.46, -0.02, -0.33, 0.0, 0.8, 3.14)
+LEFT_APPROACH_POSE_V1 = Pose6(0.46, -0.02, -0.23, 0.0, 0.8, 3.14)
+LEFT_LIFT_POSE_V1 = LEFT_APPROACH_POSE_V1
+LEFT_TABLE_PICK_V1_STATUS = "PROPOSED_FOR_RUNTIME_TEST"
+
 RIGHT_RETREAT_POSE = Pose6(
     TABLE_DROP_RELEASE_POSE.x,
     TABLE_DROP_RELEASE_POSE.y,
@@ -60,11 +65,13 @@ TRANSFER_POINT = {
     "name": "manual_table_transfer_v1",
     "right_release_pose": TABLE_DROP_RELEASE_POSE,
     "right_retreat_pose": RIGHT_RETREAT_POSE,
-    "left_approach_pose": Pose6(0.44, 0.06, -0.10, 0.0, 1.3, 1.57),
-    "left_grasp_pose": Pose6(0.44, 0.06, -0.20, 0.0, 1.3, 1.57),
+    "left_approach_pose": LEFT_APPROACH_POSE_V1,
+    "left_grasp_pose": LEFT_GRASP_POSE_V1,
+    "left_lift_pose": LEFT_LIFT_POSE_V1,
+    "left_table_pick_v1_status": LEFT_TABLE_PICK_V1_STATUS,
     "nut_transfer_world": None,
     "hand_to_nut_offset_source": None,
-    "source_note": "MVP manual table drop and manually calibrated left pick; adjust left_grasp_pose by hand.",
+    "source_note": "LEFT TABLE PICK V1 runtime-test candidate; adjust left_grasp_pose by hand only after observing Rabo behavior.",
 }
 
 
@@ -164,7 +171,7 @@ def make_plan() -> dict[str, Any]:
     right_retreat_pose = TRANSFER_POINT["right_retreat_pose"]
     left_approach_pose = TRANSFER_POINT["left_approach_pose"]
     left_grasp_pose = TRANSFER_POINT["left_grasp_pose"]
-    left_lift_pose = left_approach_pose
+    left_lift_pose = TRANSFER_POINT["left_lift_pose"]
     place_b_pose = LEFT_PLACE_POSES["B"]
 
     return {
@@ -384,12 +391,23 @@ def run_right_calibration(args: argparse.Namespace, plan: dict[str, Any]) -> int
         right_groups = make_right_calibration_groups(plan)
         execute_named_groups(
             bundle,
-            right_groups[:6],
+            right_groups[:5],
             step_delay_s=args.step_delay_s,
             settle_after_pose_s=args.settle_after_pose_s,
             hold_after_grasp_s=args.hold_after_grasp_s,
         )
-        print(f"[STEP 7] WAIT_OBJECT_SETTLE {args.settle_after_release_s:.2f}s")
+        print(f"[STEP 6] WAIT_BEFORE_RELEASE {args.wait_before_release_s:.2f}s")
+        if args.wait_before_release_s > 0:
+            time.sleep(args.wait_before_release_s)
+        execute_named_groups(
+            bundle,
+            right_groups[5:6],
+            step_delay_s=args.step_delay_s,
+            settle_after_pose_s=args.settle_after_pose_s,
+            hold_after_grasp_s=args.hold_after_grasp_s,
+            start_index=7,
+        )
+        print(f"[STEP 8] WAIT_OBJECT_SETTLE {args.settle_after_release_s:.2f}s")
         if args.settle_after_release_s > 0:
             time.sleep(args.settle_after_release_s)
         execute_named_groups(
@@ -398,7 +416,7 @@ def run_right_calibration(args: argparse.Namespace, plan: dict[str, Any]) -> int
             step_delay_s=args.step_delay_s,
             settle_after_pose_s=args.settle_after_pose_s,
             hold_after_grasp_s=args.hold_after_grasp_s,
-            start_index=8,
+            start_index=9,
         )
         print("RIGHT_ARM_CLEAR_OF_TRANSFER_ZONE")
         print("STOP")
@@ -487,12 +505,23 @@ def run_execute(args: argparse.Namespace, plan: dict[str, Any]) -> int:
         right_groups = make_right_calibration_groups(plan)
         execute_named_groups(
             bundle,
-            right_groups[:6],
+            right_groups[:5],
             step_delay_s=args.step_delay_s,
             settle_after_pose_s=args.settle_after_pose_s,
             hold_after_grasp_s=args.hold_after_grasp_s,
         )
-        print(f"[STEP 7] WAIT_OBJECT_SETTLE {args.settle_after_release_s:.2f}s")
+        print(f"[STEP 6] WAIT_BEFORE_RELEASE {args.wait_before_release_s:.2f}s")
+        if args.wait_before_release_s > 0:
+            time.sleep(args.wait_before_release_s)
+        execute_named_groups(
+            bundle,
+            right_groups[5:6],
+            step_delay_s=args.step_delay_s,
+            settle_after_pose_s=args.settle_after_pose_s,
+            hold_after_grasp_s=args.hold_after_grasp_s,
+            start_index=7,
+        )
+        print(f"[STEP 8] WAIT_OBJECT_SETTLE {args.settle_after_release_s:.2f}s")
         if args.settle_after_release_s > 0:
             time.sleep(args.settle_after_release_s)
         execute_named_groups(
@@ -501,7 +530,7 @@ def run_execute(args: argparse.Namespace, plan: dict[str, Any]) -> int:
             step_delay_s=args.step_delay_s,
             settle_after_pose_s=args.settle_after_pose_s,
             hold_after_grasp_s=args.hold_after_grasp_s,
-            start_index=8,
+            start_index=9,
         )
         print("RIGHT_ARM_CLEAR_OF_TRANSFER_ZONE")
         execute_named_groups(
@@ -510,9 +539,9 @@ def run_execute(args: argparse.Namespace, plan: dict[str, Any]) -> int:
             step_delay_s=args.step_delay_s,
             settle_after_pose_s=args.settle_after_pose_s,
             hold_after_grasp_s=args.hold_after_grasp_s,
-            start_index=10,
+            start_index=11,
         )
-        print("[STEP 18] DONE")
+        print("[STEP 19] DONE")
         print("MVP_DUAL_ARM_TRANSFER_SUCCESS")
         return 0
     except Exception as exc:
@@ -553,6 +582,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--step-delay-s", type=float, default=0.0, help="Sleep after every executed ActionStep.")
     parser.add_argument("--settle-after-pose-s", type=float, default=0.5, help="Sleep after setting Nut B pose.")
     parser.add_argument("--hold-after-grasp-s", type=float, default=0.5, help="Sleep after grasp_force before lifting.")
+    parser.add_argument("--wait-before-release-s", type=float, default=1.5, help="Right arm wait after moving to TABLE_DROP_RELEASE_POSE and before opening the hand.")
     parser.add_argument("--settle-after-release-s", type=float, default=3.0, help="Right calibration wait after releasing Nut B at the table transfer point.")
     return parser
 
@@ -570,6 +600,7 @@ def main(argv: list[str] | None = None) -> int:
             left_grasp_pose.pitch,
             left_grasp_pose.yaw,
         )
+        TRANSFER_POINT["left_lift_pose"] = TRANSFER_POINT["left_approach_pose"]
     plan = make_plan()
     if args.right_calibration:
         return run_right_calibration(args, plan)
