@@ -183,6 +183,9 @@ def scan_candidates(args: argparse.Namespace, values: dict[str, list[float]]) ->
     checker = PoseChecker(args.mock)
     candidates: list[dict[str, Any]] = []
     index = 0
+    total = math.prod(len(v) for v in values.values())
+    started = time.time()
+    full_chain_pass_count = 0
     try:
         for iz, z in enumerate(values["z"]):
             for ir, roll in enumerate(values["roll"]):
@@ -221,10 +224,27 @@ def scan_candidates(args: argparse.Namespace, values: dict[str, list[float]]) ->
                                 "orientation_prior_distance": orientation_prior_distance(grasp),
                             }
                         )
+                        if full_chain_pass:
+                            full_chain_pass_count += 1
                         index += 1
+                        if args.progress_every > 0 and (index == 1 or index % args.progress_every == 0 or index == total):
+                            print_progress(index, total, full_chain_pass_count, started)
         return candidates
     finally:
         checker.shutdown()
+
+
+def print_progress(done: int, total: int, pass_count: int, started: float) -> None:
+    elapsed = max(0.001, time.time() - started)
+    rate = done / elapsed
+    remaining = max(0, total - done)
+    eta_s = remaining / rate if rate > 0 else 0.0
+    percent = 100.0 * done / total if total else 100.0
+    print(
+        f"SCAN_PROGRESS: {done}/{total} ({percent:.1f}%) "
+        f"FULL_CHAIN_PASS={pass_count} elapsed={elapsed:.1f}s eta={eta_s:.1f}s",
+        flush=True,
+    )
 
 
 def orientation_prior_distance(pose: list[float]) -> float:
@@ -629,6 +649,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fine-angle-radius", type=float, default=0.20)
     parser.add_argument("--fine-angle-step", type=float, default=0.05)
     parser.add_argument("--top-n", type=int, default=10)
+    parser.add_argument("--progress-every", type=int, default=25, help="Print scan progress every N candidates; 0 disables progress output.")
     parser.add_argument("--mock", choices=("islands", "pitch-sign", "all-pass"), help="Local logic test mode; does not initialize Rabo SDK.")
     return parser
 
