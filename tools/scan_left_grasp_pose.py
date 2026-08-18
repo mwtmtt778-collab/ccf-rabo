@@ -170,6 +170,29 @@ def build_orientation_local_values(args: argparse.Namespace) -> dict[str, list[f
     }
 
 
+def progressive_level_values(center: list[float], level: int) -> dict[str, list[float]]:
+    if level == 1:
+        return {
+            "z": [round(center[2] - 0.01, 6), round(center[2], 6)],
+            "roll": frange(-0.4, 0.4, 0.2),
+            "pitch": frange(0.6, 1.0, 0.2),
+            "yaw": [-round(math.pi, 6), -3.0, -2.8, 2.8, 3.0, round(math.pi, 6)],
+        }
+    if level == 2:
+        return {
+            "z": [round(center[2] - 0.01, 6), round(center[2], 6)],
+            "roll": frange(-0.6, 0.6, 0.2),
+            "pitch": frange(0.4, 1.2, 0.2),
+            "yaw": [-round(math.pi, 6), -3.0, -2.8, -2.6, 2.6, 2.8, 3.0, round(math.pi, 6)],
+        }
+    return {
+        "z": [round(center[2] - 0.01, 6), round(center[2], 6), round(center[2] + 0.01, 6)],
+        "roll": frange(-0.8, 0.8, 0.2),
+        "pitch": frange(0.2, 1.4, 0.2),
+        "yaw": local_yaw_values(0.2),
+    }
+
+
 def local_yaw_values(step: float) -> list[float]:
     if step <= 0.0:
         raise ValueError("local yaw step must be positive")
@@ -199,6 +222,7 @@ class PoseChecker:
     def __init__(self, mock: str | None) -> None:
         self.mock = mock
         self.arm = None
+        self.attempts: dict[tuple[float, ...], int] = {}
         if mock is None:
             from rabo_robocap import LinkerArmA7
 
@@ -210,15 +234,31 @@ class PoseChecker:
 
     def check(self, pose: list[float]) -> tuple[str, str, Any]:
         if self.mock is not None:
-            return self.mock_check(pose)
+            key = tuple(round(v, 6) for v in pose)
+            self.attempts[key] = self.attempts.get(key, 0) + 1
+            return self.mock_check(pose, self.attempts[key])
         raw = self.arm.pose_check(pose[0], pose[1], pose[2], roll=pose[3], pitch=pose[4], yaw=pose[5])
         return normalize_pose_check(raw)
 
-    def mock_check(self, pose: list[float]) -> tuple[str, str, Any]:
+    def mock_check(self, pose: list[float], attempt: int = 1) -> tuple[str, str, Any]:
         _x, _y, z, roll, pitch, yaw = pose
         table_chain_z = -0.345 <= z <= -0.265
         if self.mock == "all-pass":
             ok = True
+        elif self.mock == "progressive":
+            stable = (
+                -0.34 <= z <= -0.33
+                and abs(roll) <= 0.2
+                and 0.6 <= pitch <= 1.0
+                and angular_distance(yaw, math.pi) <= 0.35
+            )
+            flaky = (
+                -0.34 <= z <= -0.33
+                and abs(roll) <= 0.4
+                and 0.6 <= pitch <= 1.0
+                and angular_distance(yaw, math.pi) <= 0.55
+            )
+            ok = stable or (flaky and attempt == 1)
         elif self.mock == "orientation-local":
             ok = (
                 -0.34 <= z <= -0.32
@@ -232,7 +272,7 @@ class PoseChecker:
             positive = table_chain_z and abs(roll) <= 0.25 and 0.55 <= pitch <= 1.05 and abs(yaw) <= 0.45
             negative = table_chain_z and abs(roll) <= 0.2 and -1.0 <= pitch <= -0.6 and abs(yaw) <= 0.25
             ok = positive or negative
-        return ("PASS" if ok else "FAIL", "mock_reachable" if ok else "mock_outside_stable_region", {"mock": self.mock, "ok": ok})
+        return ("PASS" if ok else "FAIL", "mock_reachable" if ok else "mock_outside_stable_region", {"mock": self.mock, "ok": ok, "attempt": attempt})
 
 
 def candidate_id(index: int) -> str:
@@ -454,6 +494,252 @@ def scan_orientation_local(args: argparse.Namespace, values: dict[str, list[floa
     return candidates, status, elapsed
 
 
+def print_phase(name: str) -> None:
+    print("")
+    print("=" * 60)
+    print(name)
+    print("=" * 60)
+
+
+def total_level_candidates(values: dict[str, list[float]]) -> int:
+    return math.prod(len(v) for v in values.values())
+
+
+def print_progressive_workload(level: int, values: dict[str, list[float]], args: argparse.Namespace) -> None:
+    total = total_level_candidates(values)
+    print(f"LEVEL {level} CANDIDATES:\n{total}")
+    print(f"INITIAL POSE_CHECK CALLS:\n{total * args.initial_checks}")
+    print(f"MAX ADDITIONAL RECHECKS:\n{total * args.repeat_checks}")
+    print(f"MAX TOTAL:\n{total * (args.initial_checks + args.repeat_checks)}")
+
+
+def progressive_pose_items(args: argparse.Namespace, values: dict[str, list[float]], seen_poses: set[tuple[float, ...]]) -> list[tuple[list[int], list[float]]]:
+    items = []
+    for iz, z in enumerate(values["z"]):
+        for ir, roll in enumerate(values["roll"]):
+            for ip, pitch in enumerate(values["pitch"]):
+                for iy, yaw in enumerate(values["yaw"]):
+                    pose = make_pose(args.xy, z, roll, pitch, yaw)
+                    pose_key = tuple(pose)
+                    if pose_key in seen_poses:
+                        continue
+                    items.append(([iz, ir, ip, iy], pose))
+    return items
+
+
+def print_progressive_unique_workload(raw_total: int, unique_total: int, args: argparse.Namespace) -> None:
+    if unique_total != raw_total:
+        print(f"UNIQUE NEW CANDIDATES:\n{unique_total}")
+        print(f"SKIPPED PREVIOUSLY CHECKED:\n{raw_total - unique_total}")
+        print(f"UNIQUE INITIAL POSE_CHECK CALLS:\n{unique_total * args.initial_checks}")
+        print(f"UNIQUE MAX ADDITIONAL RECHECKS:\n{unique_total * args.repeat_checks}")
+
+
+def run_pose_check_attempts(checker: PoseChecker, pose: list[float], count: int, start_attempt: int) -> list[dict[str, Any]]:
+    records = []
+    for offset in range(count):
+        attempt_id = start_attempt + offset
+        status, reason, raw = checker.check(pose)
+        records.append(
+            {
+                "attempt_id": attempt_id,
+                "pose": list(pose),
+                "arm": "LEFT_ARM",
+                "frame": "left_arm_base_link",
+                "result": status,
+                "reason": reason,
+                "raw": raw,
+                "timestamp": now_text(),
+            }
+        )
+    return records
+
+
+def pose_inputs_identical(attempts: list[dict[str, Any]]) -> bool:
+    if not attempts:
+        return True
+    first = attempts[0]["pose"]
+    return all(row["pose"] == first for row in attempts)
+
+
+def make_progressive_candidate(index: int, level: int, grid_index: list[int], pose: list[float], center: list[float]) -> dict[str, Any]:
+    return {
+        "candidate_id": candidate_id(index),
+        "scan_level": level,
+        "grid_index": grid_index,
+        "pose": pose,
+        "grasp_pose": pose,
+        "approach_pose": "NOT_APPLICABLE",
+        "lift_pose": "NOT_APPLICABLE",
+        "approach_reachable": "NOT_TESTED",
+        "lift_reachable": "NOT_TESTED",
+        "approach_reason": "NOT_TESTED",
+        "lift_reason": "NOT_TESTED",
+        "full_chain": "NOT_APPLICABLE_GRASP_ONLY",
+        **orientation_deltas(pose, center),
+        "orientation_distance_to_center": round(orientation_distance(pose, center), 6),
+        "initial_checks": [],
+        "final_checks": [],
+        "total_pass": 0,
+        "total_checks": 0,
+        "ik_repeatability": 0.0,
+        "ik_repeatability_text": "0/0 = 0.0",
+        "pose_inputs_identical": "NOT_TESTED",
+        "grasp_reachable": "NOT_TESTED",
+        "grasp_reason": "NOT_TESTED",
+        "local_grasp_pass": False,
+        "neighbor_robustness": 0.0,
+        "robustness_score": 0.0,
+        "neighbor_count": 0,
+        "neighbor_grasp_pass_count": 0,
+        "distance_to_edge": 0,
+        "selection_label": "NOT_TESTED",
+    }
+
+
+def finalize_progressive_candidates(candidates: list[dict[str, Any]], values: dict[str, list[float]], args: argparse.Namespace) -> None:
+    for candidate in candidates:
+        attempts = [*candidate["initial_checks"], *candidate["final_checks"]]
+        total_pass = sum(1 for row in attempts if row["result"] == "PASS")
+        total_checks = len(attempts)
+        candidate["total_pass"] = total_pass
+        candidate["total_checks"] = total_checks
+        candidate["ik_repeatability"] = round(total_pass / total_checks, 6) if total_checks else 0.0
+        candidate["ik_repeatability_text"] = f"{total_pass}/{total_checks} = {candidate['ik_repeatability']}"
+        candidate["pose_inputs_identical"] = pose_inputs_identical(attempts)
+        candidate["local_grasp_pass"] = candidate["ik_repeatability"] >= args.stable_threshold
+        if candidate["local_grasp_pass"]:
+            candidate["grasp_reachable"] = "PASS"
+            candidate["selection_label"] = "IK_STABLE_CANDIDATE"
+        elif total_pass > 0:
+            candidate["grasp_reachable"] = "UNSTABLE"
+            candidate["selection_label"] = "UNSTABLE_IK_CANDIDATE"
+        else:
+            candidate["grasp_reachable"] = "FAIL"
+            candidate["selection_label"] = "UNSTABLE_IK_CANDIDATE"
+        candidate["grasp_reason"] = attempts[-1]["reason"] if attempts else "NOT_TESTED"
+    analyze_orientation_local(candidates, values)
+    for candidate in candidates:
+        candidate["neighbor_robustness"] = candidate["robustness_score"]
+
+
+def scan_progressive_orientation(args: argparse.Namespace) -> tuple[list[dict[str, Any]], dict[str, Any], str, float]:
+    center = [round(v, 6) for v in args.center]
+    args.xy = [center[0], center[1]]
+    checker = PoseChecker(args.mock)
+    started = time.monotonic()
+    all_candidates: list[dict[str, Any]] = []
+    status = "COMPLETE"
+    stop_reason = "MAX_LEVEL_REACHED"
+    selected_level = 0
+    total_pose_check_calls = 0
+    seen_poses: set[tuple[float, ...]] = set()
+    try:
+        print_phase("PHASE A: candidate generation")
+        for level in range(1, args.max_level + 1):
+            values = progressive_level_values(center, level)
+            raw_total = total_level_candidates(values)
+            pose_items = progressive_pose_items(args, values, seen_poses)
+            total = len(pose_items)
+            print(f"\nLEVEL {level}")
+            print_progressive_workload(level, values, args)
+            print_progressive_unique_workload(raw_total, total, args)
+            progress = ProgressDisplay(total, args.progress_interval)
+            level_candidates: list[dict[str, Any]] = []
+            initial_pass_count = 0
+            stable_2_of_2 = 0
+            rejected_unstable = 0
+            index_base = len(all_candidates)
+            try:
+                print_phase("PHASE B: initial 2x pose_check")
+                processed = 0
+                for grid_index, pose in pose_items:
+                    seen_poses.add(tuple(pose))
+                    candidate = make_progressive_candidate(index_base + processed, level, grid_index, pose, center)
+                    candidate["initial_checks"] = run_pose_check_attempts(checker, pose, args.initial_checks, 1)
+                    total_pose_check_calls += args.initial_checks
+                    initial_passes = sum(1 for row in candidate["initial_checks"] if row["result"] == "PASS")
+                    if initial_passes == args.initial_checks:
+                        initial_pass_count += 1
+                        stable_2_of_2 += 1
+                    else:
+                        rejected_unstable += 1
+                        candidate["selection_label"] = "UNSTABLE_IK_CANDIDATE"
+                    processed += 1
+                    level_candidates.append(candidate)
+                    if args.progress_interval > 0 and (processed == 1 or processed % args.progress_interval == 0 or processed == total):
+                        progress.update(processed, stable_2_of_2, rejected_unstable)
+                        if processed % args.progress_interval == 0 or processed == total:
+                            progress.checkpoint(processed, stable_2_of_2, rejected_unstable, pose)
+                    if args.mock_interrupt_after is not None and processed >= args.mock_interrupt_after:
+                        raise KeyboardInterrupt
+            except KeyboardInterrupt:
+                status = "INTERRUPTED"
+                progress.complete_line()
+                print("SCAN INTERRUPTED")
+                finalize_progressive_candidates(level_candidates, values, args)
+                all_candidates.extend(level_candidates)
+                selected_level = level
+                stop_reason = "INTERRUPTED"
+                break
+            finally:
+                progress.complete_line()
+
+            print_phase("PHASE C: repeatability 3x re-check")
+            verify_pool = [c for c in level_candidates if sum(1 for row in c["initial_checks"] if row["result"] == "PASS") == args.initial_checks]
+            verify_started = time.monotonic()
+            for idx, candidate in enumerate(verify_pool, start=1):
+                elapsed_verify = max(0.001, time.monotonic() - verify_started)
+                rate = idx / elapsed_verify
+                remaining = max(0, len(verify_pool) - idx)
+                eta = remaining / rate if rate > 0 else 0.0
+                if args.progress_interval > 0 and (idx == 1 or idx % args.progress_interval == 0 or idx == len(verify_pool)):
+                    print(
+                        f"Verify stable candidates {idx}/{len(verify_pool)} | "
+                        f"repeatability checks {args.initial_checks + 1}-{args.initial_checks + args.repeat_checks}/"
+                        f"{args.initial_checks + args.repeat_checks} | "
+                        f"elapsed {human_duration(elapsed_verify)} | ETA {human_duration(eta)}",
+                        end="\r",
+                        flush=True,
+                    )
+                    if idx % args.progress_interval == 0 or idx == len(verify_pool):
+                        print("")
+                        print("[checkpoint]")
+                        print(f"verify_candidate={idx}/{len(verify_pool)}")
+                        print(f"elapsed={human_duration(elapsed_verify)}")
+                        print(f"eta={human_duration(eta)}")
+                        print(f"current_pose={candidate['pose']}")
+                candidate["final_checks"] = run_pose_check_attempts(checker, candidate["pose"], args.repeat_checks, args.initial_checks + 1)
+                total_pose_check_calls += args.repeat_checks
+            if verify_pool:
+                print("")
+            finalize_progressive_candidates(level_candidates, values, args)
+            print_phase("PHASE D: ranking and diversity selection")
+            top = select_representative_orientations(level_candidates, center, args.top_k)
+            stable_count = sum(1 for c in level_candidates if c["selection_label"] == "IK_STABLE_CANDIDATE")
+            print(f"LEVEL {level} COMPLETE")
+            print(f"stable candidates = {stable_count}")
+            all_candidates.extend(level_candidates)
+            selected_level = level
+            if stable_count >= args.min_stable_candidates and len(top) >= min(args.top_k, args.min_stable_candidates):
+                stop_reason = "ENOUGH_STABLE_CANDIDATES"
+                print("STOPPING:\nenough stable candidates found")
+                break
+            if level == 2 and args.max_level < 3:
+                stop_reason = "MAX_LEVEL_REACHED"
+        print_phase("PHASE E: report generation")
+    finally:
+        checker.shutdown()
+    elapsed = time.monotonic() - started
+    meta = {
+        "selected_level": selected_level,
+        "stop_reason": stop_reason,
+        "total_pose_check_calls": total_pose_check_calls,
+        "total_unique_candidates": len(all_candidates),
+    }
+    return all_candidates, meta, status, elapsed
+
+
 def orientation_prior_distance(pose: list[float]) -> float:
     _x, _y, z, roll, pitch, yaw = pose
     pitch_distance = min(abs(pitch - 0.8), abs(pitch + 0.8))
@@ -603,15 +889,33 @@ def select_representative_orientations(candidates: list[dict[str, Any]], center:
     passed = [c for c in candidates if c["local_grasp_pass"]]
     if not passed:
         return []
-    stable = [c for c in passed if c["robustness_score"] > 0.0]
+    ik_stable = [c for c in passed if c.get("selection_label") == "IK_STABLE_CANDIDATE"]
+    if ik_stable:
+        passed = ik_stable
+    passed = sorted(
+        passed,
+        key=lambda c: (c.get("ik_repeatability", 0.0), c.get("neighbor_robustness", c.get("robustness_score", 0.0)), c.get("distance_to_edge", 0)),
+        reverse=True,
+    )
+    best_repeatability = passed[0].get("ik_repeatability", 0.0)
+    priority_pool = [c for c in passed if c.get("ik_repeatability", 0.0) == best_repeatability]
+    if len(priority_pool) < top_k:
+        priority_pool = passed
+    passed = priority_pool
+    stable = [c for c in passed if c.get("neighbor_robustness", c.get("robustness_score", 0.0)) > 0.0]
     pool = stable or passed
-    first = min(pool, key=lambda c: (c["orientation_distance_to_center"], -c["robustness_score"]))
+    first = max(pool, key=lambda c: (c.get("ik_repeatability", 0.0), c.get("neighbor_robustness", c.get("robustness_score", 0.0)), -c["orientation_distance_to_center"]))
     selected = [first]
     remaining = [c for c in pool if c is not first]
     while remaining and len(selected) < top_k:
-        def score(candidate: dict[str, Any]) -> tuple[float, float, int]:
+        def score(candidate: dict[str, Any]) -> tuple[float, float, float, int]:
             min_distance = min(orientation_distance(candidate["pose"], chosen["pose"]) for chosen in selected)
-            return (min_distance, candidate["robustness_score"], candidate["distance_to_edge"])
+            return (
+                candidate.get("ik_repeatability", 0.0),
+                min_distance,
+                candidate.get("neighbor_robustness", candidate.get("robustness_score", 0.0)),
+                candidate["distance_to_edge"],
+            )
 
         chosen = max(remaining, key=score)
         selected.append(chosen)
@@ -771,7 +1075,15 @@ def compact_orientation_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
         "delta_pitch",
         "delta_yaw_wrapped",
         "orientation_distance_to_center",
+        "neighbor_robustness",
         "robustness_score",
+        "ik_repeatability",
+        "ik_repeatability_text",
+        "total_pass",
+        "total_checks",
+        "initial_checks",
+        "final_checks",
+        "pose_inputs_identical",
         "neighbor_count",
         "neighbor_grasp_pass_count",
         "distance_to_edge",
@@ -803,13 +1115,21 @@ def build_orientation_summary(
     top: list[dict[str, Any]],
     scan_status: str,
     elapsed_s: float,
+    progressive_meta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     pass_count = sum(1 for c in candidates if c["local_grasp_pass"])
     processed = len(candidates)
-    total = math.prod(len(v) for v in values.values())
+    total = progressive_meta.get("total_unique_candidates", processed) if progressive_meta else math.prod(len(v) for v in values.values())
+    total_checks = sum(c.get("total_checks", 0) for c in candidates)
+    stable = [c for c in candidates if c.get("selection_label") == "IK_STABLE_CANDIDATE"]
+    five_of_five = sum(1 for c in candidates if c.get("total_pass") == 5 and c.get("total_checks") == 5)
+    four_of_five = sum(1 for c in candidates if c.get("total_pass") == 4 and c.get("total_checks") == 5)
+    initial_full_pass = sum(1 for c in candidates if c.get("initial_checks") and all(row["result"] == "PASS" for row in c["initial_checks"]))
+    unstable_rejected = sum(1 for c in candidates if c.get("selection_label") == "UNSTABLE_IK_CANDIDATE")
+    suffix = "progressive_orientation" if progressive_meta else "orientation_local"
     return {
         "metadata": {
-            "run_id": run_id_text("orientation_local"),
+            "run_id": run_id_text(suffix),
             "timestamp": now_text(),
             "git_commit": get_git_commit(),
             "argv": [sys.executable, *sys.argv],
@@ -817,6 +1137,7 @@ def build_orientation_summary(
             "scan_status": scan_status,
             "elapsed_s": elapsed_s,
             "elapsed_text": human_duration(elapsed_s),
+            "progressive": bool(progressive_meta),
         },
         "status_labels": {
             "CENTER_POSE": {
@@ -855,7 +1176,14 @@ def build_orientation_summary(
             "grasp_fail_count": processed - pass_count,
             "pass_rate": round(pass_count / processed, 6) if processed else 0.0,
             "representative_candidate_count": len(top),
+            "total_pose_check_calls": progressive_meta.get("total_pose_check_calls") if progressive_meta else total,
+            "initial_full_pass_count": initial_full_pass,
+            "unstable_rejected_count": unstable_rejected,
+            "ik_stable_candidate_count": len(stable),
+            "five_of_five_candidate_count": five_of_five,
+            "four_of_five_candidate_count": four_of_five,
         },
+        "progressive": progressive_meta or {},
         "representative_orientation_candidates": [compact_orientation_candidate(c) for c in top],
         "dry_grasp_only_commands": [dry_grasp_only_command(c["pose"]) for c in top],
     }
@@ -897,7 +1225,12 @@ def write_orientation_csv(path: Path, candidates: list[dict[str, Any]]) -> None:
         "delta_pitch",
         "delta_yaw_wrapped",
         "orientation_distance_to_center",
+        "ik_repeatability",
+        "ik_repeatability_text",
+        "total_pass",
+        "total_checks",
         "robustness_score",
+        "neighbor_robustness",
         "neighbor_count",
         "neighbor_grasp_pass_count",
         "distance_to_edge",
@@ -923,7 +1256,12 @@ def write_orientation_csv(path: Path, candidates: list[dict[str, Any]]) -> None:
                     "delta_pitch": c["delta_pitch"],
                     "delta_yaw_wrapped": c["delta_yaw_wrapped"],
                     "orientation_distance_to_center": c["orientation_distance_to_center"],
+                    "ik_repeatability": c.get("ik_repeatability", 0.0),
+                    "ik_repeatability_text": c.get("ik_repeatability_text", ""),
+                    "total_pass": c.get("total_pass", 0),
+                    "total_checks": c.get("total_checks", 0),
                     "robustness_score": c["robustness_score"],
+                    "neighbor_robustness": c.get("neighbor_robustness", c["robustness_score"]),
                     "neighbor_count": c["neighbor_count"],
                     "neighbor_grasp_pass_count": c["neighbor_grasp_pass_count"],
                     "distance_to_edge": c["distance_to_edge"],
@@ -1097,11 +1435,19 @@ def render_orientation_markdown(summary: dict[str, Any]) -> str:
         "```",
         "",
         "## PASS / FAIL",
+        f"- SCAN LEVEL USED: `{summary.get('progressive', {}).get('selected_level', 'NOT_APPLICABLE')}`",
+        f"- STOP REASON: `{summary.get('progressive', {}).get('stop_reason', 'NOT_APPLICABLE')}`",
         f"- TOTAL CANDIDATES: `{summary['counts']['total_candidates']}`",
         f"- PROCESSED CANDIDATES: `{summary['counts']['processed_candidates']}`",
+        f"- TOTAL POSE_CHECK CALLS: `{summary['counts']['total_pose_check_calls']}`",
         f"- GRASP PASS COUNT: `{summary['counts']['grasp_pass_count']}`",
         f"- GRASP FAIL COUNT: `{summary['counts']['grasp_fail_count']}`",
         f"- PASS RATE: `{summary['counts']['pass_rate']}`",
+        f"- 2/2 INITIAL PASS: `{summary['counts']['initial_full_pass_count']}`",
+        f"- UNSTABLE REJECTED: `{summary['counts']['unstable_rejected_count']}`",
+        f"- IK STABLE CANDIDATES: `{summary['counts']['ik_stable_candidate_count']}`",
+        f"- 5/5 CANDIDATES: `{summary['counts']['five_of_five_candidate_count']}`",
+        f"- 4/5 CANDIDATES: `{summary['counts']['four_of_five_candidate_count']}`",
         "",
         "## REPRESENTATIVE ORIENTATION CANDIDATES",
     ]
@@ -1125,8 +1471,11 @@ def render_orientation_markdown(summary: dict[str, Any]) -> str:
                 "ORIENTATION_DISTANCE_TO_CENTER:",
                 f"`{candidate['orientation_distance_to_center']}`",
                 "",
-                "ROBUSTNESS:",
-                f"`{candidate['robustness_score']}`",
+                "IK_REPEATABILITY:",
+                f"`{candidate.get('ik_repeatability_text', 'NOT_APPLICABLE')}`",
+                "",
+                "NEIGHBOR_ROBUSTNESS:",
+                f"`{candidate.get('neighbor_robustness', candidate.get('robustness_score'))}`",
                 "",
                 "DISTANCE_TO_EDGE:",
                 f"`{candidate['distance_to_edge']}`",
@@ -1164,6 +1513,7 @@ def render_orientation_markdown(summary: dict[str, Any]) -> str:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Left-hand 4D grasp pose scan using pose_check only.")
     parser.add_argument("--orientation-local", action="store_true", help="Scan local z/roll/pitch/yaw around --center with GRASP pose_check only.")
+    parser.add_argument("--progressive", action="store_true", help="Use small progressive local scan with repeated IK pose_check verification.")
     parser.add_argument("--xy", type=float, nargs=2, default=list(DEFAULT_XY), metavar=("X", "Y"))
     parser.add_argument("--z-min", type=float, default=-0.35)
     parser.add_argument("--z-max", type=float, default=-0.31)
@@ -1196,9 +1546,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--fine-angle-step", type=float, default=0.05)
     parser.add_argument("--top-n", type=int, default=10)
     parser.add_argument("--top-k", type=int, default=6, help="Representative candidate count for --orientation-local.")
+    parser.add_argument("--initial-checks", type=int, default=2)
+    parser.add_argument("--repeat-checks", type=int, default=3)
+    parser.add_argument("--stable-threshold", type=float, default=0.8)
+    parser.add_argument("--max-level", type=int, default=2)
+    parser.add_argument("--min-stable-candidates", type=int, default=6)
     parser.add_argument("--progress-every", type=int, default=25, help="Print scan progress every N candidates; 0 disables progress output.")
     parser.add_argument("--progress-interval", type=int, default=25, help="Checkpoint interval for --orientation-local progress.")
-    parser.add_argument("--mock", choices=("islands", "pitch-sign", "all-pass", "orientation-local"), help="Local logic test mode; does not initialize Rabo SDK.")
+    parser.add_argument("--mock", choices=("islands", "pitch-sign", "all-pass", "orientation-local", "progressive"), help="Local logic test mode; does not initialize Rabo SDK.")
     parser.add_argument("--mock-interrupt-after", type=int, help=argparse.SUPPRESS)
     return parser
 
@@ -1213,6 +1568,13 @@ def validate_args(args: argparse.Namespace) -> None:
             raise SystemExit("--top-k must be positive")
         if args.progress_interval < 0:
             raise SystemExit("--progress-interval must be >= 0")
+        if args.progressive:
+            if args.initial_checks <= 0 or args.repeat_checks < 0:
+                raise SystemExit("--initial-checks must be positive and --repeat-checks must be >= 0")
+            if args.max_level not in (1, 2, 3):
+                raise SystemExit("--max-level must be 1, 2, or 3")
+            if not 0.0 <= args.stable_threshold <= 1.0:
+                raise SystemExit("--stable-threshold must be between 0 and 1")
     if args.fine and args.center is not None:
         args.xy = [args.center[0], args.center[1]]
     if not args.fine and args.pitch_values is None and not args.pitch_positive and not args.pitch_negative:
@@ -1223,6 +1585,33 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     validate_args(args)
     if args.orientation_local:
+        if args.progressive:
+            candidates, progressive_meta, scan_status, elapsed_s = scan_progressive_orientation(args)
+            # Recompute neighbor robustness over the accumulated scan points for final reporting.
+            if progressive_meta.get("selected_level"):
+                values = progressive_level_values([round(v, 6) for v in args.center], progressive_meta["selected_level"])
+            else:
+                values = progressive_level_values([round(v, 6) for v in args.center], 1)
+            top = select_representative_orientations(candidates, [round(v, 6) for v in args.center], args.top_k)
+            summary = build_orientation_summary(args, values, candidates, top, scan_status, elapsed_s, progressive_meta)
+            json_path, csv_path, md_path = write_orientation_reports(summary, candidates)
+            print("=" * 60)
+            print("SCAN COMPLETE" if scan_status == "COMPLETE" else "SCAN INTERRUPTED")
+            print("=" * 60)
+            print(f"SCAN LEVEL USED:\n{summary['progressive'].get('selected_level')}")
+            print(f"STOP REASON:\n{summary['progressive'].get('stop_reason')}")
+            print(f"TOTAL UNIQUE CANDIDATES:\n{summary['counts']['processed_candidates']}")
+            print(f"TOTAL POSE_CHECK CALLS:\n{summary['counts']['total_pose_check_calls']}")
+            print(f"2/2 INITIAL PASS:\n{summary['counts']['initial_full_pass_count']}")
+            print(f"UNSTABLE REJECTED:\n{summary['counts']['unstable_rejected_count']}")
+            print(f"5/5 CANDIDATES:\n{summary['counts']['five_of_five_candidate_count']}")
+            print(f"4/5 CANDIDATES:\n{summary['counts']['four_of_five_candidate_count']}")
+            print(f"REPRESENTATIVE CANDIDATES:\n{summary['counts']['representative_candidate_count']}")
+            print(f"REPORT:\n{md_path}")
+            print(f"REPORT_JSON: {json_path}")
+            print(f"REPORT_CSV: {csv_path}")
+            print(f"REPORT_MD: {md_path}")
+            return 0 if candidates else 1
         values = build_orientation_local_values(args)
         candidates, scan_status, elapsed_s = scan_orientation_local(args, values)
         analyze_orientation_local(candidates, values)
