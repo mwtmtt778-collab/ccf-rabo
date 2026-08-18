@@ -14,6 +14,7 @@ import subprocess
 import sys
 import time
 from dataclasses import asdict
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -73,6 +74,17 @@ DRY_CHOICES = {
     "5": "FINGER_DIRECTION_WRONG",
     "6": "COLLISION_RISK",
     "7": "OTHER",
+}
+
+DRY_GRASP_ONLY_CHOICES = {
+    "1": "GOOD",
+    "2": "PALM_REVERSED",
+    "3": "PALM_ORIENTATION_WRONG",
+    "4": "FINGER_DIRECTION_WRONG",
+    "5": "TOO_HIGH",
+    "6": "TOO_LOW",
+    "7": "COLLISION_RISK",
+    "8": "OTHER",
 }
 
 PLACE_CHOICES = {
@@ -136,7 +148,7 @@ def timestamp_text() -> str:
 
 
 def run_id_text(mode: str) -> str:
-    return time.strftime("%Y%m%d_%H%M%S") + f"_{mode}"
+    return datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3] + f"_{mode.replace('-', '_')}"
 
 
 def get_git_commit() -> str:
@@ -218,22 +230,94 @@ def read_device_state(bundle: Any | None, prefix: str) -> dict[str, Any]:
 def shutdown_bundle(bundle: Any | None) -> None:
     if bundle is None:
         return
+    if getattr(bundle, "_shutdown_done", False):
+        return
+    setattr(bundle, "_shutdown_done", True)
     for name in ("left_hand", "right_hand", "left_arm", "right_arm", "pose_setter"):
         device = getattr(bundle, name, None)
         if hasattr(device, "shutdown"):
-            device.shutdown()
+            try:
+                device.shutdown()
+            except Exception as exc:
+                print(f"shutdown warning: {name}: {repr(exc)}")
 
 
-def make_bundle(include_left: bool, include_right: bool) -> Any:
+def make_bundle(include_left: bool, include_right: bool, *, include_left_hand: bool = True, include_right_hand: bool = True) -> Any:
     from rabo_robocap import LinkerArmA7, LinkerHandO6Left, LinkerHandO6Right
 
-    values: dict[str, Any] = {}
+    values: dict[str, Any] = {"_shutdown_done": False}
     if include_left:
         values["left_arm"] = LinkerArmA7(robot_id=DEVICE_IDS["LEFT_ARM"], mode="sim")
-        values["left_hand"] = LinkerHandO6Left(robot_id=DEVICE_IDS["LEFT_HAND"], mode="sim")
+        if include_left_hand:
+            values["left_hand"] = LinkerHandO6Left(robot_id=DEVICE_IDS["LEFT_HAND"], mode="sim")
     if include_right:
         values["right_arm"] = LinkerArmA7(robot_id=DEVICE_IDS["RIGHT_ARM"], mode="sim")
-        values["right_hand"] = LinkerHandO6Right(robot_id=DEVICE_IDS["RIGHT_HAND"], mode="sim")
+        if include_right_hand:
+            values["right_hand"] = LinkerHandO6Right(robot_id=DEVICE_IDS["RIGHT_HAND"], mode="sim")
+    return SimpleNamespace(**values)
+
+
+class MockArm:
+    def __init__(self, result: str) -> None:
+        self.mock_pose_check_result = result
+        self.calls: list[dict[str, Any]] = []
+        self.current_pose = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+    def pose_check(self, *_args: Any, **_kwargs: Any) -> bool:
+        raise AssertionError("mock pose_check should be handled by call_pose_check")
+
+    def move_to(self, x: float, y: float, z: float, roll: float = 0.0, pitch: float = 0.0, yaw: float = 0.0) -> bool:
+        pose = [x, y, z, roll, pitch, yaw]
+        self.calls.append({"method": "move_to", "pose": pose})
+        self.current_pose = pose
+        return True
+
+    def move_joints(self, joints: list[float]) -> bool:
+        self.calls.append({"method": "move_joints", "joints": joints})
+        return True
+
+    def get_pose(self) -> list[float]:
+        return list(self.current_pose)
+
+    def get_joint_angles(self) -> list[float]:
+        return [0.0] * 7
+
+    def shutdown(self) -> None:
+        self.calls.append({"method": "shutdown"})
+
+
+class MockHand:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def clench(self, *args: Any, **kwargs: Any) -> bool:
+        self.calls.append({"method": "clench", "args": list(args), "kwargs": kwargs})
+        return True
+
+    def grasp_force(self, **kwargs: Any) -> bool:
+        self.calls.append({"method": "grasp_force", "kwargs": kwargs})
+        return True
+
+    def get_joint_angles(self) -> list[float]:
+        return [0.0] * 6
+
+    def get_clench(self) -> list[float]:
+        return [0.0] * 6
+
+    def shutdown(self) -> None:
+        self.calls.append({"method": "shutdown"})
+
+
+def make_mock_bundle(include_left: bool, include_right: bool, *, include_left_hand: bool, include_right_hand: bool, result: str) -> Any:
+    values: dict[str, Any] = {"_shutdown_done": False, "mock": True}
+    if include_left:
+        values["left_arm"] = MockArm(result)
+        if include_left_hand:
+            values["left_hand"] = MockHand()
+    if include_right:
+        values["right_arm"] = MockArm(result)
+        if include_right_hand:
+            values["right_hand"] = MockHand()
     return SimpleNamespace(**values)
 
 
@@ -259,6 +343,11 @@ def target_pose_from_step(step: ActionStep) -> Pose6 | None:
 
 
 def call_pose_check(arm: Any, pose: Pose6) -> dict[str, Any]:
+    mock_result = getattr(arm, "mock_pose_check_result", None)
+    if mock_result is not None:
+        status = "PASS" if mock_result == "pass" else "FAIL"
+        reason = "mock_reachable" if status == "PASS" else "mock_out_of_workspace"
+        return {"status": status, "reason": reason, "raw": {"mock": mock_result}, "pose": pose_to_list(pose)}
     raw = arm.pose_check(pose.x, pose.y, pose.z, roll=pose.roll, pitch=pose.pitch, yaw=pose.yaw)
     status, reason, value = normalize_pose_check(raw)
     return {"status": status, "reason": reason, "raw": value, "pose": pose_to_list(pose)}
@@ -307,6 +396,18 @@ def pose_error(target: Pose6 | None, actual_raw: Any) -> dict[str, Any] | None:
     }
 
 
+def update_report_pose_summary(report: dict[str, Any], *, target: Pose6 | None, actual_raw: Any, joints_raw: Any) -> None:
+    report["actual_pose"] = jsonable(actual_raw) if actual_raw is not None else "NOT_APPLICABLE"
+    report["actual_joints"] = jsonable(joints_raw) if joints_raw is not None else "NOT_APPLICABLE"
+    error = pose_error(target, actual_raw)
+    if error is None:
+        report["position_error"] = "NOT_APPLICABLE"
+        report["orientation_error"] = "NOT_APPLICABLE"
+    else:
+        report["position_error"] = error["position_error_m"]
+        report["orientation_error"] = error["orientation_error_rpy_l2_rad"]
+
+
 def execute_action_step(bundle: Any, step: ActionStep, report: dict[str, Any], *, sleep_after_s: float = 0.0) -> dict[str, Any]:
     record: dict[str, Any] = {
         "timestamp": timestamp_text(),
@@ -337,6 +438,8 @@ def execute_action_step(bundle: Any, step: ActionStep, report: dict[str, Any], *
     record["hand_clench"] = state.get(f"{step.target}_clench") if step.target.endswith("_hand") else None
     record["pose_error"] = pose_error(target_pose, record["actual_get_pose"])
     report["robot_data"].append(record)
+    if step.target == "left_arm" and step.method == "move_to":
+        update_report_pose_summary(report, target=target_pose, actual_raw=record["actual_get_pose"], joints_raw=record["joint_angles"])
     if failed:
         raise StepExecutionError(f"{step.phase}: {step.target}.{step.method} failed: {reason}")
     if sleep_after_s > 0:
@@ -353,6 +456,7 @@ def execute_group(bundle: Any, name: str, steps: list[ActionStep], report: dict[
 def preflight_pose_checks(bundle: Any, checks: list[tuple[str, str, Pose6]], report: dict[str, Any]) -> None:
     for label, arm_name, pose in checks:
         result = call_pose_check(getattr(bundle, arm_name), pose)
+        update_chain_reachability(report, label, result)
         record = {
             "timestamp": timestamp_text(),
             "phase": label,
@@ -367,10 +471,30 @@ def preflight_pose_checks(bundle: Any, checks: list[tuple[str, str, Pose6]], rep
             raise StepExecutionError(f"{label}: {arm_name} pose_check failed: {result['reason']}")
 
 
+def update_chain_reachability(report: dict[str, Any], label: str, result: dict[str, Any]) -> None:
+    key = {
+        "LEFT_APPROACH": "APPROACH_REACHABLE",
+        "LEFT_GRASP": "GRASP_REACHABLE",
+        "LEFT_LIFT": "LIFT_REACHABLE",
+    }.get(label)
+    if key is None:
+        return
+    report["left_chain_reachability"][key] = {
+        "status": result["status"],
+        "reachable": result["status"] == "PASS",
+        "reason": result["reason"],
+        "source": "VERIFIED_BY_CURRENT_RUNTIME",
+    }
+
+
 def derive_values(args: argparse.Namespace) -> dict[str, Any]:
     left_grasp = pose_from_list(args.pose) if getattr(args, "pose", None) is not None else None
-    left_approach = pose_with_z_delta(left_grasp, args.approach_dz) if left_grasp else None
-    left_lift = pose_with_z_delta(left_grasp, args.lift_dz) if left_grasp else None
+    if getattr(args, "mode", None) in ("check", "dry-grasp-only"):
+        left_approach = None
+        left_lift = None
+    else:
+        left_approach = pose_with_z_delta(left_grasp, args.approach_dz) if left_grasp else None
+        left_lift = pose_with_z_delta(left_grasp, args.lift_dz) if left_grasp else None
 
     target_world_xy = None
     right_release_world_pose = None
@@ -414,8 +538,8 @@ def derive_values(args: argparse.Namespace) -> dict[str, Any]:
 
     return {
         "LEFT_GRASP_POSE": {"value": pose_list(left_grasp), "status": "PREDICTED_EXPERIMENT_SEED" if left_grasp else "NOT_USED"},
-        "LEFT_APPROACH_POSE": {"value": pose_list(left_approach), "status": "PREDICTED"},
-        "LEFT_LIFT_POSE": {"value": pose_list(left_lift), "status": "PREDICTED"},
+        "LEFT_APPROACH_POSE": {"value": pose_list(left_approach), "status": "NOT_APPLICABLE" if getattr(args, "mode", None) in ("check", "dry-grasp-only") else "PREDICTED"},
+        "LEFT_LIFT_POSE": {"value": pose_list(left_lift), "status": "NOT_APPLICABLE" if getattr(args, "mode", None) in ("check", "dry-grasp-only") else "PREDICTED"},
         "TARGET_NUT_WORLD_XY": {"value": target_world_xy, "status": "PREDICTED_FROM_LEFT_BASE_TARGET_XY" if target_world_xy else "NOT_USED"},
         "PREDICTED_RIGHT_RELEASE_WORLD_POSE": {"value": right_release_world_pose, "status": right_release_pose_source or "NOT_USED"},
         "PREDICTED_RIGHT_RELEASE_BASE_POSE": {"value": right_release_base_pose, "status": right_release_pose_source or "NOT_USED"},
@@ -504,6 +628,7 @@ def build_report(args: argparse.Namespace, derived: dict[str, Any]) -> dict[str,
             "right_release_pose": getattr(args, "right_release_pose", None),
             "argv": command_line(),
             "plan_only": args.plan_only,
+            "mock_pose_check": getattr(args, "mock_pose_check", None),
         },
         "known_facts": {
             "LEFT_TEST_XY": {"value": LEFT_TEST_XY, "status": LEFT_TEST_XY_STATUS},
@@ -514,7 +639,19 @@ def build_report(args: argparse.Namespace, derived: dict[str, Any]) -> dict[str,
             "RIGHT_GRASP_OFFSET_WORLD_XY": {"value": RIGHT_GRASP_OFFSET_WORLD_XY, "status": RIGHT_GRASP_OFFSET_STATUS},
         },
         "derived_values": derived,
+        "left_chain_reachability": {
+            "APPROACH_REACHABLE": {"status": "NOT_TESTED", "reachable": "NOT_TESTED", "reason": "NOT_TESTED", "source": "NOT_TESTED"},
+            "GRASP_REACHABLE": {"status": "NOT_TESTED", "reachable": "NOT_TESTED", "reason": "NOT_TESTED", "source": "NOT_TESTED"},
+            "LIFT_REACHABLE": {"status": "NOT_TESTED", "reachable": "NOT_TESTED", "reason": "NOT_TESTED", "source": "NOT_TESTED"},
+        },
         "robot_data": [],
+        "initial_pose": "NOT_TESTED",
+        "initial_joints": "NOT_TESTED",
+        "target_pose": derived["LEFT_GRASP_POSE"]["value"] or "NOT_APPLICABLE",
+        "actual_pose": "NOT_TESTED",
+        "actual_joints": "NOT_TESTED",
+        "position_error": "NOT_TESTED",
+        "orientation_error": "NOT_TESTED",
         "user_observation": None,
         "diagnosis": {"labels": [], "status": "UNKNOWN", "ambiguous_causes": []},
         "runtime": {"status": "PLANNED", "failed_node": None, "error": None},
@@ -522,6 +659,8 @@ def build_report(args: argparse.Namespace, derived: dict[str, Any]) -> dict[str,
 
 
 def observation_prompt(mode: str) -> tuple[dict[str, str], str]:
+    if mode == "dry-grasp-only":
+        return DRY_GRASP_ONLY_CHOICES, "Dry grasp-only observation"
     if mode == "dry":
         return DRY_CHOICES, "Dry observation"
     if mode == "place":
@@ -666,8 +805,8 @@ def render_markdown(report: dict[str, Any]) -> str:
 
 
 def validate_args(args: argparse.Namespace) -> None:
-    if args.mode in ("dry", "real") and args.pose is None:
-        raise SystemExit("--pose X Y Z R P YAW is required for dry and real")
+    if args.mode in ("check", "dry", "dry-grasp-only", "real") and args.pose is None:
+        raise SystemExit("--pose X Y Z R P YAW is required for check, dry, dry-grasp-only, and real")
     if args.mode in ("place", "real") and args.nut_target_xy is None and args.right_release_pose is None:
         raise SystemExit("--nut-target-xy X Y or --right-release-pose X Y Z R P YAW is required for place and real")
     if args.approach_dz <= 0.0:
@@ -699,27 +838,105 @@ def run_left_dry_or_grasp(bundle: Any, left_grasp: Pose6, left_approach: Pose6, 
         execute_group(bundle, name, steps, report, args)
 
 
+def run_check_mode(bundle: Any, left_grasp: Pose6, report: dict[str, Any]) -> None:
+    result = call_pose_check(bundle.left_arm, left_grasp)
+    update_chain_reachability(report, "LEFT_GRASP", result)
+    report["robot_data"].append(
+        {
+            "timestamp": timestamp_text(),
+            "phase": "LEFT_GRASP",
+            "target": "left_arm",
+            "method": "pose_check",
+            "target_pose": pose_to_list(left_grasp),
+            "pose_check": result,
+            "status": "OK" if result["status"] == "PASS" else "POSE_CHECK_FAILED_STOPPED_BEFORE_MOVE",
+        }
+    )
+    print(f"GRASP_POSE: {pose_to_list(left_grasp)}")
+    print(f"GRASP_POSE_CHECK: {result['status']}")
+    print(f"REASON: {result['reason']}")
+
+
+def run_dry_grasp_only_mode(bundle: Any, left_grasp: Pose6, report: dict[str, Any], args: argparse.Namespace) -> None:
+    result = call_pose_check(bundle.left_arm, left_grasp)
+    update_chain_reachability(report, "LEFT_GRASP", result)
+    report["robot_data"].append(
+        {
+            "timestamp": timestamp_text(),
+            "phase": "LEFT_GRASP",
+            "target": "left_arm",
+            "method": "pose_check",
+            "target_pose": pose_to_list(left_grasp),
+            "pose_check": result,
+            "status": "OK" if result["status"] == "PASS" else "POSE_CHECK_FAILED_STOPPED_BEFORE_MOVE",
+        }
+    )
+    print(f"GRASP_POSE: {pose_to_list(left_grasp)}")
+    print(f"GRASP_POSE_CHECK: {result['status']}")
+    print(f"REASON: {result['reason']}")
+    if result["status"] != "PASS":
+        raise StepExecutionError(f"LEFT_GRASP: left_arm pose_check failed: {result['reason']}")
+    groups = [
+        ("LEFT_OPEN", [make_hand_step("LEFT_INITIAL", "left_hand", "clench", list(HAND_OPEN), {}, "open left hand before grasp-only dry run")]),
+        ("LEFT_GRASP_POSE", [make_move_step("LEFT_GRASP", "left_arm", left_grasp, "direct grasp-only pose")]),
+        (
+            "LEFT_CLOSE",
+            [
+                make_hand_step("LEFT_AFTER_CLOSE", "left_hand", "clench", list(LEFT_GRASP), {}, "legacy left grasp posture"),
+                make_hand_step("LEFT_AFTER_CLOSE", "left_hand", "grasp_force", [], {"strength": LEFT_GRASP_FORCE["strength"]}, "legacy left grasp force"),
+            ],
+        ),
+    ]
+    for name, steps in groups:
+        execute_group(bundle, name, steps, report, args)
+
+
 def run_experiment(args: argparse.Namespace, report: dict[str, Any]) -> int:
     if args.plan_only:
         report["runtime"]["status"] = "PLAN_ONLY_NO_RABO_MOTION"
         return 0
 
-    include_left = args.mode in ("dry", "real")
+    include_left = args.mode in ("check", "dry", "dry-grasp-only", "real")
     include_right = args.mode in ("place", "real")
+    include_left_hand = args.mode in ("dry", "dry-grasp-only", "real")
+    include_right_hand = args.mode in ("place", "real")
     bundle = None
     try:
-        bundle = make_bundle(include_left=include_left, include_right=include_right)
-        report["robot_data"].append(read_device_state(bundle, "INITIAL"))
+        if args.mock_pose_check is not None:
+            bundle = make_mock_bundle(
+                include_left=include_left,
+                include_right=include_right,
+                include_left_hand=include_left_hand,
+                include_right_hand=include_right_hand,
+                result=args.mock_pose_check,
+            )
+        else:
+            bundle = make_bundle(
+                include_left=include_left,
+                include_right=include_right,
+                include_left_hand=include_left_hand,
+                include_right_hand=include_right_hand,
+            )
+        initial = read_device_state(bundle, "INITIAL")
+        report["robot_data"].append(initial)
+        report["initial_pose"] = initial.get("left_arm_pose", "NOT_APPLICABLE")
+        report["initial_joints"] = initial.get("left_arm_joint_angles", "NOT_APPLICABLE")
+        if args.mode == "check":
+            left_grasp = pose_from_list(report["derived_values"]["LEFT_GRASP_POSE"]["value"])
+            run_check_mode(bundle, left_grasp, report)
         if args.mode in ("place", "real"):
             right_release_values = report["derived_values"]["PREDICTED_RIGHT_RELEASE_BASE_POSE"]["value"]
             run_right_place(bundle, pose_from_list(right_release_values), report, args)
+        if args.mode == "dry-grasp-only":
+            left_grasp = pose_from_list(report["derived_values"]["LEFT_GRASP_POSE"]["value"])
+            run_dry_grasp_only_mode(bundle, left_grasp, report, args)
         if args.mode in ("dry", "real"):
             left_grasp = pose_from_list(report["derived_values"]["LEFT_GRASP_POSE"]["value"])
             left_approach = pose_from_list(report["derived_values"]["LEFT_APPROACH_POSE"]["value"])
             left_lift = pose_from_list(report["derived_values"]["LEFT_LIFT_POSE"]["value"])
             run_left_dry_or_grasp(bundle, left_grasp, left_approach, left_lift, report, args)
         report["runtime"]["status"] = "EXECUTED"
-        if not args.no_prompt:
+        if args.mode != "check" and not args.no_prompt:
             report["user_observation"] = ask_user_observation(args.mode)
         return 0
     except Exception as exc:
@@ -739,20 +956,36 @@ def run_experiment(args: argparse.Namespace, report: dict[str, Any]) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Left-hand grasp V1 parameterized experiment tool.")
     subparsers = parser.add_subparsers(dest="mode", required=True)
-    for mode in ("dry", "place", "real"):
+    for mode in ("check", "dry", "dry-grasp-only", "place", "real"):
         sub = subparsers.add_parser(mode)
-        if mode in ("dry", "real"):
+        sub.set_defaults(
+            approach_dz=0.05,
+            lift_dz=0.05,
+            wait_before_release_s=1.5,
+            settle_after_release_s=3.0,
+            step_delay_s=0.0,
+            plan_only=False,
+            no_prompt=False,
+            mock_pose_check=None,
+        )
+        if mode in ("check", "dry", "dry-grasp-only", "real"):
             sub.add_argument("--pose", type=float, nargs=6, metavar=("X", "Y", "Z", "R", "P", "YAW"))
         if mode in ("place", "real"):
             sub.add_argument("--nut-target-xy", type=float, nargs=2, metavar=("X", "Y"))
             sub.add_argument("--right-release-pose", type=float, nargs=6, metavar=("X", "Y", "Z", "R", "P", "YAW"))
-        sub.add_argument("--approach-dz", type=float, default=0.05)
-        sub.add_argument("--lift-dz", type=float, default=0.05)
-        sub.add_argument("--wait-before-release-s", type=float, default=1.5)
-        sub.add_argument("--settle-after-release-s", type=float, default=3.0)
-        sub.add_argument("--step-delay-s", type=float, default=0.0)
-        sub.add_argument("--plan-only", action="store_true", help="Generate derived values and reports without importing or driving Rabo SDK.")
-        sub.add_argument("--no-prompt", action="store_true", help="Skip manual observation prompt after motion.")
+        if mode in ("dry", "place", "real"):
+            sub.add_argument("--approach-dz", type=float, default=0.05)
+            sub.add_argument("--lift-dz", type=float, default=0.05)
+        if mode in ("place", "real"):
+            sub.add_argument("--wait-before-release-s", type=float, default=1.5)
+            sub.add_argument("--settle-after-release-s", type=float, default=3.0)
+        if mode != "check":
+            sub.add_argument("--step-delay-s", type=float, default=0.0)
+        if mode in ("dry", "place", "real"):
+            sub.add_argument("--plan-only", action="store_true", help="Generate derived values and reports without importing or driving Rabo SDK.")
+        if mode != "check":
+            sub.add_argument("--no-prompt", action="store_true", help="Skip manual observation prompt after motion.")
+        sub.add_argument("--mock-pose-check", choices=("pass", "fail"), help=argparse.SUPPRESS)
     return parser
 
 
