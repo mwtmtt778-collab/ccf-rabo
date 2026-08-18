@@ -78,13 +78,17 @@ DRY_CHOICES = {
 
 DRY_GRASP_ONLY_CHOICES = {
     "1": "GOOD",
-    "2": "PALM_REVERSED",
-    "3": "PALM_ORIENTATION_WRONG",
-    "4": "FINGER_DIRECTION_WRONG",
-    "5": "TOO_HIGH",
-    "6": "TOO_LOW",
-    "7": "COLLISION_RISK",
-    "8": "OTHER",
+    "2": "PALM_DOWN_GOOD",
+    "3": "PALM_UP_WRONG",
+    "4": "PALM_REVERSED",
+    "5": "PALM_ORIENTATION_WRONG",
+    "6": "FINGER_DIRECTION_WRONG",
+    "7": "TOO_HIGH",
+    "8": "TOO_LOW",
+    "9": "TABLE_COLLISION",
+    "10": "NEAR_TABLE_COLLISION",
+    "11": "COLLISION_RISK",
+    "12": "OTHER",
 }
 
 PLACE_CHOICES = {
@@ -110,7 +114,10 @@ REAL_CHOICES = {
 
 
 class StepExecutionError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, failed_node: str | None = None, failed_stage: str | None = None) -> None:
+        super().__init__(message)
+        self.failed_node = failed_node
+        self.failed_stage = failed_stage
 
 
 def jsonable(value: Any) -> Any:
@@ -143,12 +150,22 @@ def pose_with_z_delta(pose: Pose6, dz: float) -> Pose6:
     return Pose6(pose.x, pose.y, pose.z + dz, pose.roll, pose.pitch, pose.yaw)
 
 
+def staged_waypoints(left_grasp: Pose6, staged_z: list[float] | None = None) -> list[tuple[str, Pose6]]:
+    z_values = staged_z if staged_z is not None else [left_grasp.z + 0.10, left_grasp.z + 0.06, left_grasp.z + 0.03]
+    return [
+        ("HIGH", Pose6(left_grasp.x, left_grasp.y, z_values[0], left_grasp.roll, left_grasp.pitch, left_grasp.yaw)),
+        ("MID", Pose6(left_grasp.x, left_grasp.y, z_values[1], left_grasp.roll, left_grasp.pitch, left_grasp.yaw)),
+        ("LOW", Pose6(left_grasp.x, left_grasp.y, z_values[2], left_grasp.roll, left_grasp.pitch, left_grasp.yaw)),
+        ("GRASP", left_grasp),
+    ]
+
+
 def timestamp_text() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S %z")
 
 
 def run_id_text(mode: str) -> str:
-    return datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3] + f"_{mode.replace('-', '_')}"
+    return datetime.now().strftime("%Y%m%d_%H%M%S_%f") + f"_{mode.replace('-', '_')}"
 
 
 def get_git_commit() -> str:
@@ -258,8 +275,10 @@ def make_bundle(include_left: bool, include_right: bool, *, include_left_hand: b
 
 
 class MockArm:
-    def __init__(self, result: str) -> None:
+    def __init__(self, result: str, *, pose_check_sequence: list[str] | None = None, move_fail_phase: str | None = None) -> None:
         self.mock_pose_check_result = result
+        self.mock_pose_check_sequence = list(pose_check_sequence or [])
+        self.mock_move_fail_phase = move_fail_phase
         self.calls: list[dict[str, Any]] = []
         self.current_pose = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
@@ -269,6 +288,8 @@ class MockArm:
     def move_to(self, x: float, y: float, z: float, roll: float = 0.0, pitch: float = 0.0, yaw: float = 0.0) -> bool:
         pose = [x, y, z, roll, pitch, yaw]
         self.calls.append({"method": "move_to", "pose": pose})
+        if self.mock_move_fail_phase is not None and self.mock_move_fail_phase == getattr(self, "current_phase", None):
+            return False
         self.current_pose = pose
         return True
 
@@ -308,10 +329,19 @@ class MockHand:
         self.calls.append({"method": "shutdown"})
 
 
-def make_mock_bundle(include_left: bool, include_right: bool, *, include_left_hand: bool, include_right_hand: bool, result: str) -> Any:
+def make_mock_bundle(
+    include_left: bool,
+    include_right: bool,
+    *,
+    include_left_hand: bool,
+    include_right_hand: bool,
+    result: str,
+    pose_check_sequence: list[str] | None = None,
+    move_fail_phase: str | None = None,
+) -> Any:
     values: dict[str, Any] = {"_shutdown_done": False, "mock": True}
     if include_left:
-        values["left_arm"] = MockArm(result)
+        values["left_arm"] = MockArm(result, pose_check_sequence=pose_check_sequence, move_fail_phase=move_fail_phase)
         if include_left_hand:
             values["left_hand"] = MockHand()
     if include_right:
@@ -345,6 +375,9 @@ def target_pose_from_step(step: ActionStep) -> Pose6 | None:
 def call_pose_check(arm: Any, pose: Pose6) -> dict[str, Any]:
     mock_result = getattr(arm, "mock_pose_check_result", None)
     if mock_result is not None:
+        sequence = getattr(arm, "mock_pose_check_sequence", [])
+        if sequence:
+            mock_result = sequence.pop(0)
         status = "PASS" if mock_result == "pass" else "FAIL"
         reason = "mock_reachable" if status == "PASS" else "mock_out_of_workspace"
         return {"status": status, "reason": reason, "raw": {"mock": mock_result}, "pose": pose_to_list(pose)}
@@ -356,6 +389,7 @@ def call_pose_check(arm: Any, pose: Pose6) -> dict[str, Any]:
 def call_step(bundle: Any, step: ActionStep) -> Any:
     target = getattr(bundle, step.target)
     method = getattr(target, step.method)
+    setattr(target, "current_phase", step.phase)
     if step.method == "move_to":
         return method(**pose_kwargs(target_pose_from_step(step)))
     if step.method == "grasp_force":
@@ -471,6 +505,72 @@ def preflight_pose_checks(bundle: Any, checks: list[tuple[str, str, Pose6]], rep
             raise StepExecutionError(f"{label}: {arm_name} pose_check failed: {result['reason']}")
 
 
+def preflight_staged_waypoints(bundle: Any, waypoints: list[tuple[str, Pose6]], report: dict[str, Any]) -> None:
+    print("STAGED PREFLIGHT")
+    report["staged_preflight"] = []
+    report["staged_pose_checks"] = {}
+    for stage, pose in waypoints:
+        result = call_pose_check(bundle.left_arm, pose)
+        if stage == "GRASP":
+            update_chain_reachability(report, "LEFT_GRASP", result)
+        phase = "LEFT_GRASP" if stage == "GRASP" else f"STAGED_{stage}"
+        row = {
+            "timestamp": timestamp_text(),
+            "phase": phase,
+            "stage": stage,
+            "target": "left_arm",
+            "method": "pose_check",
+            "target_pose": pose_to_list(pose),
+            "pose_check": result,
+            "status": "OK" if result["status"] == "PASS" else "POSE_CHECK_FAILED_STOPPED_BEFORE_MOVE",
+        }
+        report["staged_preflight"].append(row)
+        report["staged_pose_checks"][phase] = result
+        report["robot_data"].append(row)
+        print(f"{stage}: {result['status']} ({result['reason']})")
+    for row in report["staged_preflight"]:
+        if row["pose_check"]["status"] != "PASS":
+            raise StepExecutionError(
+                f"STAGE_PREFLIGHT_FAILED: {row['stage']} pose_check failed: {row['pose_check']['reason']}",
+                failed_node="STAGE_PREFLIGHT_FAILED",
+                failed_stage=row["stage"],
+            )
+
+
+def execute_move_without_pose_check(bundle: Any, phase: str, pose: Pose6, report: dict[str, Any], args: argparse.Namespace) -> None:
+    step = make_move_step(phase, "left_arm", pose, "staged grasp-only descent waypoint")
+    preflight_result = (report.get("staged_pose_checks") or {}).get(phase, "NOT_TESTED")
+    record: dict[str, Any] = {
+        "timestamp": timestamp_text(),
+        "phase": step.phase,
+        "target": step.target,
+        "method": step.method,
+        "args": jsonable(step.args),
+        "kwargs": jsonable(step.kwargs),
+        "note": step.note,
+        "target_pose": pose_to_list(pose),
+        "pose_check": preflight_result,
+        "pose_check_result": preflight_result.get("status") if isinstance(preflight_result, dict) else "NOT_TESTED",
+        "pose_check_reason": preflight_result.get("reason") if isinstance(preflight_result, dict) else "NOT_TESTED",
+    }
+    result = call_step(bundle, step)
+    failed, reason = step_result_failed(result)
+    record["move_to_return"] = jsonable(result)
+    record["status"] = "FAILED" if failed else "OK"
+    state = read_device_state(bundle, step.phase)
+    record["actual_get_pose"] = state.get("left_arm_pose")
+    record["joint_angles"] = state.get("left_arm_joint_angles")
+    record["pose_error"] = pose_error(pose, record["actual_get_pose"])
+    report["robot_data"].append(record)
+    update_report_pose_summary(report, target=pose, actual_raw=record["actual_get_pose"], joints_raw=record["joint_angles"])
+    if failed:
+        raise StepExecutionError(f"{phase}: left_arm.move_to failed: {reason}", failed_node=phase)
+    if args.step_confirm:
+        input(f"{phase} reached. Press Enter to continue...")
+    if args.stage_wait > 0:
+        time.sleep(args.stage_wait)
+
+
 def update_chain_reachability(report: dict[str, Any], label: str, result: dict[str, Any]) -> None:
     key = {
         "LEFT_APPROACH": "APPROACH_REACHABLE",
@@ -536,10 +636,22 @@ def derive_values(args: argparse.Namespace) -> dict[str, Any]:
         ]
         right_release_pose_source = "PREDICTED_RELEASE_POSE"
 
+    staged = None
+    if left_grasp is not None and getattr(args, "staged", False):
+        staged = [
+            {
+                "stage": stage,
+                "pose": pose_list(pose),
+                "status": "PREDICTED_STAGED_ENTRY_WAYPOINT_NOT_VERIFIED",
+            }
+            for stage, pose in staged_waypoints(left_grasp, getattr(args, "staged_z", None))
+        ]
+
     return {
         "LEFT_GRASP_POSE": {"value": pose_list(left_grasp), "status": "PREDICTED_EXPERIMENT_SEED" if left_grasp else "NOT_USED"},
         "LEFT_APPROACH_POSE": {"value": pose_list(left_approach), "status": "NOT_APPLICABLE" if getattr(args, "mode", None) in ("check", "dry-grasp-only") else "PREDICTED"},
         "LEFT_LIFT_POSE": {"value": pose_list(left_lift), "status": "NOT_APPLICABLE" if getattr(args, "mode", None) in ("check", "dry-grasp-only") else "PREDICTED"},
+        "STAGED_WAYPOINTS": {"value": staged, "status": "PREDICTED_STAGED_ENTRY" if staged else "NOT_APPLICABLE"},
         "TARGET_NUT_WORLD_XY": {"value": target_world_xy, "status": "PREDICTED_FROM_LEFT_BASE_TARGET_XY" if target_world_xy else "NOT_USED"},
         "PREDICTED_RIGHT_RELEASE_WORLD_POSE": {"value": right_release_world_pose, "status": right_release_pose_source or "NOT_USED"},
         "PREDICTED_RIGHT_RELEASE_BASE_POSE": {"value": right_release_base_pose, "status": right_release_pose_source or "NOT_USED"},
@@ -613,15 +725,20 @@ def left_preflight_checks(left_approach: Pose6, left_grasp: Pose6, left_lift: Po
 
 
 def build_report(args: argparse.Namespace, derived: dict[str, Any]) -> dict[str, Any]:
+    effective_mode = "dry-grasp-only-staged" if args.mode == "dry-grasp-only" and getattr(args, "staged", False) else args.mode
     return {
         "experiment_metadata": {
-            "run_id": run_id_text(args.mode),
+            "run_id": run_id_text(effective_mode),
             "timestamp": timestamp_text(),
-            "mode": args.mode,
+            "mode": effective_mode,
             "git_commit": get_git_commit(),
         },
         "command_inputs": {
             "pose": getattr(args, "pose", None),
+            "staged": getattr(args, "staged", False),
+            "staged_z": getattr(args, "staged_z", None),
+            "stage_wait": getattr(args, "stage_wait", None),
+            "step_confirm": getattr(args, "step_confirm", False),
             "nut_target_xy": getattr(args, "nut_target_xy", None),
             "approach_dz": getattr(args, "approach_dz", None),
             "lift_dz": getattr(args, "lift_dz", None),
@@ -639,6 +756,10 @@ def build_report(args: argparse.Namespace, derived: dict[str, Any]) -> dict[str,
             "RIGHT_GRASP_OFFSET_WORLD_XY": {"value": RIGHT_GRASP_OFFSET_WORLD_XY, "status": RIGHT_GRASP_OFFSET_STATUS},
         },
         "derived_values": derived,
+        "final_grasp": derived["LEFT_GRASP_POSE"]["value"] or "NOT_APPLICABLE",
+        "staged_waypoints": derived["STAGED_WAYPOINTS"]["value"] or "NOT_APPLICABLE",
+        "staged_preflight": "NOT_APPLICABLE",
+        "staged_pose_checks": "NOT_APPLICABLE",
         "left_chain_reachability": {
             "APPROACH_REACHABLE": {"status": "NOT_TESTED", "reachable": "NOT_TESTED", "reason": "NOT_TESTED", "source": "NOT_TESTED"},
             "GRASP_REACHABLE": {"status": "NOT_TESTED", "reachable": "NOT_TESTED", "reason": "NOT_TESTED", "source": "NOT_TESTED"},
@@ -654,7 +775,7 @@ def build_report(args: argparse.Namespace, derived: dict[str, Any]) -> dict[str,
         "orientation_error": "NOT_TESTED",
         "user_observation": None,
         "diagnosis": {"labels": [], "status": "UNKNOWN", "ambiguous_causes": []},
-        "runtime": {"status": "PLANNED", "failed_node": None, "error": None},
+        "runtime": {"status": "PLANNED", "failed_node": None, "failed_stage": None, "error": None},
     }
 
 
@@ -703,9 +824,13 @@ def derive_diagnosis(report: dict[str, Any]) -> None:
     mapping = {
         "TOO_HIGH": "LEFT_Z_TOO_HIGH",
         "TOO_LOW": "LEFT_Z_TOO_LOW",
+        "PALM_UP_WRONG": "LEFT_PALM_ORIENTATION_ERROR",
+        "PALM_REVERSED": "LEFT_PALM_ORIENTATION_ERROR",
         "PALM_ORIENTATION_WRONG": "LEFT_PALM_ORIENTATION_ERROR",
         "FINGER_DIRECTION_WRONG": "LEFT_FINGER_DIRECTION_ERROR",
         "COLLISION_RISK": "LEFT_EXECUTION_ERROR",
+        "TABLE_COLLISION": "LEFT_EXECUTION_ERROR",
+        "NEAR_TABLE_COLLISION": "LEFT_EXECUTION_ERROR",
         "NUT_X_NEGATIVE_ERROR": "NUT_PLACEMENT_X_ERROR",
         "NUT_X_POSITIVE_ERROR": "NUT_PLACEMENT_X_ERROR",
         "NUT_Y_NEGATIVE_ERROR": "NUT_PLACEMENT_Y_ERROR",
@@ -764,6 +889,12 @@ def render_markdown(report: dict[str, Any]) -> str:
         json.dumps(report["derived_values"], ensure_ascii=False, indent=2),
         "```",
         "",
+        "## Staged Entry",
+        f"- FINAL_GRASP: `{report['final_grasp']}`",
+        "```json",
+        json.dumps(report["staged_waypoints"], ensure_ascii=False, indent=2),
+        "```",
+        "",
         "## Runtime",
         "```json",
         json.dumps(report["runtime"], ensure_ascii=False, indent=2),
@@ -813,6 +944,12 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--approach-dz must be positive")
     if args.lift_dz <= 0.0:
         raise SystemExit("--lift-dz must be positive")
+    if getattr(args, "stage_wait", 0.0) < 0.0:
+        raise SystemExit("--stage-wait must be >= 0")
+    if getattr(args, "staged_z", None) is not None and not getattr(args, "staged", False):
+        raise SystemExit("--staged-z requires --staged")
+    if getattr(args, "step_confirm", False) and not getattr(args, "staged", False):
+        raise SystemExit("--step-confirm requires --staged")
 
 
 def run_right_place(bundle: Any, right_release_pose: Pose6, report: dict[str, Any], args: argparse.Namespace) -> None:
@@ -858,6 +995,9 @@ def run_check_mode(bundle: Any, left_grasp: Pose6, report: dict[str, Any]) -> No
 
 
 def run_dry_grasp_only_mode(bundle: Any, left_grasp: Pose6, report: dict[str, Any], args: argparse.Namespace) -> None:
+    if args.staged:
+        run_dry_grasp_only_staged_mode(bundle, left_grasp, report, args)
+        return
     result = call_pose_check(bundle.left_arm, left_grasp)
     update_chain_reachability(report, "LEFT_GRASP", result)
     report["robot_data"].append(
@@ -891,6 +1031,31 @@ def run_dry_grasp_only_mode(bundle: Any, left_grasp: Pose6, report: dict[str, An
         execute_group(bundle, name, steps, report, args)
 
 
+def run_dry_grasp_only_staged_mode(bundle: Any, left_grasp: Pose6, report: dict[str, Any], args: argparse.Namespace) -> None:
+    waypoints = staged_waypoints(left_grasp, args.staged_z)
+    preflight_staged_waypoints(bundle, waypoints, report)
+    execute_group(
+        bundle,
+        "LEFT_OPEN",
+        [make_hand_step("LEFT_INITIAL", "left_hand", "clench", list(HAND_OPEN), {}, "open left hand before staged grasp-only dry run")],
+        report,
+        args,
+    )
+    for stage, pose in waypoints:
+        phase = "LEFT_GRASP" if stage == "GRASP" else f"STAGED_{stage}"
+        execute_move_without_pose_check(bundle, phase, pose, report, args)
+    execute_group(
+        bundle,
+        "LEFT_CLOSE",
+        [
+            make_hand_step("LEFT_AFTER_CLOSE", "left_hand", "clench", list(LEFT_GRASP), {}, "legacy left grasp posture"),
+            make_hand_step("LEFT_AFTER_CLOSE", "left_hand", "grasp_force", [], {"strength": LEFT_GRASP_FORCE["strength"]}, "legacy left grasp force"),
+        ],
+        report,
+        args,
+    )
+
+
 def run_experiment(args: argparse.Namespace, report: dict[str, Any]) -> int:
     if args.plan_only:
         report["runtime"]["status"] = "PLAN_ONLY_NO_RABO_MOTION"
@@ -909,6 +1074,8 @@ def run_experiment(args: argparse.Namespace, report: dict[str, Any]) -> int:
                 include_left_hand=include_left_hand,
                 include_right_hand=include_right_hand,
                 result=args.mock_pose_check,
+                pose_check_sequence=getattr(args, "mock_pose_check_sequence", None),
+                move_fail_phase=getattr(args, "mock_move_fail_phase", None),
             )
         else:
             bundle = make_bundle(
@@ -943,7 +1110,8 @@ def run_experiment(args: argparse.Namespace, report: dict[str, Any]) -> int:
         report["runtime"]["status"] = "FAILED"
         report["runtime"]["error"] = repr(exc)
         if isinstance(exc, StepExecutionError):
-            report["runtime"]["failed_node"] = str(exc).split(":", 1)[0]
+            report["runtime"]["failed_node"] = exc.failed_node or str(exc).split(":", 1)[0]
+            report["runtime"]["failed_stage"] = exc.failed_stage
         else:
             report["runtime"]["failed_node"] = "EXCEPTION"
         print(f"FAILED: {repr(exc)}")
@@ -964,9 +1132,15 @@ def build_parser() -> argparse.ArgumentParser:
             wait_before_release_s=1.5,
             settle_after_release_s=3.0,
             step_delay_s=0.0,
+            stage_wait=0.5,
+            staged=False,
+            staged_z=None,
+            step_confirm=False,
             plan_only=False,
             no_prompt=False,
             mock_pose_check=None,
+            mock_pose_check_sequence=None,
+            mock_move_fail_phase=None,
         )
         if mode in ("check", "dry", "dry-grasp-only", "real"):
             sub.add_argument("--pose", type=float, nargs=6, metavar=("X", "Y", "Z", "R", "P", "YAW"))
@@ -981,11 +1155,18 @@ def build_parser() -> argparse.ArgumentParser:
             sub.add_argument("--settle-after-release-s", type=float, default=3.0)
         if mode != "check":
             sub.add_argument("--step-delay-s", type=float, default=0.0)
+        if mode == "dry-grasp-only":
+            sub.add_argument("--staged", action="store_true", help="Use high/mid/low staged descent before final grasp pose.")
+            sub.add_argument("--staged-z", type=float, nargs=3, metavar=("HIGH_Z", "MID_Z", "LOW_Z"), help="Override staged HIGH/MID/LOW z values.")
+            sub.add_argument("--stage-wait", type=float, default=0.5, help="Seconds to wait between staged waypoints.")
+            sub.add_argument("--step-confirm", action="store_true", help="Require Enter after each staged waypoint.")
         if mode in ("dry", "place", "real"):
             sub.add_argument("--plan-only", action="store_true", help="Generate derived values and reports without importing or driving Rabo SDK.")
         if mode != "check":
             sub.add_argument("--no-prompt", action="store_true", help="Skip manual observation prompt after motion.")
         sub.add_argument("--mock-pose-check", choices=("pass", "fail"), help=argparse.SUPPRESS)
+        sub.add_argument("--mock-pose-check-sequence", choices=("pass", "fail"), nargs="+", help=argparse.SUPPRESS)
+        sub.add_argument("--mock-move-fail-phase", help=argparse.SUPPRESS)
     return parser
 
 
