@@ -47,8 +47,8 @@ def now_text() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S %z")
 
 
-def run_id_text() -> str:
-    return datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3] + "_scan"
+def run_id_text(suffix: str = "scan") -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3] + f"_{suffix}"
 
 
 def get_git_commit() -> str:
@@ -97,6 +97,29 @@ def frange(start: float, stop: float, step: float) -> list[float]:
     return values
 
 
+def normalize_angle(angle: float) -> float:
+    return math.atan2(math.sin(angle), math.cos(angle))
+
+
+def angular_delta(a: float, b: float) -> float:
+    return normalize_angle(a - b)
+
+
+def angular_distance(a: float, b: float) -> float:
+    return abs(angular_delta(a, b))
+
+
+def human_duration(seconds: float) -> str:
+    seconds = max(0, int(round(seconds)))
+    minutes, sec = divmod(seconds, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m {sec:02d}s"
+    if minutes:
+        return f"{minutes}m {sec:02d}s"
+    return f"{sec}s"
+
+
 def unique_sorted(values: list[float]) -> list[float]:
     return sorted({round(float(v), 6) for v in values})
 
@@ -134,6 +157,36 @@ def build_scan_values(args: argparse.Namespace) -> dict[str, list[float]]:
     }
 
 
+def build_orientation_local_values(args: argparse.Namespace) -> dict[str, list[float]]:
+    if args.center is None:
+        raise SystemExit("--orientation-local requires --center X Y Z R P YAW")
+    center = args.center
+    args.xy = [center[0], center[1]]
+    return {
+        "z": frange(center[2] - args.local_z_radius, center[2] + args.local_z_radius, args.local_z_step),
+        "roll": frange(center[3] - args.local_roll_radius, center[3] + args.local_roll_radius, args.local_roll_step),
+        "pitch": frange(args.local_pitch_min, args.local_pitch_max, args.local_pitch_step),
+        "yaw": local_yaw_values(args.local_yaw_step),
+    }
+
+
+def local_yaw_values(step: float) -> list[float]:
+    if step <= 0.0:
+        raise ValueError("local yaw step must be positive")
+    negative = [-round(math.pi, 6)]
+    current = -3.0
+    while current <= -2.2 + step * 0.1:
+        negative.append(round(current, 6))
+        current += step
+    positive = []
+    current = 2.2
+    while current <= 3.0 + step * 0.1:
+        positive.append(round(current, 6))
+        current += step
+    positive.append(round(math.pi, 6))
+    return unique_sorted([*negative, *positive])
+
+
 def make_pose(xy: list[float], z: float, roll: float, pitch: float, yaw: float) -> list[float]:
     return [round(xy[0], 6), round(xy[1], 6), round(z, 6), round(roll, 6), round(pitch, 6), round(yaw, 6)]
 
@@ -166,6 +219,13 @@ class PoseChecker:
         table_chain_z = -0.345 <= z <= -0.265
         if self.mock == "all-pass":
             ok = True
+        elif self.mock == "orientation-local":
+            ok = (
+                -0.34 <= z <= -0.32
+                and -0.65 <= roll <= 0.65
+                and 0.35 <= pitch <= 1.25
+                and (angular_distance(yaw, math.pi) <= 0.75 or angular_distance(yaw, -2.4) <= 0.25)
+            )
         elif self.mock == "pitch-sign":
             ok = table_chain_z and abs(roll) <= 0.25 and 0.55 <= pitch <= 1.05 and abs(yaw) <= 0.45
         else:
@@ -245,6 +305,153 @@ def print_progress(done: int, total: int, pass_count: int, started: float) -> No
         f"FULL_CHAIN_PASS={pass_count} elapsed={elapsed:.1f}s eta={eta_s:.1f}s",
         flush=True,
     )
+
+
+class ProgressDisplay:
+    def __init__(self, total: int, interval: int) -> None:
+        self.total = total
+        self.interval = max(1, interval)
+        self.started = time.monotonic()
+
+    def stats(self, done: int) -> tuple[float, float, float]:
+        elapsed = max(0.001, time.monotonic() - self.started)
+        rate = done / elapsed if done else 0.0
+        remaining = max(0, self.total - done)
+        eta = remaining / rate if rate > 0 else 0.0
+        percent = 100.0 * done / self.total if self.total else 100.0
+        return elapsed, eta, percent
+
+    def update(self, done: int, pass_count: int, fail_count: int) -> None:
+        elapsed, eta, percent = self.stats(done)
+        width = 24
+        filled = int(width * done / self.total) if self.total else width
+        bar = "█" * filled + "-" * (width - filled)
+        print(
+            f"Scan [{bar}] {percent:5.1f}% | {done}/{self.total} | "
+            f"PASS {pass_count} | FAIL {fail_count} | elapsed {human_duration(elapsed)} | ETA {human_duration(eta)}",
+            end="\r",
+            flush=True,
+        )
+
+    def checkpoint(self, done: int, pass_count: int, fail_count: int, current_pose: list[float]) -> None:
+        elapsed, eta, _percent = self.stats(done)
+        print("")
+        print("[checkpoint]")
+        print(f"processed={done}/{self.total}")
+        print(f"grasp_pass={pass_count}")
+        print(f"grasp_fail={fail_count}")
+        print(f"elapsed={human_duration(elapsed)}")
+        print(f"eta={human_duration(eta)}")
+        print(f"current_pose={current_pose}")
+
+    def complete_line(self) -> None:
+        print("")
+
+
+def orientation_distance(a: list[float], b: list[float]) -> float:
+    dz = (a[2] - b[2]) / 0.01
+    dr = angular_distance(a[3], b[3])
+    dp = angular_distance(a[4], b[4])
+    dy = angular_distance(a[5], b[5])
+    return math.sqrt(0.05 * dz * dz + dr * dr + dp * dp + dy * dy)
+
+
+def orientation_deltas(pose: list[float], center: list[float]) -> dict[str, float]:
+    return {
+        "delta_z": round(pose[2] - center[2], 6),
+        "delta_roll": round(angular_delta(pose[3], center[3]), 6),
+        "delta_pitch": round(angular_delta(pose[4], center[4]), 6),
+        "delta_yaw_wrapped": round(angular_delta(pose[5], center[5]), 6),
+    }
+
+
+def print_orientation_scan_start(center: list[float], total: int) -> None:
+    print("=" * 60)
+    print("LEFT GRASP LOCAL ORIENTATION SCAN")
+    print("=" * 60)
+    print("")
+    print("CENTER:")
+    print(center)
+    print("")
+    print("TOTAL CANDIDATES:")
+    print(total)
+    print("")
+    print("MODE:")
+    print("GRASP_POSE_CHECK_ONLY")
+    print("")
+
+
+def scan_orientation_local(args: argparse.Namespace, values: dict[str, list[float]]) -> tuple[list[dict[str, Any]], str, float]:
+    checker = PoseChecker(args.mock)
+    candidates: list[dict[str, Any]] = []
+    center = [round(v, 6) for v in args.center]
+    total = math.prod(len(v) for v in values.values())
+    progress = ProgressDisplay(total, args.progress_interval)
+    index = 0
+    pass_count = 0
+    fail_count = 0
+    status = "COMPLETE"
+    print_orientation_scan_start(center, total)
+    try:
+        for iz, z in enumerate(values["z"]):
+            for ir, roll in enumerate(values["roll"]):
+                for ip, pitch in enumerate(values["pitch"]):
+                    for iy, yaw in enumerate(values["yaw"]):
+                        pose = make_pose(args.xy, z, roll, pitch, yaw)
+                        grasp_status, grasp_reason, grasp_raw = checker.check(pose)
+                        is_pass = grasp_status == "PASS"
+                        if is_pass:
+                            pass_count += 1
+                        else:
+                            fail_count += 1
+                        deltas = orientation_deltas(pose, center)
+                        candidates.append(
+                            {
+                                "candidate_id": candidate_id(index),
+                                "grid_index": [iz, ir, ip, iy],
+                                "pose": pose,
+                                "grasp_pose": pose,
+                                "approach_pose": "NOT_APPLICABLE",
+                                "lift_pose": "NOT_APPLICABLE",
+                                "grasp_reachable": grasp_status,
+                                "grasp_reason": grasp_reason,
+                                "grasp_raw": grasp_raw,
+                                "approach_reachable": "NOT_TESTED",
+                                "lift_reachable": "NOT_TESTED",
+                                "approach_reason": "NOT_TESTED",
+                                "lift_reason": "NOT_TESTED",
+                                "full_chain": "NOT_APPLICABLE_GRASP_ONLY",
+                                "local_grasp_pass": is_pass,
+                                "result_status": "VERIFIED_BY_CURRENT_RUNTIME" if args.mock is None else "MOCK_VERIFIED_FOR_LOCAL_LOGIC_TEST_ONLY",
+                                **deltas,
+                                "orientation_distance_to_center": round(orientation_distance(pose, center), 6),
+                                "robustness_score": 0.0,
+                                "neighbor_count": 0,
+                                "neighbor_grasp_pass_count": 0,
+                                "distance_to_edge": 0,
+                                "selection_label": "IK_REACHABLE_ORIENTATION_CANDIDATE" if is_pass else "GRASP_POSE_CHECK_FAIL",
+                            }
+                        )
+                        index += 1
+                        if args.progress_interval > 0 and (index == 1 or index % args.progress_interval == 0 or index == total):
+                            progress.update(index, pass_count, fail_count)
+                            if index % args.progress_interval == 0 or index == total:
+                                progress.checkpoint(index, pass_count, fail_count, pose)
+                        if args.mock_interrupt_after is not None and index >= args.mock_interrupt_after:
+                            raise KeyboardInterrupt
+    except KeyboardInterrupt:
+        status = "INTERRUPTED"
+        progress.complete_line()
+        print("SCAN INTERRUPTED")
+        print(f"processed_candidates={index}")
+        print(f"total_candidates={total}")
+        print(f"grasp_pass={pass_count}")
+        print(f"grasp_fail={fail_count}")
+    finally:
+        progress.complete_line()
+        elapsed = time.monotonic() - progress.started
+        checker.shutdown()
+    return candidates, status, elapsed
 
 
 def orientation_prior_distance(pose: list[float]) -> float:
@@ -329,6 +536,89 @@ def analyze_grid(candidates: list[dict[str, Any]], values: dict[str, list[float]
         for key in region["keys"]:
             by_key[tuple(key)]["region_id"] = new_id
     return regions
+
+
+def analyze_orientation_local(candidates: list[dict[str, Any]], values: dict[str, list[float]]) -> None:
+    z_step = infer_step(values["z"])
+    roll_step = infer_step(values["roll"])
+    pitch_step = infer_step(values["pitch"])
+    yaw_step = infer_wrapped_yaw_step(values["yaw"])
+    for candidate in candidates:
+        pose = candidate["pose"]
+        neighbors = [
+            other
+            for other in candidates
+            if other is not candidate
+            and abs(other["pose"][2] - pose[2]) <= z_step * 1.1
+            and angular_distance(other["pose"][3], pose[3]) <= roll_step * 1.1
+            and angular_distance(other["pose"][4], pose[4]) <= pitch_step * 1.1
+            and angular_distance(other["pose"][5], pose[5]) <= yaw_step * 1.1
+        ]
+        pass_count = sum(1 for other in neighbors if other["local_grasp_pass"])
+        candidate["neighbor_count"] = len(neighbors)
+        candidate["neighbor_grasp_pass_count"] = pass_count
+        candidate["robustness_score"] = round(pass_count / len(neighbors), 6) if neighbors else 0.0
+        candidate["distance_to_edge"] = 1 if candidate["local_grasp_pass"] and candidate["robustness_score"] >= 0.99 else 0
+
+
+def infer_step(values: list[float]) -> float:
+    if len(values) < 2:
+        return 1.0
+    diffs = [abs(values[i + 1] - values[i]) for i in range(len(values) - 1) if abs(values[i + 1] - values[i]) > 1e-9]
+    return min(diffs) if diffs else 1.0
+
+
+def infer_wrapped_yaw_step(values: list[float]) -> float:
+    if len(values) < 2:
+        return 1.0
+    diffs = []
+    for i, value in enumerate(values):
+        for other in values[i + 1:]:
+            diff = angular_distance(value, other)
+            if diff > 1e-9:
+                diffs.append(diff)
+    return min(diffs) if diffs else 1.0
+
+
+def local_distance_to_edge(
+    key: tuple[int, int, int, int],
+    pass_keys: set[tuple[int, int, int, int]],
+    shape: tuple[int, int, int, int],
+) -> int:
+    min_steps = None
+    for offset in axis_offsets_4d():
+        steps = 0
+        current = key
+        while True:
+            nxt = add_index(current, offset)
+            if not in_bounds(nxt, shape) or nxt not in pass_keys:
+                break
+            steps += 1
+            current = nxt
+        min_steps = steps if min_steps is None else min(min_steps, steps)
+    return int(min_steps or 0)
+
+
+def select_representative_orientations(candidates: list[dict[str, Any]], center: list[float], top_k: int) -> list[dict[str, Any]]:
+    passed = [c for c in candidates if c["local_grasp_pass"]]
+    if not passed:
+        return []
+    stable = [c for c in passed if c["robustness_score"] > 0.0]
+    pool = stable or passed
+    first = min(pool, key=lambda c: (c["orientation_distance_to_center"], -c["robustness_score"]))
+    selected = [first]
+    remaining = [c for c in pool if c is not first]
+    while remaining and len(selected) < top_k:
+        def score(candidate: dict[str, Any]) -> tuple[float, float, int]:
+            min_distance = min(orientation_distance(candidate["pose"], chosen["pose"]) for chosen in selected)
+            return (min_distance, candidate["robustness_score"], candidate["distance_to_edge"])
+
+        chosen = max(remaining, key=score)
+        selected.append(chosen)
+        remaining = [c for c in remaining if c is not chosen]
+    for rank, candidate in enumerate(selected, start=1):
+        candidate["rank"] = rank
+    return selected
 
 
 def distance_to_edge(
@@ -469,6 +759,27 @@ def compact_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
     return {key: candidate.get(key) for key in keys}
 
 
+def compact_orientation_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
+    keys = [
+        "rank",
+        "candidate_id",
+        "pose",
+        "grasp_reachable",
+        "grasp_reason",
+        "delta_z",
+        "delta_roll",
+        "delta_pitch",
+        "delta_yaw_wrapped",
+        "orientation_distance_to_center",
+        "robustness_score",
+        "neighbor_count",
+        "neighbor_grasp_pass_count",
+        "distance_to_edge",
+        "selection_label",
+    ]
+    return {key: candidate.get(key) for key in keys}
+
+
 def write_reports(summary: dict[str, Any], candidates: list[dict[str, Any]]) -> tuple[Path, Path, Path]:
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     run_id = summary["metadata"]["run_id"]
@@ -483,6 +794,142 @@ def write_reports(summary: dict[str, Any], candidates: list[dict[str, Any]]) -> 
     with md_path.open("w", encoding="utf-8") as f:
         f.write(render_markdown(summary))
     return json_path, csv_path, md_path
+
+
+def build_orientation_summary(
+    args: argparse.Namespace,
+    values: dict[str, list[float]],
+    candidates: list[dict[str, Any]],
+    top: list[dict[str, Any]],
+    scan_status: str,
+    elapsed_s: float,
+) -> dict[str, Any]:
+    pass_count = sum(1 for c in candidates if c["local_grasp_pass"])
+    processed = len(candidates)
+    total = math.prod(len(v) for v in values.values())
+    return {
+        "metadata": {
+            "run_id": run_id_text("orientation_local"),
+            "timestamp": now_text(),
+            "git_commit": get_git_commit(),
+            "argv": [sys.executable, *sys.argv],
+            "mock": args.mock,
+            "scan_status": scan_status,
+            "elapsed_s": elapsed_s,
+            "elapsed_text": human_duration(elapsed_s),
+        },
+        "status_labels": {
+            "CENTER_POSE": {
+                "value": args.center,
+                "status": "RABO_EXECUTION_VERIFIED_BUT_USER_OBSERVED_PALM_REVERSED",
+            },
+            "ROLL_PI_BRANCH": {
+                "status": "TESTED_ROLL_PI_CANDIDATES_FAILED",
+                "tested_candidates": [
+                    [0.385, 0.038, -0.33, 3.1416, 0.8, 3.1416],
+                    [0.385, 0.038, -0.33, 3.1416, -0.8, 0.0],
+                ],
+                "reason": "out_of_workspace",
+                "scope_note": "Does not prove every roll≈pi pose is unreachable.",
+            },
+            "POSE_CHECK_RESULT": "VERIFIED_BY_CURRENT_RUNTIME" if args.mock is None else "MOCK_VERIFIED_FOR_LOCAL_LOGIC_TEST_ONLY",
+            "OUTPUT_LABEL": "IK_REACHABLE_ORIENTATION_CANDIDATE",
+        },
+        "command_inputs": vars(args),
+        "search_range": {
+            "x": [args.center[0], args.center[0]],
+            "y": [args.center[1], args.center[1]],
+            "z": [min(values["z"]), max(values["z"]), args.local_z_step],
+            "roll": [min(values["roll"]), max(values["roll"]), args.local_roll_step],
+            "pitch": [min(values["pitch"]), max(values["pitch"]), args.local_pitch_step],
+            "yaw": {
+                "values": values["yaw"],
+                "note": "Yaw comparisons use wrapped angular distance.",
+            },
+        },
+        "scan_values": values,
+        "counts": {
+            "total_candidates": total,
+            "processed_candidates": processed,
+            "grasp_pass_count": pass_count,
+            "grasp_fail_count": processed - pass_count,
+            "pass_rate": round(pass_count / processed, 6) if processed else 0.0,
+            "representative_candidate_count": len(top),
+        },
+        "representative_orientation_candidates": [compact_orientation_candidate(c) for c in top],
+        "dry_grasp_only_commands": [dry_grasp_only_command(c["pose"]) for c in top],
+    }
+
+
+def dry_grasp_only_command(pose: list[float]) -> str:
+    values = " ".join(str(v) for v in pose)
+    return f"python3 tools/test_left_grasp_v1.py dry-grasp-only --pose {values}"
+
+
+def write_orientation_reports(summary: dict[str, Any], candidates: list[dict[str, Any]]) -> tuple[Path, Path, Path]:
+    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    run_id = summary["metadata"]["run_id"]
+    json_path = REPORT_DIR / f"{run_id}.json"
+    csv_path = REPORT_DIR / f"{run_id}.csv"
+    md_path = REPORT_DIR / f"{run_id}.md"
+    payload = {**summary, "candidates": candidates}
+    with json_path.open("w", encoding="utf-8") as f:
+        json.dump(jsonable(payload), f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    write_orientation_csv(csv_path, candidates)
+    with md_path.open("w", encoding="utf-8") as f:
+        f.write(render_orientation_markdown(summary))
+    return json_path, csv_path, md_path
+
+
+def write_orientation_csv(path: Path, candidates: list[dict[str, Any]]) -> None:
+    fields = [
+        "candidate_id",
+        "pose",
+        "z",
+        "roll",
+        "pitch",
+        "yaw",
+        "grasp_reachable",
+        "grasp_reason",
+        "delta_z",
+        "delta_roll",
+        "delta_pitch",
+        "delta_yaw_wrapped",
+        "orientation_distance_to_center",
+        "robustness_score",
+        "neighbor_count",
+        "neighbor_grasp_pass_count",
+        "distance_to_edge",
+        "selection_label",
+    ]
+    with path.open("w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        for c in candidates:
+            pose = c["pose"]
+            writer.writerow(
+                {
+                    "candidate_id": c["candidate_id"],
+                    "pose": json.dumps(pose),
+                    "z": pose[2],
+                    "roll": pose[3],
+                    "pitch": pose[4],
+                    "yaw": pose[5],
+                    "grasp_reachable": c["grasp_reachable"],
+                    "grasp_reason": c["grasp_reason"],
+                    "delta_z": c["delta_z"],
+                    "delta_roll": c["delta_roll"],
+                    "delta_pitch": c["delta_pitch"],
+                    "delta_yaw_wrapped": c["delta_yaw_wrapped"],
+                    "orientation_distance_to_center": c["orientation_distance_to_center"],
+                    "robustness_score": c["robustness_score"],
+                    "neighbor_count": c["neighbor_count"],
+                    "neighbor_grasp_pass_count": c["neighbor_grasp_pass_count"],
+                    "distance_to_edge": c["distance_to_edge"],
+                    "selection_label": c["selection_label"],
+                }
+            )
 
 
 def write_csv(path: Path, candidates: list[dict[str, Any]]) -> None:
@@ -624,8 +1071,99 @@ def render_markdown(summary: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def render_orientation_markdown(summary: dict[str, Any]) -> str:
+    lines = [
+        f"# Left Local Orientation Scan Report: {summary['metadata']['run_id']}",
+        "",
+        "## Metadata",
+        f"- timestamp: `{summary['metadata']['timestamp']}`",
+        f"- git_commit: `{summary['metadata']['git_commit']}`",
+        f"- scan_status: `{summary['metadata']['scan_status']}`",
+        f"- pose_check_status: `{summary['status_labels']['POSE_CHECK_RESULT']}`",
+        "",
+        "## CENTER POSE",
+        "```json",
+        json.dumps(summary["status_labels"]["CENTER_POSE"], ensure_ascii=False, indent=2),
+        "```",
+        "",
+        "## SEARCH RANGE",
+        "```json",
+        json.dumps(summary["search_range"], ensure_ascii=False, indent=2),
+        "```",
+        "",
+        "## CURRENT EXPERIMENT EXCLUSIONS",
+        "```json",
+        json.dumps(summary["status_labels"]["ROLL_PI_BRANCH"], ensure_ascii=False, indent=2),
+        "```",
+        "",
+        "## PASS / FAIL",
+        f"- TOTAL CANDIDATES: `{summary['counts']['total_candidates']}`",
+        f"- PROCESSED CANDIDATES: `{summary['counts']['processed_candidates']}`",
+        f"- GRASP PASS COUNT: `{summary['counts']['grasp_pass_count']}`",
+        f"- GRASP FAIL COUNT: `{summary['counts']['grasp_fail_count']}`",
+        f"- PASS RATE: `{summary['counts']['pass_rate']}`",
+        "",
+        "## REPRESENTATIVE ORIENTATION CANDIDATES",
+    ]
+    if not summary["representative_orientation_candidates"]:
+        lines.append("- No GRASP pose_check PASS candidates found.")
+    for candidate in summary["representative_orientation_candidates"]:
+        lines.extend(
+            [
+                "",
+                f"### #{candidate['rank']}",
+                "",
+                "POSE:",
+                f"`{candidate['pose']}`",
+                "",
+                "GRASP:",
+                f"`{candidate['grasp_reachable']}`",
+                "",
+                "DELTA FROM CENTER:",
+                f"`z={candidate['delta_z']}, roll={candidate['delta_roll']}, pitch={candidate['delta_pitch']}, yaw_wrapped={candidate['delta_yaw_wrapped']}`",
+                "",
+                "ORIENTATION_DISTANCE_TO_CENTER:",
+                f"`{candidate['orientation_distance_to_center']}`",
+                "",
+                "ROBUSTNESS:",
+                f"`{candidate['robustness_score']}`",
+                "",
+                "DISTANCE_TO_EDGE:",
+                f"`{candidate['distance_to_edge']}`",
+                "",
+                "LABEL:",
+                f"`{candidate['selection_label']}`",
+                "",
+                "--------------------------------",
+            ]
+        )
+    lines.extend(["", "## dry-grasp-only Commands"])
+    for index, command in enumerate(summary["dry_grasp_only_commands"], start=1):
+        lines.extend(
+            [
+                "",
+                f"### CANDIDATE_{index:02d}_COMMAND",
+                "```bash",
+                command,
+                "```",
+            ]
+        )
+    lines.extend(
+        [
+            "",
+            "## Notes",
+            "- This scan only checks GRASP pose_check. It does not check Approach or Lift.",
+            "- These are IK_REACHABLE_ORIENTATION_CANDIDATE poses, not confirmed correct grasp poses.",
+            "- Correct palm/finger direction must be verified by dry-grasp-only and USER_OBSERVED notes.",
+            "",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Left-hand 4D grasp pose scan using pose_check only.")
+    parser.add_argument("--orientation-local", action="store_true", help="Scan local z/roll/pitch/yaw around --center with GRASP pose_check only.")
     parser.add_argument("--xy", type=float, nargs=2, default=list(DEFAULT_XY), metavar=("X", "Y"))
     parser.add_argument("--z-min", type=float, default=-0.35)
     parser.add_argument("--z-max", type=float, default=-0.31)
@@ -644,19 +1182,37 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--lift-dz", type=float, default=0.05)
     parser.add_argument("--fine", action="store_true")
     parser.add_argument("--center", type=float, nargs=6, metavar=("X", "Y", "Z", "R", "P", "YAW"))
+    parser.add_argument("--local-z-radius", type=float, default=0.01)
+    parser.add_argument("--local-z-step", type=float, default=0.01)
+    parser.add_argument("--local-roll-radius", type=float, default=0.8)
+    parser.add_argument("--local-roll-step", type=float, default=0.2)
+    parser.add_argument("--local-pitch-min", type=float, default=0.2)
+    parser.add_argument("--local-pitch-max", type=float, default=1.4)
+    parser.add_argument("--local-pitch-step", type=float, default=0.2)
+    parser.add_argument("--local-yaw-step", type=float, default=0.2)
     parser.add_argument("--fine-z-radius", type=float, default=0.015)
     parser.add_argument("--fine-z-step", type=float, default=0.005)
     parser.add_argument("--fine-angle-radius", type=float, default=0.20)
     parser.add_argument("--fine-angle-step", type=float, default=0.05)
     parser.add_argument("--top-n", type=int, default=10)
+    parser.add_argument("--top-k", type=int, default=6, help="Representative candidate count for --orientation-local.")
     parser.add_argument("--progress-every", type=int, default=25, help="Print scan progress every N candidates; 0 disables progress output.")
-    parser.add_argument("--mock", choices=("islands", "pitch-sign", "all-pass"), help="Local logic test mode; does not initialize Rabo SDK.")
+    parser.add_argument("--progress-interval", type=int, default=25, help="Checkpoint interval for --orientation-local progress.")
+    parser.add_argument("--mock", choices=("islands", "pitch-sign", "all-pass", "orientation-local"), help="Local logic test mode; does not initialize Rabo SDK.")
+    parser.add_argument("--mock-interrupt-after", type=int, help=argparse.SUPPRESS)
     return parser
 
 
 def validate_args(args: argparse.Namespace) -> None:
     if args.approach_dz <= 0.0 or args.lift_dz <= 0.0:
         raise SystemExit("--approach-dz and --lift-dz must be positive")
+    if args.orientation_local:
+        if args.center is None:
+            raise SystemExit("--orientation-local requires --center X Y Z R P YAW")
+        if args.top_k <= 0:
+            raise SystemExit("--top-k must be positive")
+        if args.progress_interval < 0:
+            raise SystemExit("--progress-interval must be >= 0")
     if args.fine and args.center is not None:
         args.xy = [args.center[0], args.center[1]]
     if not args.fine and args.pitch_values is None and not args.pitch_positive and not args.pitch_negative:
@@ -666,6 +1222,28 @@ def validate_args(args: argparse.Namespace) -> None:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     validate_args(args)
+    if args.orientation_local:
+        values = build_orientation_local_values(args)
+        candidates, scan_status, elapsed_s = scan_orientation_local(args, values)
+        analyze_orientation_local(candidates, values)
+        top = select_representative_orientations(candidates, [round(v, 6) for v in args.center], args.top_k)
+        summary = build_orientation_summary(args, values, candidates, top, scan_status, elapsed_s)
+        json_path, csv_path, md_path = write_orientation_reports(summary, candidates)
+        print("=" * 60)
+        print("SCAN COMPLETE" if scan_status == "COMPLETE" else "SCAN INTERRUPTED")
+        print("=" * 60)
+        print(f"TOTAL:\n{summary['counts']['total_candidates']}")
+        print(f"PROCESSED:\n{summary['counts']['processed_candidates']}")
+        print(f"GRASP PASS:\n{summary['counts']['grasp_pass_count']}")
+        print(f"GRASP FAIL:\n{summary['counts']['grasp_fail_count']}")
+        print(f"PASS RATE:\n{summary['counts']['pass_rate'] * 100:.2f}%")
+        print(f"ELAPSED:\n{summary['metadata']['elapsed_text']}")
+        print(f"REPRESENTATIVE CANDIDATES:\n{summary['counts']['representative_candidate_count']}")
+        print(f"REPORT:\n{md_path}")
+        print(f"REPORT_JSON: {json_path}")
+        print(f"REPORT_CSV: {csv_path}")
+        print(f"REPORT_MD: {md_path}")
+        return 0 if candidates else 1
     values = build_scan_values(args)
     expected = math.prod(len(v) for v in values.values())
     print(f"SCAN_CANDIDATES: {expected}")
