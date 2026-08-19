@@ -41,6 +41,11 @@ from agents.three_nut_expert.config import (  # noqa: E402
     Pose6,
 )
 from agents.three_nut_expert.expert import ActionStep, pose_to_list  # noqa: E402
+from expert.left_nut_grasp_planner import (  # noqa: E402
+    LEFT_GRASP_OFFSET_BASE,
+    LEFT_SLANTED_GRASP_RPY,
+    LeftNutGraspPlanner,
+)
 from expert.transforms import (  # noqa: E402
     pose_orientation_error,
     pose_position_error,
@@ -204,6 +209,8 @@ def run_id_text(mode: str) -> str:
         return datetime.now().strftime("left_direct_grasp_interactive_%Y%m%d_%H%M%S")
     if mode == "slanted-orientation-calibration":
         return datetime.now().strftime("slanted_orientation_calibration_%Y%m%d_%H%M%S")
+    if mode == "auto-left-grasp":
+        return datetime.now().strftime("auto_left_grasp_%Y%m%d_%H%M%S")
     return datetime.now().strftime("%Y%m%d_%H%M%S_%f") + f"_{mode.replace('-', '_')}"
 
 
@@ -333,7 +340,11 @@ class MockArm:
         self.current_pose = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
     def pose_check(self, *_args: Any, **_kwargs: Any) -> bool:
-        raise AssertionError("mock pose_check should be handled by call_pose_check")
+        result = self.mock_pose_check_result
+        if self.mock_pose_check_sequence:
+            result = self.mock_pose_check_sequence.pop(0)
+        self.calls.append({"method": "pose_check", "result": result})
+        return result == "pass"
 
     def move_to(self, x: float, y: float, z: float, roll: float = 0.0, pitch: float = 0.0, yaw: float = 0.0) -> bool:
         pose = [x, y, z, roll, pitch, yaw]
@@ -1287,6 +1298,7 @@ def derive_values(args: argparse.Namespace) -> dict[str, Any]:
         "left-direct-grasp",
         "left-direct-grasp-interactive",
         "slanted-orientation-calibration",
+        "auto-left-grasp",
     ):
         left_approach = None
         left_lift = None
@@ -1347,8 +1359,8 @@ def derive_values(args: argparse.Namespace) -> dict[str, Any]:
 
     return {
         "LEFT_GRASP_POSE": {"value": pose_list(left_grasp), "status": "PREDICTED_EXPERIMENT_SEED" if left_grasp else "NOT_USED"},
-        "LEFT_APPROACH_POSE": {"value": pose_list(left_approach), "status": "NOT_APPLICABLE" if getattr(args, "mode", None) in ("check", "dry-grasp-only", "orientation-calibration", "left-direct-grasp", "left-direct-grasp-interactive", "slanted-orientation-calibration") else "PREDICTED"},
-        "LEFT_LIFT_POSE": {"value": pose_list(left_lift), "status": "NOT_APPLICABLE" if getattr(args, "mode", None) in ("check", "dry-grasp-only", "orientation-calibration", "left-direct-grasp", "left-direct-grasp-interactive", "slanted-orientation-calibration") else "PREDICTED"},
+        "LEFT_APPROACH_POSE": {"value": pose_list(left_approach), "status": "NOT_APPLICABLE" if getattr(args, "mode", None) in ("check", "dry-grasp-only", "orientation-calibration", "left-direct-grasp", "left-direct-grasp-interactive", "slanted-orientation-calibration", "auto-left-grasp") else "PREDICTED"},
+        "LEFT_LIFT_POSE": {"value": pose_list(left_lift), "status": "NOT_APPLICABLE" if getattr(args, "mode", None) in ("check", "dry-grasp-only", "orientation-calibration", "left-direct-grasp", "left-direct-grasp-interactive", "slanted-orientation-calibration", "auto-left-grasp") else "PREDICTED"},
         "STAGED_WAYPOINTS": {"value": staged, "status": "PREDICTED_STAGED_ENTRY" if staged else "NOT_APPLICABLE"},
         "TARGET_NUT_WORLD_XY": {"value": target_world_xy, "status": "PREDICTED_FROM_LEFT_BASE_TARGET_XY" if target_world_xy else "NOT_USED"},
         "PREDICTED_RIGHT_RELEASE_WORLD_POSE": {"value": right_release_world_pose, "status": right_release_pose_source or "NOT_USED"},
@@ -1442,6 +1454,8 @@ def build_report(args: argparse.Namespace, derived: dict[str, Any]) -> dict[str,
             "lift_dz": getattr(args, "lift_dz", None),
             "right_release_pose": getattr(args, "right_release_pose", None),
             "yaw": getattr(args, "yaw", None),
+            "nut_world": getattr(args, "nut_world", None),
+            "yaw_offset": getattr(args, "yaw_offset", None),
             "argv": command_line(),
             "plan_only": args.plan_only,
             "mock_pose_check": getattr(args, "mock_pose_check", None),
@@ -1651,6 +1665,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--step-confirm requires --staged")
     if getattr(args, "yaw", 0.0) < -3.14 or getattr(args, "yaw", 0.0) > 3.14:
         raise SystemExit("--yaw must be within [-3.14, 3.14]")
+    if getattr(args, "yaw_offset", 0.0) < -3.14 or getattr(args, "yaw_offset", 0.0) > 3.14:
+        raise SystemExit("--yaw-offset must be within [-3.14, 3.14]")
+    if args.mode == "auto-left-grasp" and getattr(args, "nut_world", None) is None:
+        raise SystemExit("--nut-world X Y Z is required for auto-left-grasp")
 
 
 def run_right_place(bundle: Any, right_release_pose: Pose6, report: dict[str, Any], args: argparse.Namespace) -> None:
@@ -2401,14 +2419,138 @@ def run_slanted_orientation_calibration_mode(bundle: Any, report: dict[str, Any]
         print("输入无效，请重新选择。")
 
 
+def print_auto_left_grasp_plan(plan: dict[str, Any], yaw_offset: float) -> None:
+    print("==================================================")
+    print("左手自动 Nut 抓取 V1")
+    print("==================================================")
+    print("")
+    print("输入 Nut 世界坐标：")
+    print(f"X = {plan['nut_world_xyz'][0]:.4f}")
+    print(f"Y = {plan['nut_world_xyz'][1]:.4f}")
+    print(f"Z = {plan['nut_world_xyz'][2]:.4f}")
+    print("")
+    print("换算到左臂 base：")
+    print(json.dumps(jsonable(plan["nut_left_base_xyz"]), ensure_ascii=False))
+    print("")
+    print("使用抓取位置模板：")
+    print(f"dx = {LEFT_GRASP_OFFSET_BASE[0]:+.5f} m")
+    print(f"dy = {LEFT_GRASP_OFFSET_BASE[1]:+.5f} m")
+    print(f"dz = {LEFT_GRASP_OFFSET_BASE[2]:+.5f} m")
+    print("")
+    print("使用左手斜抓姿态：")
+    print(f"roll  = {LEFT_SLANTED_GRASP_RPY[0]:.4f}")
+    print(f"pitch = {LEFT_SLANTED_GRASP_RPY[1]:.4f}")
+    print(f"yaw   = {yaw_offset:.4f}")
+    print("")
+    print("生成抓取 Pose：")
+    print(json.dumps(jsonable(plan["grasp_pose"]), ensure_ascii=False))
+    print("")
+    print("生成高空接近 Pose：")
+    print(json.dumps(jsonable(plan["pregrasp_pose"]), ensure_ascii=False))
+    print("")
+    print("下降 waypoint：")
+    for item in plan["descent_waypoints"]:
+        print(f"- {item['stage']}: {item['pose']}")
+    print("")
+    print("抬升 waypoint：")
+    for item in plan["lift_waypoints"]:
+        print(f"- {item['stage']}: {item['pose']}")
+    print("")
+    print("说明：当前实现是任务专用抓取规划 + 分阶段安全接近策略 + IK 可达性预检。")
+    print("它不是完整环境碰撞规划，也不是自动避障规划器。")
+    print("")
+    print("开始整条抓取路径预检...")
+
+
+def print_auto_left_preflight(preflight: dict[str, Any]) -> None:
+    for row in preflight["checks"]:
+        status = "通过" if row["pass"] else "失败"
+        print(f"{row['stage']}: {status} ({row['reason']})")
+    if preflight["success"]:
+        print("")
+        print("抓取路径预检通过。")
+        return
+    failed = next((row for row in preflight["checks"] if not row["pass"]), None)
+    print("")
+    print("抓取路径预检失败。")
+    print("")
+    print("失败阶段：")
+    print(preflight["failed_stage"])
+    print("")
+    print("目标 Pose：")
+    print(json.dumps(jsonable(preflight.get("failed_pose") or (failed or {}).get("target_pose")), ensure_ascii=False))
+    print("")
+    print("原因：")
+    print(preflight["reason"])
+    print("")
+    print("本次不会执行抓取。")
+
+
+def run_auto_left_grasp_mode(bundle: Any, report: dict[str, Any], args: argparse.Namespace) -> None:
+    planner = LeftNutGraspPlanner(left_arm=bundle.left_arm, left_hand=bundle.left_hand)
+    nut_world_xyz = [float(v) for v in args.nut_world]
+    yaw_offset = float(args.yaw_offset)
+    plan = planner.build_plan(nut_world_xyz, yaw_offset=yaw_offset)
+
+    report["mode"] = "auto-left-grasp"
+    report["nut_world_xyz"] = plan["nut_world_xyz"]
+    report["nut_left_base_xyz"] = plan["nut_left_base_xyz"]
+    report["grasp_template"] = plan["grasp_template"]
+    report["generated_grasp_pose"] = plan["grasp_pose"]
+    report["pregrasp_pose"] = plan["pregrasp_pose"]
+    report["descent_waypoints"] = plan["descent_waypoints"]
+    report["lift_waypoints"] = plan["lift_waypoints"]
+    report["preflight"] = []
+    report["executed_waypoints"] = []
+    report["grasp_action"] = {}
+    report["lift"] = []
+    report["success"] = None
+
+    print_auto_left_grasp_plan(plan, yaw_offset)
+    preflight = planner.preflight_grasp_chain(plan)
+    report["preflight"] = preflight["checks"]
+    print_auto_left_preflight(preflight)
+    if not preflight["success"]:
+        report["success"] = False
+        report["runtime"]["failed_node"] = preflight["failed_stage"]
+        report["runtime"]["error"] = preflight["reason"]
+        return
+
+    answer = input("按 ENTER 开始执行。\n输入 q 退出。\n").strip().lower()
+    if answer == "q":
+        report["runtime"]["status"] = "ABORTED_BY_USER"
+        report["success"] = False
+        return
+
+    execution = planner.execute(plan)
+    report["safe_pre_joints_execution"] = execution["safe_pre_joints"]
+    report["open_hand"] = execution["open_hand"]
+    report["executed_waypoints"] = execution["executed_waypoints"]
+    report["grasp_action"] = execution["grasp_action"]
+    report["lift"] = execution["lift"]
+    report["success"] = execution["success"]
+    if not execution["success"]:
+        report["runtime"]["failed_node"] = execution["failed_stage"]
+        report["runtime"]["error"] = jsonable(execution["reason"])
+        print("")
+        print("左手自动抓取执行失败。")
+        print(f"失败阶段：{execution['failed_stage']}")
+        print(f"原因：{jsonable(execution['reason'])}")
+        return
+
+    print("")
+    print("左手自动抓取流程已完成。")
+    print("请观察 Nut 是否跟随左手抬起。")
+
+
 def run_experiment(args: argparse.Namespace, report: dict[str, Any]) -> int:
     if args.plan_only:
         report["runtime"]["status"] = "PLAN_ONLY_NO_RABO_MOTION"
         return 0
 
-    include_left = args.mode in ("check", "dry", "dry-grasp-only", "real", "orientation-calibration", "left-direct-grasp", "left-direct-grasp-interactive", "slanted-orientation-calibration")
+    include_left = args.mode in ("check", "dry", "dry-grasp-only", "real", "orientation-calibration", "left-direct-grasp", "left-direct-grasp-interactive", "slanted-orientation-calibration", "auto-left-grasp")
     include_right = args.mode in ("place", "real")
-    include_left_hand = args.mode in ("dry", "dry-grasp-only", "real", "orientation-calibration", "left-direct-grasp", "left-direct-grasp-interactive", "slanted-orientation-calibration")
+    include_left_hand = args.mode in ("dry", "dry-grasp-only", "real", "orientation-calibration", "left-direct-grasp", "left-direct-grasp-interactive", "slanted-orientation-calibration", "auto-left-grasp")
     include_right_hand = args.mode in ("place", "real")
     include_pose_setter = args.mode in ("left-direct-grasp", "left-direct-grasp-interactive")
     bundle = None
@@ -2458,9 +2600,11 @@ def run_experiment(args: argparse.Namespace, report: dict[str, Any]) -> int:
             run_left_direct_grasp_interactive_mode(bundle, report, args)
         if args.mode == "slanted-orientation-calibration":
             run_slanted_orientation_calibration_mode(bundle, report, args)
+        if args.mode == "auto-left-grasp":
+            run_auto_left_grasp_mode(bundle, report, args)
         if not str(report["runtime"].get("status", "")).startswith("ABORTED_BY_USER"):
             report["runtime"]["status"] = "EXECUTED"
-        if args.mode not in ("check", "orientation-calibration", "left-direct-grasp", "left-direct-grasp-interactive", "slanted-orientation-calibration") and not args.no_prompt:
+        if args.mode not in ("check", "orientation-calibration", "left-direct-grasp", "left-direct-grasp-interactive", "slanted-orientation-calibration", "auto-left-grasp") and not args.no_prompt:
             report["user_observation"] = ask_user_observation(args.mode)
         return 0
     except Exception as exc:
@@ -2481,7 +2625,7 @@ def run_experiment(args: argparse.Namespace, report: dict[str, Any]) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Left-hand grasp V1 parameterized experiment tool.")
     subparsers = parser.add_subparsers(dest="mode", required=True)
-    for mode in ("check", "dry", "dry-grasp-only", "place", "real", "orientation-calibration", "left-direct-grasp", "left-direct-grasp-interactive", "slanted-orientation-calibration"):
+    for mode in ("check", "dry", "dry-grasp-only", "place", "real", "orientation-calibration", "left-direct-grasp", "left-direct-grasp-interactive", "slanted-orientation-calibration", "auto-left-grasp"):
         sub = subparsers.add_parser(mode)
         sub.set_defaults(
             approach_dz=0.05,
@@ -2512,7 +2656,10 @@ def build_parser() -> argparse.ArgumentParser:
             sub.add_argument("--settle-after-release-s", type=float, default=3.0)
         if mode in ("left-direct-grasp", "left-direct-grasp-interactive", "slanted-orientation-calibration"):
             sub.add_argument("--yaw", type=float, default=0.0, help="Left top-grasp yaw in radians. Roll/pitch stay fixed at 0.0/-1.57.")
-        if mode not in ("check", "orientation-calibration", "left-direct-grasp", "left-direct-grasp-interactive", "slanted-orientation-calibration"):
+        if mode == "auto-left-grasp":
+            sub.add_argument("--nut-world", type=float, nargs=3, metavar=("X", "Y", "Z"), required=True, help="Nut world XYZ coordinate.")
+            sub.add_argument("--yaw-offset", type=float, default=0.0, help="Yaw offset for the left grasp template.")
+        if mode not in ("check", "orientation-calibration", "left-direct-grasp", "left-direct-grasp-interactive", "slanted-orientation-calibration", "auto-left-grasp"):
             sub.add_argument("--step-delay-s", type=float, default=0.0)
         if mode == "dry-grasp-only":
             sub.add_argument("--staged", action="store_true", help="Use high/mid/low staged descent before final grasp pose.")
@@ -2521,7 +2668,7 @@ def build_parser() -> argparse.ArgumentParser:
             sub.add_argument("--step-confirm", action="store_true", help="Require Enter after each staged waypoint.")
         if mode in ("dry", "place", "real"):
             sub.add_argument("--plan-only", action="store_true", help="Generate derived values and reports without importing or driving Rabo SDK.")
-        if mode not in ("check", "orientation-calibration", "left-direct-grasp", "left-direct-grasp-interactive", "slanted-orientation-calibration"):
+        if mode not in ("check", "orientation-calibration", "left-direct-grasp", "left-direct-grasp-interactive", "slanted-orientation-calibration", "auto-left-grasp"):
             sub.add_argument("--no-prompt", action="store_true", help="Skip manual observation prompt after motion.")
         sub.add_argument("--mock-pose-check", choices=("pass", "fail"), help=argparse.SUPPRESS)
         sub.add_argument("--mock-pose-check-sequence", choices=("pass", "fail"), nargs="+", help=argparse.SUPPRESS)
