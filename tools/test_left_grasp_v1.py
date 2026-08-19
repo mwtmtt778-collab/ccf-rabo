@@ -70,6 +70,9 @@ LEFT_DIRECT_GRASP_Z = -0.33
 LEFT_DIRECT_PRE_GRASP_HIGH_Z = -0.15
 LEFT_DIRECT_DESCENT_Z = [-0.20, -0.25, -0.29, -0.31, -0.33]
 LEFT_DIRECT_LIFT_Z = [-0.30, -0.27, -0.23]
+LEFT_DIRECT_INTERACTIVE_START_Z = -0.35
+LEFT_DIRECT_INTERACTIVE_Z_MIN = -0.45
+LEFT_DIRECT_INTERACTIVE_Z_MAX = -0.10
 LEFT_DIRECT_GRASP_FORCE = {"strength": 1.0, "fingers": [1, 3, 4]}
 LEFT_DIRECT_ORIENTATION_SOURCE = "VERIFIED_ORIENTATION_CALIBRATION_20260819"
 LEFT_DIRECT_SETTLE_AFTER_POSE_S = 2.5
@@ -193,6 +196,8 @@ def run_id_text(mode: str) -> str:
         return datetime.now().strftime("orientation_calibration_%Y%m%d_%H%M%S")
     if mode == "left-direct-grasp":
         return datetime.now().strftime("left_direct_grasp_%Y%m%d_%H%M%S")
+    if mode == "left-direct-grasp-interactive":
+        return datetime.now().strftime("left_direct_grasp_interactive_%Y%m%d_%H%M%S")
     return datetime.now().strftime("%Y%m%d_%H%M%S_%f") + f"_{mode.replace('-', '_')}"
 
 
@@ -673,6 +678,211 @@ def execute_left_hand_command(
     return result
 
 
+def format_optional_float(value: float | None, digits: int = 4) -> str:
+    return "未记录" if value is None else f"{value:.{digits}f}"
+
+
+def actual_pose_values(arm: Any) -> tuple[list[float] | None, Any]:
+    raw = safe_call("left_arm", arm, "get_pose")
+    return numeric_pose(raw), raw
+
+
+def print_left_direct_interactive_header(current_pose: Pose6) -> None:
+    print("==================================================")
+    print("左手抓取高度交互标定")
+    print("==================================================")
+    print("")
+    print("当前末端位置：")
+    print(f"X = {current_pose.x:.3f}")
+    print(f"Y = {current_pose.y:.3f}")
+    print(f"Z = {current_pose.z:.3f}")
+    print("")
+    print("当前姿态：")
+    print(f"roll  = {current_pose.roll:.3f}")
+    print(f"pitch = {current_pose.pitch:.3f}")
+    print(f"yaw   = {current_pose.yaw:.3f}")
+    print("")
+    print("请观察仿真画面：")
+    print("- 掌心是否朝下")
+    print("- 螺母是否位于三指之间")
+    print("- 手指高度是否合适")
+    print("- 是否存在碰撞风险")
+    print("==================================================")
+
+
+def print_left_direct_interactive_menu() -> str:
+    print("")
+    print("请选择操作：")
+    print("")
+    print("1：向下 5 mm")
+    print("2：向上 5 mm")
+    print("")
+    print("3：向下 2 mm")
+    print("4：向上 2 mm")
+    print("")
+    print("5：向下 1 mm")
+    print("6：向上 1 mm")
+    print("")
+    print("g：执行抓取")
+    print("l：抓住后向上抬 3 cm")
+    print("")
+    print("o：张开左手")
+    print("p：打印当前 Pose 和关节角")
+    print("")
+    print("q：退出实验")
+    print("")
+    return input("请输入：").strip().lower()
+
+
+def print_left_direct_status(bundle: Any, report: dict[str, Any], *, current_z: float, grasp_executed: bool) -> None:
+    actual_pose, raw_pose = actual_pose_values(bundle.left_arm)
+    joints = safe_call("left_arm", bundle.left_arm, "get_joint_angles")
+    grasp = report["grasp"]
+    print("")
+    print("当前状态")
+    print("-------------------------")
+    print("实际末端位置：")
+    if actual_pose is None:
+        print(json.dumps(jsonable(raw_pose), ensure_ascii=False))
+    else:
+        print(f"X = {actual_pose[0]:.4f}")
+        print(f"Y = {actual_pose[1]:.4f}")
+        print(f"Z = {actual_pose[2]:.4f}")
+    print("")
+    print("实际末端姿态：")
+    if actual_pose is None:
+        print("无法解析当前姿态")
+    else:
+        print(f"roll  = {actual_pose[3]:.4f}")
+        print(f"pitch = {actual_pose[4]:.4f}")
+        print(f"yaw   = {actual_pose[5]:.4f}")
+    print("")
+    print("当前关节角：")
+    print(json.dumps(jsonable(joints), ensure_ascii=False))
+    print("")
+    print("是否执行过抓取：")
+    print("是" if grasp_executed else "否")
+    print("")
+    print("记录的抓取 Z：")
+    print(format_optional_float(grasp.get("actual_grasp_z")))
+    print("-------------------------")
+    append_robot_record(
+        report,
+        phase="LEFT_DIRECT_INTERACTIVE_PRINT_STATUS",
+        target="left_arm",
+        method="get_pose/get_joint_angles",
+        actual_get_pose=raw_pose,
+        actual_joints=joints,
+        current_z=current_z,
+        grasp_executed=grasp_executed,
+        status="OK",
+    )
+
+
+def interactive_z_move(
+    bundle: Any,
+    report: dict[str, Any],
+    *,
+    action: str,
+    delta_z: float,
+    current_z: float,
+    yaw: float,
+    lift: bool = False,
+) -> float:
+    before_z = current_z
+    target_z = current_z + delta_z
+    history_key = "lift_history" if lift else "interactive_history"
+    record: dict[str, Any] = {
+        "action": action,
+        "before_z": before_z,
+        "target_z": target_z,
+        "actual_z": None,
+        "pose_check": False,
+        "pose_check_reason": "NOT_RUN",
+        "move_success": False,
+        "move_to_return": None,
+        "actual_get_pose": [],
+        "actual_joints": [],
+    }
+    if target_z < LEFT_DIRECT_INTERACTIVE_Z_MIN:
+        print("")
+        print(f"已到达本实验设置的最低安全高度 {LEFT_DIRECT_INTERACTIVE_Z_MIN:.3f} m。")
+        print("本次不继续下降。")
+        record["blocked_by_limit"] = "Z_MIN"
+        report[history_key].append(jsonable(record))
+        return current_z
+    if target_z > LEFT_DIRECT_INTERACTIVE_Z_MAX:
+        print("")
+        print(f"已到达本实验设置的最高安全高度 {LEFT_DIRECT_INTERACTIVE_Z_MAX:.3f} m。")
+        print("本次不继续上升。")
+        record["blocked_by_limit"] = "Z_MAX"
+        report[history_key].append(jsonable(record))
+        return current_z
+
+    target_pose = left_direct_pose(target_z, yaw)
+    pose_check = call_pose_check(bundle.left_arm, target_pose)
+    record["pose_check"] = pose_check["status"] == "PASS"
+    record["pose_check_reason"] = pose_check["reason"]
+    record["pose_check_raw"] = pose_check["raw"]
+    append_robot_record(
+        report,
+        phase=f"LEFT_DIRECT_INTERACTIVE_{action}",
+        target="left_arm",
+        method="pose_check",
+        target_pose=pose_to_list(target_pose),
+        pose_check=pose_check,
+        status="OK" if pose_check["status"] == "PASS" else "POSE_CHECK_FAILED_STOPPED_BEFORE_MOVE",
+    )
+    if pose_check["status"] != "PASS":
+        print("")
+        print("[不可执行]")
+        print("")
+        print(f"目标 Z：{target_z:.4f} m")
+        print("pose_check：失败")
+        print(f"原因：{pose_check['reason']}")
+        print("")
+        print("机械臂没有移动。")
+        print(f"当前 Z 仍为：{current_z:.4f} m")
+        report[history_key].append(jsonable(record))
+        return current_z
+
+    success, move_return, raw_pose, joints = execute_orientation_move(
+        bundle,
+        f"LEFT_DIRECT_INTERACTIVE_{action}",
+        target_pose,
+        report,
+        "left direct grasp interactive z adjustment",
+    )
+    parsed_pose = numeric_pose(raw_pose)
+    actual_z = parsed_pose[2] if parsed_pose is not None else target_z
+    record["move_success"] = success
+    record["move_to_return"] = move_return
+    record["actual_get_pose"] = jsonable(raw_pose)
+    record["actual_joints"] = jsonable(joints)
+    record["actual_z"] = actual_z
+    report[history_key].append(jsonable(record))
+    if not success:
+        print("")
+        print("[移动失败]")
+        print(f"目标 Z：{target_z:.4f} m")
+        print(f"move_to 返回：{jsonable(move_return)}")
+        print(f"当前 Z 仍记录为：{current_z:.4f} m")
+        raise StepExecutionError(f"LEFT_DIRECT_INTERACTIVE_{action}: left_arm.move_to failed", failed_node=f"LEFT_DIRECT_INTERACTIVE_{action}")
+
+    direction = "向上" if delta_z > 0 else "向下"
+    moved_mm = abs(actual_z - before_z) * 1000.0
+    print("")
+    print("[移动成功]")
+    print("")
+    print(f"目标 Z：{target_z:.4f} m")
+    print(f"实际 Z：{actual_z:.4f} m")
+    print("")
+    print(f"本次{direction}移动约：{moved_mm:.1f} mm")
+    print("")
+    print("请观察仿真画面。")
+    return actual_z
+
+
 def execute_action_step(bundle: Any, step: ActionStep, report: dict[str, Any], *, sleep_after_s: float = 0.0) -> dict[str, Any]:
     record: dict[str, Any] = {
         "timestamp": timestamp_text(),
@@ -820,7 +1030,7 @@ def update_chain_reachability(report: dict[str, Any], label: str, result: dict[s
 
 def derive_values(args: argparse.Namespace) -> dict[str, Any]:
     left_grasp = pose_from_list(args.pose) if getattr(args, "pose", None) is not None else None
-    if getattr(args, "mode", None) in ("check", "dry-grasp-only", "orientation-calibration", "left-direct-grasp"):
+    if getattr(args, "mode", None) in ("check", "dry-grasp-only", "orientation-calibration", "left-direct-grasp", "left-direct-grasp-interactive"):
         left_approach = None
         left_lift = None
     else:
@@ -880,8 +1090,8 @@ def derive_values(args: argparse.Namespace) -> dict[str, Any]:
 
     return {
         "LEFT_GRASP_POSE": {"value": pose_list(left_grasp), "status": "PREDICTED_EXPERIMENT_SEED" if left_grasp else "NOT_USED"},
-        "LEFT_APPROACH_POSE": {"value": pose_list(left_approach), "status": "NOT_APPLICABLE" if getattr(args, "mode", None) in ("check", "dry-grasp-only", "orientation-calibration", "left-direct-grasp") else "PREDICTED"},
-        "LEFT_LIFT_POSE": {"value": pose_list(left_lift), "status": "NOT_APPLICABLE" if getattr(args, "mode", None) in ("check", "dry-grasp-only", "orientation-calibration", "left-direct-grasp") else "PREDICTED"},
+        "LEFT_APPROACH_POSE": {"value": pose_list(left_approach), "status": "NOT_APPLICABLE" if getattr(args, "mode", None) in ("check", "dry-grasp-only", "orientation-calibration", "left-direct-grasp", "left-direct-grasp-interactive") else "PREDICTED"},
+        "LEFT_LIFT_POSE": {"value": pose_list(left_lift), "status": "NOT_APPLICABLE" if getattr(args, "mode", None) in ("check", "dry-grasp-only", "orientation-calibration", "left-direct-grasp", "left-direct-grasp-interactive") else "PREDICTED"},
         "STAGED_WAYPOINTS": {"value": staged, "status": "PREDICTED_STAGED_ENTRY" if staged else "NOT_APPLICABLE"},
         "TARGET_NUT_WORLD_XY": {"value": target_world_xy, "status": "PREDICTED_FROM_LEFT_BASE_TARGET_XY" if target_world_xy else "NOT_USED"},
         "PREDICTED_RIGHT_RELEASE_WORLD_POSE": {"value": right_release_world_pose, "status": right_release_pose_source or "NOT_USED"},
@@ -1620,16 +1830,231 @@ def run_left_direct_grasp_mode(bundle: Any, report: dict[str, Any], args: argpar
         open_left_hand(bundle.left_hand, report, phase="LEFT_DIRECT_OPTIONAL_OPEN_BEFORE_SHUTDOWN")
 
 
+def run_left_direct_grasp_interactive_mode(bundle: Any, report: dict[str, Any], args: argparse.Namespace) -> None:
+    yaw = float(args.yaw)
+    safe_palm_down_pose = Pose6(CALIBRATION_XYZ[0], CALIBRATION_XYZ[1], CALIBRATION_XYZ[2], LEFT_TOP_GRASP_ROLL, LEFT_TOP_GRASP_PITCH, yaw)
+    pre_grasp_high = left_direct_pose(LEFT_DIRECT_PRE_GRASP_HIGH_Z, yaw)
+    interactive_start_pose = left_direct_pose(LEFT_DIRECT_INTERACTIVE_START_Z, yaw)
+
+    report["mode"] = "left-direct-grasp-interactive"
+    report["nut_world_pose"] = list(NUT_B_LEFT_TEST_WORLD_POSE)
+    report["left_test_xy"] = list(LEFT_TEST_XY)
+    report["orientation"] = {
+        "roll": LEFT_TOP_GRASP_ROLL,
+        "pitch": LEFT_TOP_GRASP_PITCH,
+        "yaw": yaw,
+        "source": LEFT_DIRECT_ORIENTATION_SOURCE,
+    }
+    report["interactive_start_z"] = LEFT_DIRECT_INTERACTIVE_START_Z
+    report["interactive_z_limits"] = {
+        "min": LEFT_DIRECT_INTERACTIVE_Z_MIN,
+        "max": LEFT_DIRECT_INTERACTIVE_Z_MAX,
+    }
+    report["safe_palm_down_pose"] = pose_to_list(safe_palm_down_pose)
+    report["pre_grasp_high"] = pose_to_list(pre_grasp_high)
+    report["interactive_start_pose"] = pose_to_list(interactive_start_pose)
+    report["interactive_history"] = []
+    report["lift_history"] = []
+    report["grasp"] = {
+        "executed": False,
+        "actual_grasp_pose": [],
+        "actual_grasp_z": None,
+        "strength": LEFT_DIRECT_GRASP_FORCE["strength"],
+        "fingers": list(LEFT_DIRECT_GRASP_FORCE["fingers"]),
+    }
+
+    print("==================================================")
+    print("左手直接抓 Nut B：交互式高度标定")
+    print("==================================================")
+    print("正在把 Nut B 放到左手测试位置。")
+    result = bundle.pose_setter.set(NUT_IDS["B"], tuple(NUT_B_LEFT_TEST_WORLD_POSE))
+    failed, reason = step_result_failed(result)
+    append_robot_record(
+        report,
+        phase="LEFT_DIRECT_INTERACTIVE_SET_NUT_B",
+        target="pose_setter",
+        method="set",
+        args=[NUT_IDS["B"], NUT_B_LEFT_TEST_WORLD_POSE],
+        return_value=result,
+        status="FAILED" if failed else "OK",
+    )
+    print("Nut B 已移动到左手直接抓取测试位置。")
+    print(f"world pose = {NUT_B_LEFT_TEST_WORLD_POSE}")
+    print(f"set 返回值 = {jsonable(result)}")
+    if failed:
+        raise StepExecutionError(f"LEFT_DIRECT_INTERACTIVE_SET_NUT_B: pose_setter.set failed: {reason}", failed_node="LEFT_DIRECT_INTERACTIVE_SET_NUT_B")
+    time.sleep(LEFT_DIRECT_SETTLE_AFTER_POSE_S)
+
+    print("正在张开左手。")
+    open_left_hand(bundle.left_hand, report, phase="LEFT_DIRECT_INTERACTIVE_OPEN_HAND")
+
+    for index, joints in enumerate(ORIENTATION_CALIBRATION_SAFE_JOINTS, start=1):
+        print(f"[安全预摆 {index}] 目标关节 = {joints}")
+        result = bundle.left_arm.move_joints(joints)
+        failed, reason = step_result_failed(result)
+        append_robot_record(
+            report,
+            phase=f"LEFT_DIRECT_INTERACTIVE_SAFE_PRE_{index}",
+            target="left_arm",
+            method="move_joints",
+            args=[joints],
+            return_value=result,
+            status="FAILED" if failed else "OK",
+        )
+        print(f"[安全预摆 {index}] 返回值 = {jsonable(result)}")
+        if failed:
+            print("[失败] 安全预摆失败")
+            raise StepExecutionError(f"LEFT_DIRECT_INTERACTIVE_SAFE_PRE_{index}: left_arm.move_joints failed: {reason}", failed_node="LEFT_DIRECT_INTERACTIVE_SAFE_PRE")
+
+    checked_left_move(
+        bundle,
+        report,
+        phase="LEFT_DIRECT_INTERACTIVE_SAFE_PALM_DOWN",
+        pose=safe_palm_down_pose,
+        waypoint_bucket=None,
+    )
+    checked_left_move(
+        bundle,
+        report,
+        phase="LEFT_DIRECT_INTERACTIVE_PRE_GRASP_HIGH",
+        pose=pre_grasp_high,
+        waypoint_bucket=None,
+    )
+    checked_left_move(
+        bundle,
+        report,
+        phase="LEFT_DIRECT_INTERACTIVE_START_Z",
+        pose=interactive_start_pose,
+        waypoint_bucket=None,
+    )
+
+    parsed_pose, raw_pose = actual_pose_values(bundle.left_arm)
+    current_z = parsed_pose[2] if parsed_pose is not None else LEFT_DIRECT_INTERACTIVE_START_Z
+    print_left_direct_interactive_header(left_direct_pose(current_z, yaw))
+
+    grasp_executed = False
+    while True:
+        choice = print_left_direct_interactive_menu()
+        if choice == "q":
+            report["runtime"]["status"] = "ABORTED_BY_USER" if not grasp_executed else "FINISHED_BY_USER"
+            break
+        if choice == "p":
+            print_left_direct_status(bundle, report, current_z=current_z, grasp_executed=grasp_executed)
+            continue
+        if choice == "o":
+            open_left_hand(bundle.left_hand, report, phase="LEFT_DIRECT_INTERACTIVE_OPEN_BY_USER")
+            print("左手已张开。")
+            continue
+        if choice == "g":
+            parsed_pose, raw_pose = actual_pose_values(bundle.left_arm)
+            grasp_z = parsed_pose[2] if parsed_pose is not None else current_z
+            print("==================================================")
+            print("准备执行抓取")
+            print("")
+            print("当前实际 EE Pose：")
+            print(json.dumps(jsonable(raw_pose), ensure_ascii=False))
+            print("")
+            print("当前 Z：")
+            print(f"{grasp_z:.4f} m")
+            print("")
+            print("请确认：")
+            print("螺母已经位于大拇指、中指、无名指之间。")
+            print("")
+            answer = input("按 ENTER 确认抓取。\n输入 q 取消。\n").strip().lower()
+            print("==================================================")
+            if answer == "q":
+                print("已取消本次抓取。")
+                continue
+            execute_left_hand_command(
+                bundle.left_hand,
+                report,
+                phase="LEFT_DIRECT_INTERACTIVE_THUMB_TUCK",
+                method_name="clench",
+                kwargs={"thumb_rotation": 1.0},
+            )
+            time.sleep(0.3)
+            execute_left_hand_command(
+                bundle.left_hand,
+                report,
+                phase="LEFT_DIRECT_INTERACTIVE_GRASP_FORCE",
+                method_name="grasp_force",
+                kwargs=dict(LEFT_DIRECT_GRASP_FORCE),
+            )
+            grasp_executed = True
+            report["grasp"]["executed"] = True
+            report["grasp"]["actual_grasp_pose"] = jsonable(raw_pose)
+            report["grasp"]["actual_grasp_z"] = grasp_z
+            current_z = grasp_z
+            print("")
+            print("抓取动作已执行。")
+            print("")
+            print("请观察：")
+            print("- 三根手指是否接触螺母")
+            print("- 螺母是否被夹紧")
+            print("- 是否发生滑动")
+            print("")
+            print("如果准备测试是否抓牢，请输入 l 抬起。")
+            print("如果需要松手，请输入 o。")
+            continue
+        if choice == "l":
+            current_z = interactive_z_move(
+                bundle,
+                report,
+                action="LIFT_30MM",
+                delta_z=0.03,
+                current_z=current_z,
+                yaw=yaw,
+                lift=True,
+            )
+            print("")
+            print("已向上抬约 3 cm。")
+            print("")
+            print("当前 Z：")
+            print(f"{current_z:.4f} m")
+            print("")
+            print("请观察 Nut B 是否跟随手一起上升。")
+            print("")
+            print("可以：")
+            print("l：继续向上抬 3 cm")
+            print("o：张开手")
+            print("p：查看当前状态")
+            print("q：结束实验")
+            continue
+
+        z_actions = {
+            "1": ("DOWN_5MM", -0.005),
+            "2": ("UP_5MM", 0.005),
+            "3": ("DOWN_2MM", -0.002),
+            "4": ("UP_2MM", 0.002),
+            "5": ("DOWN_1MM", -0.001),
+            "6": ("UP_1MM", 0.001),
+        }
+        if choice in z_actions:
+            action, delta_z = z_actions[choice]
+            current_z = interactive_z_move(
+                bundle,
+                report,
+                action=action,
+                delta_z=delta_z,
+                current_z=current_z,
+                yaw=yaw,
+            )
+            continue
+
+        print("")
+        print("输入无效，请重新选择。")
+
+
 def run_experiment(args: argparse.Namespace, report: dict[str, Any]) -> int:
     if args.plan_only:
         report["runtime"]["status"] = "PLAN_ONLY_NO_RABO_MOTION"
         return 0
 
-    include_left = args.mode in ("check", "dry", "dry-grasp-only", "real", "orientation-calibration", "left-direct-grasp")
+    include_left = args.mode in ("check", "dry", "dry-grasp-only", "real", "orientation-calibration", "left-direct-grasp", "left-direct-grasp-interactive")
     include_right = args.mode in ("place", "real")
-    include_left_hand = args.mode in ("dry", "dry-grasp-only", "real", "orientation-calibration", "left-direct-grasp")
+    include_left_hand = args.mode in ("dry", "dry-grasp-only", "real", "orientation-calibration", "left-direct-grasp", "left-direct-grasp-interactive")
     include_right_hand = args.mode in ("place", "real")
-    include_pose_setter = args.mode == "left-direct-grasp"
+    include_pose_setter = args.mode in ("left-direct-grasp", "left-direct-grasp-interactive")
     bundle = None
     try:
         if args.mock_pose_check is not None:
@@ -1673,9 +2098,11 @@ def run_experiment(args: argparse.Namespace, report: dict[str, Any]) -> int:
             run_orientation_calibration_mode(bundle, report)
         if args.mode == "left-direct-grasp":
             run_left_direct_grasp_mode(bundle, report, args)
+        if args.mode == "left-direct-grasp-interactive":
+            run_left_direct_grasp_interactive_mode(bundle, report, args)
         if not str(report["runtime"].get("status", "")).startswith("ABORTED_BY_USER"):
             report["runtime"]["status"] = "EXECUTED"
-        if args.mode not in ("check", "orientation-calibration", "left-direct-grasp") and not args.no_prompt:
+        if args.mode not in ("check", "orientation-calibration", "left-direct-grasp", "left-direct-grasp-interactive") and not args.no_prompt:
             report["user_observation"] = ask_user_observation(args.mode)
         return 0
     except Exception as exc:
@@ -1696,7 +2123,7 @@ def run_experiment(args: argparse.Namespace, report: dict[str, Any]) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Left-hand grasp V1 parameterized experiment tool.")
     subparsers = parser.add_subparsers(dest="mode", required=True)
-    for mode in ("check", "dry", "dry-grasp-only", "place", "real", "orientation-calibration", "left-direct-grasp"):
+    for mode in ("check", "dry", "dry-grasp-only", "place", "real", "orientation-calibration", "left-direct-grasp", "left-direct-grasp-interactive"):
         sub = subparsers.add_parser(mode)
         sub.set_defaults(
             approach_dz=0.05,
@@ -1725,9 +2152,9 @@ def build_parser() -> argparse.ArgumentParser:
         if mode in ("place", "real"):
             sub.add_argument("--wait-before-release-s", type=float, default=1.5)
             sub.add_argument("--settle-after-release-s", type=float, default=3.0)
-        if mode == "left-direct-grasp":
+        if mode in ("left-direct-grasp", "left-direct-grasp-interactive"):
             sub.add_argument("--yaw", type=float, default=0.0, help="Left top-grasp yaw in radians. Roll/pitch stay fixed at 0.0/-1.57.")
-        if mode not in ("check", "orientation-calibration", "left-direct-grasp"):
+        if mode not in ("check", "orientation-calibration", "left-direct-grasp", "left-direct-grasp-interactive"):
             sub.add_argument("--step-delay-s", type=float, default=0.0)
         if mode == "dry-grasp-only":
             sub.add_argument("--staged", action="store_true", help="Use high/mid/low staged descent before final grasp pose.")
@@ -1736,7 +2163,7 @@ def build_parser() -> argparse.ArgumentParser:
             sub.add_argument("--step-confirm", action="store_true", help="Require Enter after each staged waypoint.")
         if mode in ("dry", "place", "real"):
             sub.add_argument("--plan-only", action="store_true", help="Generate derived values and reports without importing or driving Rabo SDK.")
-        if mode not in ("check", "orientation-calibration", "left-direct-grasp"):
+        if mode not in ("check", "orientation-calibration", "left-direct-grasp", "left-direct-grasp-interactive"):
             sub.add_argument("--no-prompt", action="store_true", help="Skip manual observation prompt after motion.")
         sub.add_argument("--mock-pose-check", choices=("pass", "fail"), help=argparse.SUPPRESS)
         sub.add_argument("--mock-pose-check-sequence", choices=("pass", "fail"), nargs="+", help=argparse.SUPPRESS)
