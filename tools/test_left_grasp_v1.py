@@ -70,6 +70,8 @@ ORIENTATION_CALIBRATION_POSES = [
 ]
 
 NUT_B_LEFT_TEST_WORLD_POSE = [-0.2966, 0.0420, 0.2806, 0.0, 0.0, 0.5233]
+AUTO_LEFT_GRASP_NUT_RPY = [0.0, 0.0, 0.5233]
+AUTO_LEFT_GRASP_NUT_SETTLE_S = 3.0
 LEFT_TOP_GRASP_ROLL = 0.0
 LEFT_TOP_GRASP_PITCH = -1.57
 LEFT_DIRECT_GRASP_Z = -0.33
@@ -1456,6 +1458,7 @@ def build_report(args: argparse.Namespace, derived: dict[str, Any]) -> dict[str,
             "yaw": getattr(args, "yaw", None),
             "nut_world": getattr(args, "nut_world", None),
             "yaw_offset": getattr(args, "yaw_offset", None),
+            "place_nut_b": getattr(args, "place_nut_b", None),
             "argv": command_line(),
             "plan_only": args.plan_only,
             "mock_pose_check": getattr(args, "mock_pose_check", None),
@@ -2486,6 +2489,65 @@ def print_auto_left_preflight(preflight: dict[str, Any]) -> None:
     print("本次不会执行抓取。")
 
 
+def place_nut_b_for_auto_left_grasp(bundle: Any, report: dict[str, Any], nut_world_xyz: list[float]) -> bool:
+    target_world_pose = [
+        float(nut_world_xyz[0]),
+        float(nut_world_xyz[1]),
+        float(nut_world_xyz[2]),
+        AUTO_LEFT_GRASP_NUT_RPY[0],
+        AUTO_LEFT_GRASP_NUT_RPY[1],
+        AUTO_LEFT_GRASP_NUT_RPY[2],
+    ]
+    result = bundle.pose_setter.set(NUT_IDS["B"], tuple(target_world_pose))
+    failed, reason = step_result_failed(result)
+    report["nut_placement"] = {
+        "requested": True,
+        "entity_id": NUT_IDS["B"],
+        "target_world_pose": target_world_pose,
+        "set_return": jsonable(result),
+        "settle_seconds": AUTO_LEFT_GRASP_NUT_SETTLE_S,
+        "success": not failed,
+        "reason": reason if failed else "",
+    }
+    append_robot_record(
+        report,
+        phase="AUTO_LEFT_GRASP_SET_NUT_B",
+        target="pose_setter",
+        method="set",
+        args=[NUT_IDS["B"], target_world_pose],
+        return_value=result,
+        status="FAILED" if failed else "OK",
+    )
+    if failed:
+        print("")
+        print("[失败]")
+        print("")
+        print("Nut B 放置失败。")
+        print("本次不会继续执行左手抓取。")
+        report["success"] = False
+        report["runtime"]["failed_node"] = "AUTO_LEFT_GRASP_SET_NUT_B"
+        report["runtime"]["error"] = reason
+        return False
+
+    print("========================================")
+    print("Nut B 已移动到左手自动抓取测试位置")
+    print("")
+    print("Nut B 世界坐标：")
+    print(f"X = {target_world_pose[0]: .4f}")
+    print(f"Y = {target_world_pose[1]: .4f}")
+    print(f"Z = {target_world_pose[2]: .4f}")
+    print("")
+    print("Nut B 姿态：")
+    print("roll  = 0")
+    print("pitch = 0")
+    print(f"yaw   = {target_world_pose[5]:.4f}")
+    print("")
+    print(f"等待 {AUTO_LEFT_GRASP_NUT_SETTLE_S:.0f} 秒，使螺母稳定。")
+    print("========================================")
+    time.sleep(AUTO_LEFT_GRASP_NUT_SETTLE_S)
+    return True
+
+
 def run_auto_left_grasp_mode(bundle: Any, report: dict[str, Any], args: argparse.Namespace) -> None:
     planner = LeftNutGraspPlanner(left_arm=bundle.left_arm, left_hand=bundle.left_hand)
     nut_world_xyz = [float(v) for v in args.nut_world]
@@ -2505,6 +2567,16 @@ def run_auto_left_grasp_mode(bundle: Any, report: dict[str, Any], args: argparse
     report["grasp_action"] = {}
     report["lift"] = []
     report["success"] = None
+    report["nut_placement"] = {
+        "requested": bool(args.place_nut_b),
+        "entity_id": NUT_IDS["B"] if args.place_nut_b else None,
+        "target_world_pose": None,
+        "set_return": None,
+        "settle_seconds": AUTO_LEFT_GRASP_NUT_SETTLE_S if args.place_nut_b else 0.0,
+    }
+
+    if args.place_nut_b and not place_nut_b_for_auto_left_grasp(bundle, report, nut_world_xyz):
+        return
 
     print_auto_left_grasp_plan(plan, yaw_offset)
     preflight = planner.preflight_grasp_chain(plan)
@@ -2552,7 +2624,9 @@ def run_experiment(args: argparse.Namespace, report: dict[str, Any]) -> int:
     include_right = args.mode in ("place", "real")
     include_left_hand = args.mode in ("dry", "dry-grasp-only", "real", "orientation-calibration", "left-direct-grasp", "left-direct-grasp-interactive", "slanted-orientation-calibration", "auto-left-grasp")
     include_right_hand = args.mode in ("place", "real")
-    include_pose_setter = args.mode in ("left-direct-grasp", "left-direct-grasp-interactive")
+    include_pose_setter = args.mode in ("left-direct-grasp", "left-direct-grasp-interactive") or (
+        args.mode == "auto-left-grasp" and getattr(args, "place_nut_b", False)
+    )
     bundle = None
     try:
         if args.mock_pose_check is not None:
@@ -2659,6 +2733,7 @@ def build_parser() -> argparse.ArgumentParser:
         if mode == "auto-left-grasp":
             sub.add_argument("--nut-world", type=float, nargs=3, metavar=("X", "Y", "Z"), required=True, help="Nut world XYZ coordinate.")
             sub.add_argument("--yaw-offset", type=float, default=0.0, help="Yaw offset for the left grasp template.")
+            sub.add_argument("--place-nut-b", action="store_true", help="Testing mode: move Nut B to --nut-world before planning/execution.")
         if mode not in ("check", "orientation-calibration", "left-direct-grasp", "left-direct-grasp-interactive", "slanted-orientation-calibration", "auto-left-grasp"):
             sub.add_argument("--step-delay-s", type=float, default=0.0)
         if mode == "dry-grasp-only":
