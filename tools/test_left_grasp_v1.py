@@ -32,6 +32,7 @@ from agents.three_nut_expert.config import (  # noqa: E402
     LEFT_GRASP,
     LEFT_GRASP_FORCE,
     LEFT_PRE_JOINTS,
+    NUT_IDS,
     RIGHT_GRASP_FORCE,
     RIGHT_LIFT_POSES,
     RIGHT_PRE_JOINTS,
@@ -61,6 +62,17 @@ ORIENTATION_CALIBRATION_POSES = [
     ("Pose_C", "POSE_B_YAW_POSITIVE", Pose6(CALIBRATION_XYZ[0], CALIBRATION_XYZ[1], CALIBRATION_XYZ[2], 0.0, -1.57, 1.0)),
     ("Pose_D", "POSE_B_YAW_NEGATIVE", Pose6(CALIBRATION_XYZ[0], CALIBRATION_XYZ[1], CALIBRATION_XYZ[2], 0.0, -1.57, -1.0)),
 ]
+
+NUT_B_LEFT_TEST_WORLD_POSE = [-0.2966, 0.0420, 0.2806, 0.0, 0.0, 0.5233]
+LEFT_TOP_GRASP_ROLL = 0.0
+LEFT_TOP_GRASP_PITCH = -1.57
+LEFT_DIRECT_GRASP_Z = -0.33
+LEFT_DIRECT_PRE_GRASP_HIGH_Z = -0.15
+LEFT_DIRECT_DESCENT_Z = [-0.20, -0.25, -0.29, -0.31, -0.33]
+LEFT_DIRECT_LIFT_Z = [-0.30, -0.27, -0.23]
+LEFT_DIRECT_GRASP_FORCE = {"strength": 1.0, "fingers": [1, 3, 4]}
+LEFT_DIRECT_ORIENTATION_SOURCE = "VERIFIED_ORIENTATION_CALIBRATION_20260819"
+LEFT_DIRECT_SETTLE_AFTER_POSE_S = 2.5
 
 RIGHT_NUT_B_GRASP_POSE = Pose6(-0.2803, 0.157, -0.33, 0.0, 0.8, 0.0)
 RIGHT_NUT_B_GRASP_POSE_STATUS = "VERIFIED_RIGHT_NUT_B_SUCCESS_FROZEN"
@@ -179,6 +191,8 @@ def timestamp_text() -> str:
 def run_id_text(mode: str) -> str:
     if mode == "orientation-calibration":
         return datetime.now().strftime("orientation_calibration_%Y%m%d_%H%M%S")
+    if mode == "left-direct-grasp":
+        return datetime.now().strftime("left_direct_grasp_%Y%m%d_%H%M%S")
     return datetime.now().strftime("%Y%m%d_%H%M%S_%f") + f"_{mode.replace('-', '_')}"
 
 
@@ -273,7 +287,14 @@ def shutdown_bundle(bundle: Any | None) -> None:
                 print(f"shutdown warning: {name}: {repr(exc)}")
 
 
-def make_bundle(include_left: bool, include_right: bool, *, include_left_hand: bool = True, include_right_hand: bool = True) -> Any:
+def make_bundle(
+    include_left: bool,
+    include_right: bool,
+    *,
+    include_left_hand: bool = True,
+    include_right_hand: bool = True,
+    include_pose_setter: bool = False,
+) -> Any:
     from rabo_robocap import LinkerArmA7, LinkerHandO6Left, LinkerHandO6Right
 
     values: dict[str, Any] = {"_shutdown_done": False}
@@ -285,6 +306,10 @@ def make_bundle(include_left: bool, include_right: bool, *, include_left_hand: b
         values["right_arm"] = LinkerArmA7(robot_id=DEVICE_IDS["RIGHT_ARM"], mode="sim")
         if include_right_hand:
             values["right_hand"] = LinkerHandO6Right(robot_id=DEVICE_IDS["RIGHT_HAND"], mode="sim")
+    if include_pose_setter:
+        from rabo_dev_kit import SetEntityPose
+
+        values["pose_setter"] = SetEntityPose(world=WORLD_ID)
     return SimpleNamespace(**values)
 
 
@@ -347,6 +372,18 @@ class MockHand:
         self.calls.append({"method": "shutdown"})
 
 
+class MockPoseSetter:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def set(self, thing_id: str, pose: tuple[float, float, float, float, float, float]) -> bool:
+        self.calls.append({"method": "set", "thing_id": thing_id, "pose": list(pose)})
+        return True
+
+    def shutdown(self) -> None:
+        self.calls.append({"method": "shutdown"})
+
+
 def make_mock_bundle(
     include_left: bool,
     include_right: bool,
@@ -354,6 +391,7 @@ def make_mock_bundle(
     include_left_hand: bool,
     include_right_hand: bool,
     result: str,
+    include_pose_setter: bool = False,
     pose_check_sequence: list[str] | None = None,
     move_fail_phase: str | None = None,
 ) -> Any:
@@ -366,6 +404,8 @@ def make_mock_bundle(
         values["right_arm"] = MockArm(result)
         if include_right_hand:
             values["right_hand"] = MockHand()
+    if include_pose_setter:
+        values["pose_setter"] = MockPoseSetter()
     return SimpleNamespace(**values)
 
 
@@ -474,7 +514,7 @@ def prompt_enter_skip_quit(message: str) -> str:
     return "enter"
 
 
-def open_left_hand(left_hand: Any, report: dict[str, Any]) -> None:
+def open_left_hand(left_hand: Any, report: dict[str, Any], *, phase: str = "ORIENTATION_CALIBRATION_OPEN_HAND") -> None:
     if hasattr(left_hand, "open"):
         result = left_hand.open()
         method = "open"
@@ -484,7 +524,7 @@ def open_left_hand(left_hand: Any, report: dict[str, Any]) -> None:
     failed, reason = step_result_failed(result)
     append_robot_record(
         report,
-        phase="ORIENTATION_CALIBRATION_OPEN_HAND",
+        phase=phase,
         target="left_hand",
         method=method,
         return_value=result,
@@ -493,12 +533,13 @@ def open_left_hand(left_hand: Any, report: dict[str, Any]) -> None:
     print(f"[LEFT_HAND_OPEN] method={method} return={jsonable(result)}")
     if failed:
         raise StepExecutionError(
-            f"ORIENTATION_CALIBRATION_OPEN_HAND: left_hand.{method} failed: {reason}",
-            failed_node="ORIENTATION_CALIBRATION_OPEN_HAND",
+            f"{phase}: left_hand.{method} failed: {reason}",
+            failed_node=phase,
         )
 
 
 def execute_orientation_move(bundle: Any, name: str, pose: Pose6, report: dict[str, Any], note: str) -> tuple[bool, Any, Any, Any]:
+    setattr(bundle.left_arm, "current_phase", name)
     result = bundle.left_arm.move_to(pose.x, pose.y, pose.z, roll=pose.roll, pitch=pose.pitch, yaw=pose.yaw)
     failed, reason = step_result_failed(result)
     actual_pose = safe_call("left_arm", bundle.left_arm, "get_pose")
@@ -519,6 +560,117 @@ def execute_orientation_move(bundle: Any, name: str, pose: Pose6, report: dict[s
     if failed:
         print(f"[FAIL] {name} move_to failed: {reason}")
     return (not failed), jsonable(result), actual_pose, joint_angles
+
+
+def left_direct_pose(z: float, yaw: float) -> Pose6:
+    return Pose6(LEFT_TEST_XY[0], LEFT_TEST_XY[1], z, LEFT_TOP_GRASP_ROLL, LEFT_TOP_GRASP_PITCH, yaw)
+
+
+def record_left_direct_waypoint(report: dict[str, Any], bucket: str, record: dict[str, Any]) -> None:
+    report.setdefault(bucket, []).append(jsonable(record))
+
+
+def confirm_or_abort(prompt: str, *, failed_node: str) -> None:
+    answer = input(prompt).strip().lower()
+    if answer == "q":
+        raise StepExecutionError(f"{failed_node}: aborted by user", failed_node=failed_node)
+
+
+def checked_left_move(
+    bundle: Any,
+    report: dict[str, Any],
+    *,
+    phase: str,
+    pose: Pose6,
+    waypoint_bucket: str | None,
+    confirm_prompt: str | None = None,
+) -> dict[str, Any]:
+    pose_check = call_pose_check(bundle.left_arm, pose)
+    record: dict[str, Any] = {
+        "phase": phase,
+        "target_pose": pose_to_list(pose),
+        "pose_check": pose_check["status"] == "PASS",
+        "pose_check_status": pose_check["status"],
+        "pose_check_reason": pose_check["reason"],
+        "pose_check_raw": pose_check["raw"],
+        "move_executed": False,
+        "move_to_return": None,
+        "actual_get_pose": [],
+        "actual_joints": [],
+    }
+    append_robot_record(
+        report,
+        phase=phase,
+        target="left_arm",
+        method="pose_check",
+        target_pose=pose_to_list(pose),
+        pose_check=pose_check,
+        status="OK" if pose_check["status"] == "PASS" else "POSE_CHECK_FAILED_STOPPED_BEFORE_MOVE",
+    )
+    print(f"[{phase}]")
+    print(f"target = {pose_to_list(pose)}")
+    print(f"pose_check = {pose_check['status']}")
+    print(f"reason = {pose_check['reason']}")
+    if pose_check["status"] != "PASS":
+        if waypoint_bucket is not None:
+            record_left_direct_waypoint(report, waypoint_bucket, record)
+        raise StepExecutionError(f"{phase}: left_arm pose_check failed: {pose_check['reason']}", failed_node=phase)
+    if confirm_prompt is not None:
+        confirm_or_abort(confirm_prompt, failed_node=phase)
+    success, move_return, actual_pose, joint_angles = execute_orientation_move(
+        bundle,
+        phase,
+        pose,
+        report,
+        "left direct grasp checked waypoint",
+    )
+    record["move_executed"] = True
+    record["move_to_return"] = move_return
+    record["actual_get_pose"] = jsonable(actual_pose)
+    record["actual_joints"] = jsonable(joint_angles)
+    record["move_success"] = success
+    print("actual get_pose()")
+    print(json.dumps(jsonable(actual_pose), ensure_ascii=False))
+    print("actual joints")
+    print(json.dumps(jsonable(joint_angles), ensure_ascii=False))
+    print(f"move_to return value = {jsonable(move_return)}")
+    if waypoint_bucket is not None:
+        record_left_direct_waypoint(report, waypoint_bucket, record)
+    if not success:
+        raise StepExecutionError(f"{phase}: left_arm.move_to failed", failed_node=phase)
+    return record
+
+
+def execute_left_hand_command(
+    left_hand: Any,
+    report: dict[str, Any],
+    *,
+    phase: str,
+    method_name: str,
+    args: list[Any] | None = None,
+    kwargs: dict[str, Any] | None = None,
+) -> Any:
+    args = args or []
+    kwargs = kwargs or {}
+    method = getattr(left_hand, method_name)
+    result = method(*args, **kwargs)
+    failed, reason = step_result_failed(result)
+    append_robot_record(
+        report,
+        phase=phase,
+        target="left_hand",
+        method=method_name,
+        args=args,
+        kwargs=kwargs,
+        return_value=result,
+        joint_angles=safe_call("left_hand", left_hand, "get_joint_angles"),
+        hand_clench=safe_call("left_hand", left_hand, "get_clench"),
+        status="FAILED" if failed else "OK",
+    )
+    print(f"[{phase}] {method_name} return = {jsonable(result)}")
+    if failed:
+        raise StepExecutionError(f"{phase}: left_hand.{method_name} failed: {reason}", failed_node=phase)
+    return result
 
 
 def execute_action_step(bundle: Any, step: ActionStep, report: dict[str, Any], *, sleep_after_s: float = 0.0) -> dict[str, Any]:
@@ -668,7 +820,7 @@ def update_chain_reachability(report: dict[str, Any], label: str, result: dict[s
 
 def derive_values(args: argparse.Namespace) -> dict[str, Any]:
     left_grasp = pose_from_list(args.pose) if getattr(args, "pose", None) is not None else None
-    if getattr(args, "mode", None) in ("check", "dry-grasp-only", "orientation-calibration"):
+    if getattr(args, "mode", None) in ("check", "dry-grasp-only", "orientation-calibration", "left-direct-grasp"):
         left_approach = None
         left_lift = None
     else:
@@ -728,8 +880,8 @@ def derive_values(args: argparse.Namespace) -> dict[str, Any]:
 
     return {
         "LEFT_GRASP_POSE": {"value": pose_list(left_grasp), "status": "PREDICTED_EXPERIMENT_SEED" if left_grasp else "NOT_USED"},
-        "LEFT_APPROACH_POSE": {"value": pose_list(left_approach), "status": "NOT_APPLICABLE" if getattr(args, "mode", None) in ("check", "dry-grasp-only", "orientation-calibration") else "PREDICTED"},
-        "LEFT_LIFT_POSE": {"value": pose_list(left_lift), "status": "NOT_APPLICABLE" if getattr(args, "mode", None) in ("check", "dry-grasp-only", "orientation-calibration") else "PREDICTED"},
+        "LEFT_APPROACH_POSE": {"value": pose_list(left_approach), "status": "NOT_APPLICABLE" if getattr(args, "mode", None) in ("check", "dry-grasp-only", "orientation-calibration", "left-direct-grasp") else "PREDICTED"},
+        "LEFT_LIFT_POSE": {"value": pose_list(left_lift), "status": "NOT_APPLICABLE" if getattr(args, "mode", None) in ("check", "dry-grasp-only", "orientation-calibration", "left-direct-grasp") else "PREDICTED"},
         "STAGED_WAYPOINTS": {"value": staged, "status": "PREDICTED_STAGED_ENTRY" if staged else "NOT_APPLICABLE"},
         "TARGET_NUT_WORLD_XY": {"value": target_world_xy, "status": "PREDICTED_FROM_LEFT_BASE_TARGET_XY" if target_world_xy else "NOT_USED"},
         "PREDICTED_RIGHT_RELEASE_WORLD_POSE": {"value": right_release_world_pose, "status": right_release_pose_source or "NOT_USED"},
@@ -822,6 +974,7 @@ def build_report(args: argparse.Namespace, derived: dict[str, Any]) -> dict[str,
             "approach_dz": getattr(args, "approach_dz", None),
             "lift_dz": getattr(args, "lift_dz", None),
             "right_release_pose": getattr(args, "right_release_pose", None),
+            "yaw": getattr(args, "yaw", None),
             "argv": command_line(),
             "plan_only": args.plan_only,
             "mock_pose_check": getattr(args, "mock_pose_check", None),
@@ -1029,6 +1182,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--staged-z requires --staged")
     if getattr(args, "step_confirm", False) and not getattr(args, "staged", False):
         raise SystemExit("--step-confirm requires --staged")
+    if getattr(args, "yaw", 0.0) < -3.14 or getattr(args, "yaw", 0.0) > 3.14:
+        raise SystemExit("--yaw must be within [-3.14, 3.14]")
 
 
 def run_right_place(bundle: Any, right_release_pose: Pose6, report: dict[str, Any], args: argparse.Namespace) -> None:
@@ -1313,15 +1468,168 @@ def run_orientation_calibration_mode(bundle: Any, report: dict[str, Any]) -> Non
         )
 
 
+def run_left_direct_grasp_mode(bundle: Any, report: dict[str, Any], args: argparse.Namespace) -> None:
+    yaw = float(args.yaw)
+    safe_palm_down_pose = Pose6(CALIBRATION_XYZ[0], CALIBRATION_XYZ[1], CALIBRATION_XYZ[2], LEFT_TOP_GRASP_ROLL, LEFT_TOP_GRASP_PITCH, yaw)
+    pre_grasp_high = left_direct_pose(LEFT_DIRECT_PRE_GRASP_HIGH_Z, yaw)
+    grasp_pose = left_direct_pose(LEFT_DIRECT_GRASP_Z, yaw)
+    descent_poses = [left_direct_pose(z, yaw) for z in LEFT_DIRECT_DESCENT_Z]
+    lift_poses = [left_direct_pose(z, yaw) for z in LEFT_DIRECT_LIFT_Z]
+
+    report["mode"] = "left-direct-grasp"
+    report["nut_world_pose"] = list(NUT_B_LEFT_TEST_WORLD_POSE)
+    report["left_test_xy"] = list(LEFT_TEST_XY)
+    report["orientation"] = {
+        "roll": LEFT_TOP_GRASP_ROLL,
+        "pitch": LEFT_TOP_GRASP_PITCH,
+        "yaw": yaw,
+        "source": LEFT_DIRECT_ORIENTATION_SOURCE,
+    }
+    report["grasp_pose"] = pose_to_list(grasp_pose)
+    report["safe_palm_down_pose"] = pose_to_list(safe_palm_down_pose)
+    report["pre_grasp_high"] = pose_to_list(pre_grasp_high)
+    report["descent_waypoints"] = []
+    report["lift_waypoints"] = []
+    report["grasp_force"] = dict(LEFT_DIRECT_GRASP_FORCE)
+
+    print("==================================================")
+    print("LEFT DIRECT GRASP")
+    print("Moving Nut B to left-hand direct-grasp test position.")
+    result = bundle.pose_setter.set(NUT_IDS["B"], tuple(NUT_B_LEFT_TEST_WORLD_POSE))
+    failed, reason = step_result_failed(result)
+    append_robot_record(
+        report,
+        phase="LEFT_DIRECT_SET_NUT_B",
+        target="pose_setter",
+        method="set",
+        args=[NUT_IDS["B"], NUT_B_LEFT_TEST_WORLD_POSE],
+        return_value=result,
+        status="FAILED" if failed else "OK",
+    )
+    print("Nut B moved to left-hand direct-grasp test position.")
+    print(f"world pose = {NUT_B_LEFT_TEST_WORLD_POSE}")
+    print(f"set return = {jsonable(result)}")
+    if failed:
+        raise StepExecutionError(f"LEFT_DIRECT_SET_NUT_B: pose_setter.set failed: {reason}", failed_node="LEFT_DIRECT_SET_NUT_B")
+    time.sleep(LEFT_DIRECT_SETTLE_AFTER_POSE_S)
+
+    print("Opening left hand.")
+    open_left_hand(bundle.left_hand, report, phase="LEFT_DIRECT_OPEN_HAND")
+
+    for index, joints in enumerate(ORIENTATION_CALIBRATION_SAFE_JOINTS, start=1):
+        print(f"[LEFT_DIRECT_SAFE_PRE_{index}] target joints = {joints}")
+        result = bundle.left_arm.move_joints(joints)
+        failed, reason = step_result_failed(result)
+        append_robot_record(
+            report,
+            phase=f"LEFT_DIRECT_SAFE_PRE_{index}",
+            target="left_arm",
+            method="move_joints",
+            args=[joints],
+            return_value=result,
+            status="FAILED" if failed else "OK",
+        )
+        print(f"[LEFT_DIRECT_SAFE_PRE_{index}] return = {jsonable(result)}")
+        if failed:
+            print("[FAIL] safe pre-position failed")
+            raise StepExecutionError(f"LEFT_DIRECT_SAFE_PRE_{index}: left_arm.move_joints failed: {reason}", failed_node="LEFT_DIRECT_SAFE_PRE")
+
+    checked_left_move(
+        bundle,
+        report,
+        phase="LEFT_DIRECT_SAFE_PALM_DOWN",
+        pose=safe_palm_down_pose,
+        waypoint_bucket=None,
+    )
+
+    checked_left_move(
+        bundle,
+        report,
+        phase="LEFT_DIRECT_PRE_GRASP_HIGH",
+        pose=pre_grasp_high,
+        waypoint_bucket=None,
+    )
+    confirm_or_abort(
+        "PRE_GRASP_HIGH reached.\nObserve Nut B alignment and clearance.\nPress ENTER to start staged descent.\nq to abort.\n",
+        failed_node="LEFT_DIRECT_PRE_GRASP_HIGH",
+    )
+
+    for pose in descent_poses:
+        checked_left_move(
+            bundle,
+            report,
+            phase=f"LEFT_DIRECT_DESCEND_Z_{pose.z:.2f}",
+            pose=pose,
+            waypoint_bucket="descent_waypoints",
+            confirm_prompt=(
+                f"Press ENTER to execute descent z={pose.z:.2f}.\n"
+                "q to abort.\n"
+            ),
+        )
+
+    confirm_or_abort(
+        "GRASP POSE REACHED\n\n"
+        "Check:\n"
+        "- palm is facing down\n"
+        "- nut is between fingers\n"
+        "- no collision with table\n\n"
+        "Press ENTER to close hand.\n"
+        "q to abort.\n",
+        failed_node="LEFT_DIRECT_GRASP_CONFIRM",
+    )
+
+    execute_left_hand_command(
+        bundle.left_hand,
+        report,
+        phase="LEFT_DIRECT_THUMB_TUCK",
+        method_name="clench",
+        kwargs={"thumb_rotation": 1.0},
+    )
+    execute_left_hand_command(
+        bundle.left_hand,
+        report,
+        phase="LEFT_DIRECT_GRASP_FORCE",
+        method_name="grasp_force",
+        kwargs=dict(LEFT_DIRECT_GRASP_FORCE),
+    )
+    time.sleep(1.0)
+
+    for pose in lift_poses:
+        checked_left_move(
+            bundle,
+            report,
+            phase=f"LEFT_DIRECT_LIFT_Z_{pose.z:.2f}",
+            pose=pose,
+            waypoint_bucket="lift_waypoints",
+        )
+
+    input(
+        "================================\n"
+        "LEFT DIRECT GRASP TEST COMPLETE\n\n"
+        "Observe Nut B:\n\n"
+        "1. Nut lifted successfully\n"
+        "2. Nut slipped / dropped\n"
+        "3. Hand missed Nut\n"
+        "4. Collision occurred\n\n"
+        "Press ENTER to finish.\n"
+        "================================\n"
+    )
+    answer = input("Open hand before shutdown? [y/N] ").strip().lower()
+    report["open_hand_before_shutdown"] = answer == "y"
+    if answer == "y":
+        open_left_hand(bundle.left_hand, report, phase="LEFT_DIRECT_OPTIONAL_OPEN_BEFORE_SHUTDOWN")
+
+
 def run_experiment(args: argparse.Namespace, report: dict[str, Any]) -> int:
     if args.plan_only:
         report["runtime"]["status"] = "PLAN_ONLY_NO_RABO_MOTION"
         return 0
 
-    include_left = args.mode in ("check", "dry", "dry-grasp-only", "real", "orientation-calibration")
+    include_left = args.mode in ("check", "dry", "dry-grasp-only", "real", "orientation-calibration", "left-direct-grasp")
     include_right = args.mode in ("place", "real")
-    include_left_hand = args.mode in ("dry", "dry-grasp-only", "real", "orientation-calibration")
+    include_left_hand = args.mode in ("dry", "dry-grasp-only", "real", "orientation-calibration", "left-direct-grasp")
     include_right_hand = args.mode in ("place", "real")
+    include_pose_setter = args.mode == "left-direct-grasp"
     bundle = None
     try:
         if args.mock_pose_check is not None:
@@ -1331,6 +1639,7 @@ def run_experiment(args: argparse.Namespace, report: dict[str, Any]) -> int:
                 include_left_hand=include_left_hand,
                 include_right_hand=include_right_hand,
                 result=args.mock_pose_check,
+                include_pose_setter=include_pose_setter,
                 pose_check_sequence=getattr(args, "mock_pose_check_sequence", None),
                 move_fail_phase=getattr(args, "mock_move_fail_phase", None),
             )
@@ -1340,6 +1649,7 @@ def run_experiment(args: argparse.Namespace, report: dict[str, Any]) -> int:
                 include_right=include_right,
                 include_left_hand=include_left_hand,
                 include_right_hand=include_right_hand,
+                include_pose_setter=include_pose_setter,
             )
         initial = read_device_state(bundle, "INITIAL")
         report["robot_data"].append(initial)
@@ -1361,9 +1671,11 @@ def run_experiment(args: argparse.Namespace, report: dict[str, Any]) -> int:
             run_left_dry_or_grasp(bundle, left_grasp, left_approach, left_lift, report, args)
         if args.mode == "orientation-calibration":
             run_orientation_calibration_mode(bundle, report)
+        if args.mode == "left-direct-grasp":
+            run_left_direct_grasp_mode(bundle, report, args)
         if not str(report["runtime"].get("status", "")).startswith("ABORTED_BY_USER"):
             report["runtime"]["status"] = "EXECUTED"
-        if args.mode not in ("check", "orientation-calibration") and not args.no_prompt:
+        if args.mode not in ("check", "orientation-calibration", "left-direct-grasp") and not args.no_prompt:
             report["user_observation"] = ask_user_observation(args.mode)
         return 0
     except Exception as exc:
@@ -1384,7 +1696,7 @@ def run_experiment(args: argparse.Namespace, report: dict[str, Any]) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Left-hand grasp V1 parameterized experiment tool.")
     subparsers = parser.add_subparsers(dest="mode", required=True)
-    for mode in ("check", "dry", "dry-grasp-only", "place", "real", "orientation-calibration"):
+    for mode in ("check", "dry", "dry-grasp-only", "place", "real", "orientation-calibration", "left-direct-grasp"):
         sub = subparsers.add_parser(mode)
         sub.set_defaults(
             approach_dz=0.05,
@@ -1413,7 +1725,9 @@ def build_parser() -> argparse.ArgumentParser:
         if mode in ("place", "real"):
             sub.add_argument("--wait-before-release-s", type=float, default=1.5)
             sub.add_argument("--settle-after-release-s", type=float, default=3.0)
-        if mode not in ("check", "orientation-calibration"):
+        if mode == "left-direct-grasp":
+            sub.add_argument("--yaw", type=float, default=0.0, help="Left top-grasp yaw in radians. Roll/pitch stay fixed at 0.0/-1.57.")
+        if mode not in ("check", "orientation-calibration", "left-direct-grasp"):
             sub.add_argument("--step-delay-s", type=float, default=0.0)
         if mode == "dry-grasp-only":
             sub.add_argument("--staged", action="store_true", help="Use high/mid/low staged descent before final grasp pose.")
@@ -1422,7 +1736,7 @@ def build_parser() -> argparse.ArgumentParser:
             sub.add_argument("--step-confirm", action="store_true", help="Require Enter after each staged waypoint.")
         if mode in ("dry", "place", "real"):
             sub.add_argument("--plan-only", action="store_true", help="Generate derived values and reports without importing or driving Rabo SDK.")
-        if mode not in ("check", "orientation-calibration"):
+        if mode not in ("check", "orientation-calibration", "left-direct-grasp"):
             sub.add_argument("--no-prompt", action="store_true", help="Skip manual observation prompt after motion.")
         sub.add_argument("--mock-pose-check", choices=("pass", "fail"), help=argparse.SUPPRESS)
         sub.add_argument("--mock-pose-check-sequence", choices=("pass", "fail"), nargs="+", help=argparse.SUPPRESS)
