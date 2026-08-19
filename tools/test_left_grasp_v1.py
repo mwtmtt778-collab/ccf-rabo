@@ -50,6 +50,18 @@ from expert.transforms import (  # noqa: E402
 LEFT_TEST_XY = [0.385, 0.038]
 LEFT_TEST_XY_STATUS = "VERIFIED_BY_PREVIOUS_RABO_REACHABILITY_TEST"
 
+CALIBRATION_XYZ = [0.43, 0.30, -0.10]
+ORIENTATION_CALIBRATION_SAFE_JOINTS = [
+    [0, -1.57, 0, 0, 0, 0, 0],
+    [-1.57, -0.7, 0, 0, 0, 0, 0],
+]
+ORIENTATION_CALIBRATION_POSES = [
+    ("Pose_A_REFERENCE", "REFERENCE", Pose6(CALIBRATION_XYZ[0], CALIBRATION_XYZ[1], CALIBRATION_XYZ[2], 0.0, 1.3, 1.57)),
+    ("Pose_B", "THEORY_TEST", Pose6(CALIBRATION_XYZ[0], CALIBRATION_XYZ[1], CALIBRATION_XYZ[2], 0.0, -1.57, 0.0)),
+    ("Pose_C", "POSE_B_YAW_POSITIVE", Pose6(CALIBRATION_XYZ[0], CALIBRATION_XYZ[1], CALIBRATION_XYZ[2], 0.0, -1.57, 1.0)),
+    ("Pose_D", "POSE_B_YAW_NEGATIVE", Pose6(CALIBRATION_XYZ[0], CALIBRATION_XYZ[1], CALIBRATION_XYZ[2], 0.0, -1.57, -1.0)),
+]
+
 RIGHT_NUT_B_GRASP_POSE = Pose6(-0.2803, 0.157, -0.33, 0.0, 0.8, 0.0)
 RIGHT_NUT_B_GRASP_POSE_STATUS = "VERIFIED_RIGHT_NUT_B_SUCCESS_FROZEN"
 
@@ -165,6 +177,8 @@ def timestamp_text() -> str:
 
 
 def run_id_text(mode: str) -> str:
+    if mode == "orientation-calibration":
+        return datetime.now().strftime("orientation_calibration_%Y%m%d_%H%M%S")
     return datetime.now().strftime("%Y%m%d_%H%M%S_%f") + f"_{mode.replace('-', '_')}"
 
 
@@ -315,6 +329,10 @@ class MockHand:
         self.calls.append({"method": "clench", "args": list(args), "kwargs": kwargs})
         return True
 
+    def open(self) -> bool:
+        self.calls.append({"method": "open"})
+        return True
+
     def grasp_force(self, **kwargs: Any) -> bool:
         self.calls.append({"method": "grasp_force", "kwargs": kwargs})
         return True
@@ -440,6 +458,67 @@ def update_report_pose_summary(report: dict[str, Any], *, target: Pose6 | None, 
     else:
         report["position_error"] = error["position_error_m"]
         report["orientation_error"] = error["orientation_error_rpy_l2_rad"]
+
+
+def append_robot_record(report: dict[str, Any], **kwargs: Any) -> None:
+    record = {"timestamp": timestamp_text(), **kwargs}
+    report["robot_data"].append(jsonable(record))
+
+
+def prompt_enter_skip_quit(message: str) -> str:
+    answer = input(message).strip().lower()
+    if answer == "q":
+        return "quit"
+    if answer == "s":
+        return "skip"
+    return "enter"
+
+
+def open_left_hand(left_hand: Any, report: dict[str, Any]) -> None:
+    if hasattr(left_hand, "open"):
+        result = left_hand.open()
+        method = "open"
+    else:
+        result = left_hand.clench(list(HAND_OPEN))
+        method = "clench"
+    failed, reason = step_result_failed(result)
+    append_robot_record(
+        report,
+        phase="ORIENTATION_CALIBRATION_OPEN_HAND",
+        target="left_hand",
+        method=method,
+        return_value=result,
+        status="FAILED" if failed else "OK",
+    )
+    print(f"[LEFT_HAND_OPEN] method={method} return={jsonable(result)}")
+    if failed:
+        raise StepExecutionError(
+            f"ORIENTATION_CALIBRATION_OPEN_HAND: left_hand.{method} failed: {reason}",
+            failed_node="ORIENTATION_CALIBRATION_OPEN_HAND",
+        )
+
+
+def execute_orientation_move(bundle: Any, name: str, pose: Pose6, report: dict[str, Any], note: str) -> tuple[bool, Any, Any, Any]:
+    result = bundle.left_arm.move_to(pose.x, pose.y, pose.z, roll=pose.roll, pitch=pose.pitch, yaw=pose.yaw)
+    failed, reason = step_result_failed(result)
+    actual_pose = safe_call("left_arm", bundle.left_arm, "get_pose")
+    joint_angles = safe_call("left_arm", bundle.left_arm, "get_joint_angles")
+    append_robot_record(
+        report,
+        phase=name,
+        target="left_arm",
+        method="move_to",
+        note=note,
+        target_pose=pose_to_list(pose),
+        move_to_return=result,
+        actual_get_pose=actual_pose,
+        joint_angles=joint_angles,
+        pose_error=pose_error(pose, actual_pose),
+        status="FAILED" if failed else "OK",
+    )
+    if failed:
+        print(f"[FAIL] {name} move_to failed: {reason}")
+    return (not failed), jsonable(result), actual_pose, joint_angles
 
 
 def execute_action_step(bundle: Any, step: ActionStep, report: dict[str, Any], *, sleep_after_s: float = 0.0) -> dict[str, Any]:
@@ -589,7 +668,7 @@ def update_chain_reachability(report: dict[str, Any], label: str, result: dict[s
 
 def derive_values(args: argparse.Namespace) -> dict[str, Any]:
     left_grasp = pose_from_list(args.pose) if getattr(args, "pose", None) is not None else None
-    if getattr(args, "mode", None) in ("check", "dry-grasp-only"):
+    if getattr(args, "mode", None) in ("check", "dry-grasp-only", "orientation-calibration"):
         left_approach = None
         left_lift = None
     else:
@@ -649,8 +728,8 @@ def derive_values(args: argparse.Namespace) -> dict[str, Any]:
 
     return {
         "LEFT_GRASP_POSE": {"value": pose_list(left_grasp), "status": "PREDICTED_EXPERIMENT_SEED" if left_grasp else "NOT_USED"},
-        "LEFT_APPROACH_POSE": {"value": pose_list(left_approach), "status": "NOT_APPLICABLE" if getattr(args, "mode", None) in ("check", "dry-grasp-only") else "PREDICTED"},
-        "LEFT_LIFT_POSE": {"value": pose_list(left_lift), "status": "NOT_APPLICABLE" if getattr(args, "mode", None) in ("check", "dry-grasp-only") else "PREDICTED"},
+        "LEFT_APPROACH_POSE": {"value": pose_list(left_approach), "status": "NOT_APPLICABLE" if getattr(args, "mode", None) in ("check", "dry-grasp-only", "orientation-calibration") else "PREDICTED"},
+        "LEFT_LIFT_POSE": {"value": pose_list(left_lift), "status": "NOT_APPLICABLE" if getattr(args, "mode", None) in ("check", "dry-grasp-only", "orientation-calibration") else "PREDICTED"},
         "STAGED_WAYPOINTS": {"value": staged, "status": "PREDICTED_STAGED_ENTRY" if staged else "NOT_APPLICABLE"},
         "TARGET_NUT_WORLD_XY": {"value": target_world_xy, "status": "PREDICTED_FROM_LEFT_BASE_TARGET_XY" if target_world_xy else "NOT_USED"},
         "PREDICTED_RIGHT_RELEASE_WORLD_POSE": {"value": right_release_world_pose, "status": right_release_pose_source or "NOT_USED"},
@@ -1056,14 +1135,192 @@ def run_dry_grasp_only_staged_mode(bundle: Any, left_grasp: Pose6, report: dict[
     )
 
 
+def run_orientation_calibration_mode(bundle: Any, report: dict[str, Any]) -> None:
+    left_arm = bundle.left_arm
+    left_hand = bundle.left_hand
+    report["calibration_xyz"] = list(CALIBRATION_XYZ)
+    report["tests"] = []
+    report["orientation_calibration"] = {
+        "calibration_xyz": list(CALIBRATION_XYZ),
+        "safe_pre_position_joints": ORIENTATION_CALIBRATION_SAFE_JOINTS,
+        "reference_pose": pose_to_list(ORIENTATION_CALIBRATION_POSES[0][2]),
+        "tests": report["tests"],
+    }
+
+    print("==================================================")
+    print("ORIENTATION CALIBRATION")
+    print("Opening left hand.")
+    open_left_hand(left_hand, report)
+
+    for index, joints in enumerate(ORIENTATION_CALIBRATION_SAFE_JOINTS, start=1):
+        print(f"[SAFE_PRE_POSITION_{index}] target joints = {joints}")
+        result = left_arm.move_joints(joints)
+        failed, reason = step_result_failed(result)
+        append_robot_record(
+            report,
+            phase=f"ORIENTATION_CALIBRATION_SAFE_PRE_{index}",
+            target="left_arm",
+            method="move_joints",
+            args=[joints],
+            return_value=result,
+            status="FAILED" if failed else "OK",
+        )
+        print(f"[SAFE_PRE_POSITION_{index}] return = {jsonable(result)}")
+        if failed:
+            print("[FAIL] safe pre-position failed")
+            raise StepExecutionError(
+                f"ORIENTATION_CALIBRATION_SAFE_PRE_{index}: left_arm.move_joints failed: {reason}",
+                failed_node="ORIENTATION_CALIBRATION_SAFE_PRE",
+            )
+
+    reference_pose = ORIENTATION_CALIBRATION_POSES[0][2]
+    reference_check = call_pose_check(left_arm, reference_pose)
+    append_robot_record(
+        report,
+        phase="ORIENTATION_CALIBRATION_REFERENCE_CHECK",
+        target="left_arm",
+        method="pose_check",
+        target_pose=pose_to_list(reference_pose),
+        pose_check=reference_check,
+        status="OK" if reference_check["status"] == "PASS" else "POSE_CHECK_FAILED_STOPPED_BEFORE_MOVE",
+    )
+    print("Reference safe pose")
+    print(f"target = {pose_to_list(reference_pose)}")
+    print(f"pose_check = {reference_check['status']}")
+    print(f"reason = {reference_check['reason']}")
+    if reference_check["status"] != "PASS":
+        raise StepExecutionError(
+            f"ORIENTATION_CALIBRATION_REFERENCE_CHECK: left_arm pose_check failed: {reference_check['reason']}",
+            failed_node="ORIENTATION_CALIBRATION_REFERENCE_CHECK",
+        )
+
+    success, move_return, actual_pose, joint_angles = execute_orientation_move(
+        bundle,
+        "ORIENTATION_CALIBRATION_REFERENCE",
+        reference_pose,
+        report,
+        "enter known high reference pose before fixed-xyz orientation tests",
+    )
+    if not success:
+        raise StepExecutionError(
+            "ORIENTATION_CALIBRATION_REFERENCE: left_arm.move_to failed",
+            failed_node="ORIENTATION_CALIBRATION_REFERENCE",
+        )
+
+    print("")
+    print("Reference safe pose reached.")
+    print("")
+    print("Actual pose:")
+    print(f"position/orientation = {jsonable(actual_pose)}")
+    print("")
+    print("Actual joints:")
+    print(json.dumps(jsonable(joint_angles), ensure_ascii=False))
+    print(f"move_to return value = {jsonable(move_return)}")
+    print("")
+    print("Check the simulator.")
+    answer = input("Press ENTER to continue.\nType q + ENTER to abort.\n").strip().lower()
+    print("==================================================")
+    if answer == "q":
+        report["runtime"]["status"] = "ABORTED_BY_USER_AFTER_REFERENCE"
+        return
+
+    for name, label, pose in ORIENTATION_CALIBRATION_POSES:
+        test_record: dict[str, Any] = {
+            "name": name,
+            "label": label,
+            "commanded_pose": pose_to_list(pose),
+            "commanded_rpy": [pose.roll, pose.pitch, pose.yaw],
+            "pose_check": False,
+            "pose_check_reason": "NOT_RUN",
+            "move_executed": False,
+            "move_success": False,
+            "move_to_return": None,
+            "actual_pose": [],
+            "joint_angles": [],
+        }
+        report["tests"].append(test_record)
+
+        pose_check = call_pose_check(left_arm, pose)
+        test_record["pose_check"] = pose_check["status"] == "PASS"
+        test_record["pose_check_reason"] = pose_check["reason"]
+        test_record["pose_check_raw"] = pose_check["raw"]
+        append_robot_record(
+            report,
+            phase=name,
+            target="left_arm",
+            method="pose_check",
+            target_pose=pose_to_list(pose),
+            pose_check=pose_check,
+            status="OK" if pose_check["status"] == "PASS" else "POSE_CHECK_FAILED_STOPPED_BEFORE_MOVE",
+        )
+
+        print("")
+        print(name.replace("_", " "))
+        if label == "REFERENCE":
+            print(label)
+        print(f"target = {pose_to_list(pose)}")
+        print(f"pose_check = {pose_check['status']}")
+        print(f"reason = {pose_check['reason']}")
+
+        if pose_check["status"] != "PASS":
+            input("Press ENTER to test the next pose.")
+            continue
+
+        action = prompt_enter_skip_quit(
+            f"Press ENTER to execute {name.replace('_', ' ')}.\n"
+            "Type s to skip.\n"
+            "Type q to quit.\n"
+        )
+        if action == "quit":
+            report["runtime"]["status"] = "ABORTED_BY_USER"
+            break
+        if action == "skip":
+            test_record["move_skipped_by_user"] = True
+            continue
+
+        success, move_return, actual_pose, joint_angles = execute_orientation_move(
+            bundle,
+            name,
+            pose,
+            report,
+            "fixed-xyz orientation calibration pose",
+        )
+        test_record["move_executed"] = True
+        test_record["move_success"] = success
+        test_record["move_to_return"] = move_return
+        test_record["actual_pose"] = jsonable(actual_pose)
+        test_record["joint_angles"] = jsonable(joint_angles)
+
+        print("")
+        print("commanded pose")
+        print(pose_to_list(pose))
+        print("actual get_pose()")
+        print(json.dumps(jsonable(actual_pose), ensure_ascii=False))
+        print("actual joint angles")
+        print(json.dumps(jsonable(joint_angles), ensure_ascii=False))
+        print(f"move_to return value = {jsonable(move_return)}")
+
+        if not success:
+            raise StepExecutionError(f"{name}: left_arm.move_to failed", failed_node=name)
+
+        input(
+            "Observe:\n"
+            "1. Palm direction\n"
+            "2. Finger direction\n"
+            "3. Whether arm/hand touched the table\n"
+            "4. Whether wrist made a large flip\n\n"
+            "Press ENTER for next pose.\n"
+        )
+
+
 def run_experiment(args: argparse.Namespace, report: dict[str, Any]) -> int:
     if args.plan_only:
         report["runtime"]["status"] = "PLAN_ONLY_NO_RABO_MOTION"
         return 0
 
-    include_left = args.mode in ("check", "dry", "dry-grasp-only", "real")
+    include_left = args.mode in ("check", "dry", "dry-grasp-only", "real", "orientation-calibration")
     include_right = args.mode in ("place", "real")
-    include_left_hand = args.mode in ("dry", "dry-grasp-only", "real")
+    include_left_hand = args.mode in ("dry", "dry-grasp-only", "real", "orientation-calibration")
     include_right_hand = args.mode in ("place", "real")
     bundle = None
     try:
@@ -1102,8 +1359,11 @@ def run_experiment(args: argparse.Namespace, report: dict[str, Any]) -> int:
             left_approach = pose_from_list(report["derived_values"]["LEFT_APPROACH_POSE"]["value"])
             left_lift = pose_from_list(report["derived_values"]["LEFT_LIFT_POSE"]["value"])
             run_left_dry_or_grasp(bundle, left_grasp, left_approach, left_lift, report, args)
-        report["runtime"]["status"] = "EXECUTED"
-        if args.mode != "check" and not args.no_prompt:
+        if args.mode == "orientation-calibration":
+            run_orientation_calibration_mode(bundle, report)
+        if not str(report["runtime"].get("status", "")).startswith("ABORTED_BY_USER"):
+            report["runtime"]["status"] = "EXECUTED"
+        if args.mode not in ("check", "orientation-calibration") and not args.no_prompt:
             report["user_observation"] = ask_user_observation(args.mode)
         return 0
     except Exception as exc:
@@ -1124,7 +1384,7 @@ def run_experiment(args: argparse.Namespace, report: dict[str, Any]) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Left-hand grasp V1 parameterized experiment tool.")
     subparsers = parser.add_subparsers(dest="mode", required=True)
-    for mode in ("check", "dry", "dry-grasp-only", "place", "real"):
+    for mode in ("check", "dry", "dry-grasp-only", "place", "real", "orientation-calibration"):
         sub = subparsers.add_parser(mode)
         sub.set_defaults(
             approach_dz=0.05,
@@ -1153,7 +1413,7 @@ def build_parser() -> argparse.ArgumentParser:
         if mode in ("place", "real"):
             sub.add_argument("--wait-before-release-s", type=float, default=1.5)
             sub.add_argument("--settle-after-release-s", type=float, default=3.0)
-        if mode != "check":
+        if mode not in ("check", "orientation-calibration"):
             sub.add_argument("--step-delay-s", type=float, default=0.0)
         if mode == "dry-grasp-only":
             sub.add_argument("--staged", action="store_true", help="Use high/mid/low staged descent before final grasp pose.")
@@ -1162,7 +1422,7 @@ def build_parser() -> argparse.ArgumentParser:
             sub.add_argument("--step-confirm", action="store_true", help="Require Enter after each staged waypoint.")
         if mode in ("dry", "place", "real"):
             sub.add_argument("--plan-only", action="store_true", help="Generate derived values and reports without importing or driving Rabo SDK.")
-        if mode != "check":
+        if mode not in ("check", "orientation-calibration"):
             sub.add_argument("--no-prompt", action="store_true", help="Skip manual observation prompt after motion.")
         sub.add_argument("--mock-pose-check", choices=("pass", "fail"), help=argparse.SUPPRESS)
         sub.add_argument("--mock-pose-check-sequence", choices=("pass", "fail"), nargs="+", help=argparse.SUPPRESS)
