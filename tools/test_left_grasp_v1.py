@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import subprocess
 import sys
 import time
@@ -76,6 +77,9 @@ LEFT_DIRECT_INTERACTIVE_Z_MAX = -0.10
 LEFT_DIRECT_GRASP_FORCE = {"strength": 1.0, "fingers": [1, 3, 4]}
 LEFT_DIRECT_ORIENTATION_SOURCE = "VERIFIED_ORIENTATION_CALIBRATION_20260819"
 LEFT_DIRECT_SETTLE_AFTER_POSE_S = 2.5
+SLANTED_PITCH_MIN = -2.8
+SLANTED_PITCH_MAX = -1.2
+SLANTED_TARGET_DESCRIPTION = "掌心朝机器人前方并斜向下，视觉接近官方抓取，约40~50度"
 
 RIGHT_NUT_B_GRASP_POSE = Pose6(-0.2803, 0.157, -0.33, 0.0, 0.8, 0.0)
 RIGHT_NUT_B_GRASP_POSE_STATUS = "VERIFIED_RIGHT_NUT_B_SUCCESS_FROZEN"
@@ -198,6 +202,8 @@ def run_id_text(mode: str) -> str:
         return datetime.now().strftime("left_direct_grasp_%Y%m%d_%H%M%S")
     if mode == "left-direct-grasp-interactive":
         return datetime.now().strftime("left_direct_grasp_interactive_%Y%m%d_%H%M%S")
+    if mode == "slanted-orientation-calibration":
+        return datetime.now().strftime("slanted_orientation_calibration_%Y%m%d_%H%M%S")
     return datetime.now().strftime("%Y%m%d_%H%M%S_%f") + f"_{mode.replace('-', '_')}"
 
 
@@ -883,6 +889,250 @@ def interactive_z_move(
     return actual_z
 
 
+def slanted_pose(pitch: float, yaw: float) -> Pose6:
+    return Pose6(CALIBRATION_XYZ[0], CALIBRATION_XYZ[1], CALIBRATION_XYZ[2], 0.0, pitch, yaw)
+
+
+def print_slanted_header(current_pitch: float, yaw: float) -> None:
+    print("==================================================")
+    print("左手斜抓朝向标定")
+    print("==================================================")
+    print("")
+    print("当前固定位置：")
+    print(f"X = {CALIBRATION_XYZ[0]:.3f}")
+    print(f"Y = {CALIBRATION_XYZ[1]:.3f}")
+    print(f"Z = {CALIBRATION_XYZ[2]:.3f}")
+    print("")
+    print("当前姿态：")
+    print("roll  = 0.000")
+    print(f"pitch = {current_pitch:.3f}")
+    print(f"yaw   = {yaw:.3f}")
+    print("")
+    print("当前状态：")
+    print("掌心基准为“基本朝下”。")
+    print("")
+    print("本实验目标：")
+    print("让掌心逐渐变成：")
+    print("“朝机器人前方 + 向下”的斜抓姿态，")
+    print("视觉上接近官方抓取，大约 40°～50°。")
+    print("")
+    print("请观察仿真画面。")
+    print("==================================================")
+
+
+def print_slanted_menu() -> str:
+    print("")
+    print("请选择操作：")
+    print("")
+    print("1：继续向前倾 5°")
+    print("2：向回调 5°")
+    print("")
+    print("3：继续向前倾 2°")
+    print("4：向回调 2°")
+    print("")
+    print("5：继续向前倾 1°")
+    print("6：向回调 1°")
+    print("")
+    print("p：打印当前实际 Pose 和关节角")
+    print("c：确认当前朝向为斜抓候选")
+    print("r：恢复到掌心朝下基准姿态")
+    print("")
+    print("q：退出实验")
+    print("")
+    return input("请输入：").strip().lower()
+
+
+def print_slanted_status(bundle: Any, report: dict[str, Any], *, current_pitch: float, yaw: float) -> None:
+    actual_pose, raw_pose = actual_pose_values(bundle.left_arm)
+    joints = safe_call("left_arm", bundle.left_arm, "get_joint_angles")
+    print("")
+    print("当前状态")
+    print("-------------------------")
+    print("固定目标位置：")
+    print(f"X = {CALIBRATION_XYZ[0]:.3f}")
+    print(f"Y = {CALIBRATION_XYZ[1]:.3f}")
+    print(f"Z = {CALIBRATION_XYZ[2]:.3f}")
+    print("")
+    print("当前命令姿态：")
+    print("roll  = 0.0000")
+    print(f"pitch = {current_pitch:.4f} rad，约 {math.degrees(current_pitch):.1f}°")
+    print(f"yaw   = {yaw:.4f}")
+    print("")
+    print("当前实际 Pose：")
+    print(json.dumps(jsonable(raw_pose), ensure_ascii=False))
+    if actual_pose is not None:
+        print("")
+        print("解析后的实际 RPY（仅记录，不用于判断成败）：")
+        print(f"roll  = {actual_pose[3]:.4f}")
+        print(f"pitch = {actual_pose[4]:.4f}")
+        print(f"yaw   = {actual_pose[5]:.4f}")
+    print("")
+    print("当前关节角：")
+    print(json.dumps(jsonable(joints), ensure_ascii=False))
+    print("-------------------------")
+    append_robot_record(
+        report,
+        phase="SLANTED_PRINT_STATUS",
+        target="left_arm",
+        method="get_pose/get_joint_angles",
+        commanded_rpy=[0.0, current_pitch, yaw],
+        actual_get_pose=raw_pose,
+        actual_joints=joints,
+        status="OK",
+    )
+
+
+def slanted_pitch_move(
+    bundle: Any,
+    report: dict[str, Any],
+    *,
+    action: str,
+    delta_pitch: float,
+    current_pitch: float,
+    yaw: float,
+) -> float:
+    before_pitch = current_pitch
+    target_pitch = current_pitch + delta_pitch
+    record: dict[str, Any] = {
+        "action": action,
+        "before_pitch": before_pitch,
+        "target_pitch": target_pitch,
+        "pose_check": False,
+        "pose_check_reason": "NOT_RUN",
+        "move_success": False,
+        "move_to_return": None,
+        "actual_pose": [],
+        "actual_joints": [],
+    }
+    if target_pitch < SLANTED_PITCH_MIN or target_pitch > SLANTED_PITCH_MAX:
+        print("")
+        print("已达到本实验设置的 pitch 安全范围。")
+        print("本次不继续移动。")
+        print(f"安全范围：{SLANTED_PITCH_MIN:.3f} 到 {SLANTED_PITCH_MAX:.3f} rad")
+        record["blocked_by_limit"] = True
+        report["interaction_history"].append(jsonable(record))
+        return current_pitch
+
+    target_pose = slanted_pose(target_pitch, yaw)
+    pose_check = call_pose_check(bundle.left_arm, target_pose)
+    record["pose_check"] = pose_check["status"] == "PASS"
+    record["pose_check_reason"] = pose_check["reason"]
+    record["pose_check_raw"] = pose_check["raw"]
+    append_robot_record(
+        report,
+        phase=f"SLANTED_{action}",
+        target="left_arm",
+        method="pose_check",
+        target_pose=pose_to_list(target_pose),
+        pose_check=pose_check,
+        status="OK" if pose_check["status"] == "PASS" else "POSE_CHECK_FAILED_STOPPED_BEFORE_MOVE",
+    )
+    if pose_check["status"] != "PASS":
+        print("")
+        print("[不可执行]")
+        print("")
+        print("目标 pitch：")
+        print(f"{target_pitch:.4f} rad")
+        print(f"约 {math.degrees(target_pitch):.1f}°")
+        print("")
+        print("pose_check：失败")
+        print(f"原因：{pose_check['reason']}")
+        print("")
+        print("机械臂没有移动。")
+        print("当前 pitch 保持不变。")
+        report["interaction_history"].append(jsonable(record))
+        return current_pitch
+
+    success, move_return, raw_pose, joints = execute_orientation_move(
+        bundle,
+        f"SLANTED_{action}",
+        target_pose,
+        report,
+        "fixed-xyz slanted orientation pitch adjustment",
+    )
+    record["move_success"] = success
+    record["move_to_return"] = move_return
+    record["actual_pose"] = jsonable(raw_pose)
+    record["actual_joints"] = jsonable(joints)
+    report["interaction_history"].append(jsonable(record))
+    if not success:
+        raise StepExecutionError(f"SLANTED_{action}: left_arm.move_to failed", failed_node=f"SLANTED_{action}")
+
+    print("")
+    print("[姿态调整成功]")
+    print("")
+    print("命令 pitch：")
+    print(f"{target_pitch:.4f} rad")
+    print(f"约 {math.degrees(target_pitch):.1f}°")
+    print("")
+    print("实际 Pose：")
+    print(json.dumps(jsonable(raw_pose), ensure_ascii=False))
+    print("")
+    print("请观察：")
+    print("1. 掌心是否仍有明显向下分量")
+    print("2. 掌心是否开始朝机器人前方")
+    print("3. 是否接近官方抓取中的斜抓姿态")
+    print("4. 手腕是否出现异常翻转")
+    print("")
+    print("继续使用菜单微调。")
+    return target_pitch
+
+
+def confirm_slanted_candidate(bundle: Any, report: dict[str, Any], *, current_pitch: float, yaw: float) -> None:
+    actual_pose, raw_pose = actual_pose_values(bundle.left_arm)
+    joints = safe_call("left_arm", bundle.left_arm, "get_joint_angles")
+    print("==================================================")
+    print("确认当前斜抓候选")
+    print("")
+    print("当前命令姿态：")
+    print("roll  = 0.0000")
+    print(f"pitch = {current_pitch:.4f}")
+    print(f"yaw   = {yaw:.4f}")
+    print("")
+    print("当前实际 Pose：")
+    print(json.dumps(jsonable(raw_pose), ensure_ascii=False))
+    print("")
+    print("当前关节角：")
+    print(json.dumps(jsonable(joints), ensure_ascii=False))
+    print("")
+    print("请确认：")
+    print("当前掌心方向已经接近目标")
+    print("“前方 + 向下”的斜抓姿态。")
+    print("")
+    answer = input("按 ENTER 保存当前候选。\n输入 q 取消。\n").strip().lower()
+    print("==================================================")
+    if answer == "q":
+        print("已取消保存当前候选。")
+        return
+    report["confirmed_candidate"] = {
+        "confirmed": True,
+        "commanded_rpy": [0.0, current_pitch, yaw],
+        "actual_pose": jsonable(raw_pose),
+        "joint_angles": jsonable(joints),
+    }
+    append_robot_record(
+        report,
+        phase="SLANTED_CONFIRM_CANDIDATE",
+        target="left_arm",
+        method="get_pose/get_joint_angles",
+        commanded_rpy=[0.0, current_pitch, yaw],
+        actual_get_pose=raw_pose,
+        actual_joints=joints,
+        status="OK",
+    )
+    print("")
+    print("斜抓候选已保存。")
+    print("")
+    print("建议记录为：")
+    print("")
+    print("LEFT_SLANTED_GRASP_RPY =")
+    print(f"[0.0, {current_pitch:.4f}, {yaw:.4f}]")
+    print("")
+    print("该结果目前状态：")
+    print("人工视觉验证候选")
+    print("不是最终抓取成功 Pose。")
+
+
 def execute_action_step(bundle: Any, step: ActionStep, report: dict[str, Any], *, sleep_after_s: float = 0.0) -> dict[str, Any]:
     record: dict[str, Any] = {
         "timestamp": timestamp_text(),
@@ -1030,7 +1280,14 @@ def update_chain_reachability(report: dict[str, Any], label: str, result: dict[s
 
 def derive_values(args: argparse.Namespace) -> dict[str, Any]:
     left_grasp = pose_from_list(args.pose) if getattr(args, "pose", None) is not None else None
-    if getattr(args, "mode", None) in ("check", "dry-grasp-only", "orientation-calibration", "left-direct-grasp", "left-direct-grasp-interactive"):
+    if getattr(args, "mode", None) in (
+        "check",
+        "dry-grasp-only",
+        "orientation-calibration",
+        "left-direct-grasp",
+        "left-direct-grasp-interactive",
+        "slanted-orientation-calibration",
+    ):
         left_approach = None
         left_lift = None
     else:
@@ -1090,8 +1347,8 @@ def derive_values(args: argparse.Namespace) -> dict[str, Any]:
 
     return {
         "LEFT_GRASP_POSE": {"value": pose_list(left_grasp), "status": "PREDICTED_EXPERIMENT_SEED" if left_grasp else "NOT_USED"},
-        "LEFT_APPROACH_POSE": {"value": pose_list(left_approach), "status": "NOT_APPLICABLE" if getattr(args, "mode", None) in ("check", "dry-grasp-only", "orientation-calibration", "left-direct-grasp", "left-direct-grasp-interactive") else "PREDICTED"},
-        "LEFT_LIFT_POSE": {"value": pose_list(left_lift), "status": "NOT_APPLICABLE" if getattr(args, "mode", None) in ("check", "dry-grasp-only", "orientation-calibration", "left-direct-grasp", "left-direct-grasp-interactive") else "PREDICTED"},
+        "LEFT_APPROACH_POSE": {"value": pose_list(left_approach), "status": "NOT_APPLICABLE" if getattr(args, "mode", None) in ("check", "dry-grasp-only", "orientation-calibration", "left-direct-grasp", "left-direct-grasp-interactive", "slanted-orientation-calibration") else "PREDICTED"},
+        "LEFT_LIFT_POSE": {"value": pose_list(left_lift), "status": "NOT_APPLICABLE" if getattr(args, "mode", None) in ("check", "dry-grasp-only", "orientation-calibration", "left-direct-grasp", "left-direct-grasp-interactive", "slanted-orientation-calibration") else "PREDICTED"},
         "STAGED_WAYPOINTS": {"value": staged, "status": "PREDICTED_STAGED_ENTRY" if staged else "NOT_APPLICABLE"},
         "TARGET_NUT_WORLD_XY": {"value": target_world_xy, "status": "PREDICTED_FROM_LEFT_BASE_TARGET_XY" if target_world_xy else "NOT_USED"},
         "PREDICTED_RIGHT_RELEASE_WORLD_POSE": {"value": right_release_world_pose, "status": right_release_pose_source or "NOT_USED"},
@@ -2045,14 +2302,113 @@ def run_left_direct_grasp_interactive_mode(bundle: Any, report: dict[str, Any], 
         print("输入无效，请重新选择。")
 
 
+def run_slanted_orientation_calibration_mode(bundle: Any, report: dict[str, Any], args: argparse.Namespace) -> None:
+    yaw = float(args.yaw)
+    current_pitch = LEFT_TOP_GRASP_PITCH
+    baseline_pose = slanted_pose(current_pitch, yaw)
+
+    report["mode"] = "slanted-orientation-calibration"
+    report["calibration_xyz"] = list(CALIBRATION_XYZ)
+    report["baseline_rpy"] = [0.0, LEFT_TOP_GRASP_PITCH, yaw]
+    report["target_description"] = SLANTED_TARGET_DESCRIPTION
+    report["pitch_safety_range"] = {"min": SLANTED_PITCH_MIN, "max": SLANTED_PITCH_MAX}
+    report["interaction_history"] = []
+    report["confirmed_candidate"] = {
+        "confirmed": False,
+        "commanded_rpy": [],
+        "actual_pose": [],
+        "joint_angles": [],
+    }
+
+    print("==================================================")
+    print("左手斜抓朝向标定：准备进入安全高空区域")
+    print("==================================================")
+    print("正在张开左手。")
+    open_left_hand(bundle.left_hand, report, phase="SLANTED_OPEN_HAND")
+
+    for index, joints in enumerate(ORIENTATION_CALIBRATION_SAFE_JOINTS, start=1):
+        print(f"[安全预摆 {index}] 目标关节 = {joints}")
+        result = bundle.left_arm.move_joints(joints)
+        failed, reason = step_result_failed(result)
+        append_robot_record(
+            report,
+            phase=f"SLANTED_SAFE_PRE_{index}",
+            target="left_arm",
+            method="move_joints",
+            args=[joints],
+            return_value=result,
+            status="FAILED" if failed else "OK",
+        )
+        print(f"[安全预摆 {index}] 返回值 = {jsonable(result)}")
+        if failed:
+            print("[失败] 安全预摆失败")
+            raise StepExecutionError(f"SLANTED_SAFE_PRE_{index}: left_arm.move_joints failed: {reason}", failed_node="SLANTED_SAFE_PRE")
+
+    checked_left_move(
+        bundle,
+        report,
+        phase="SLANTED_BASELINE_PALM_DOWN",
+        pose=baseline_pose,
+        waypoint_bucket=None,
+    )
+    print_slanted_header(current_pitch, yaw)
+
+    while True:
+        choice = print_slanted_menu()
+        if choice == "q":
+            report["runtime"]["status"] = "ABORTED_BY_USER"
+            break
+        if choice == "p":
+            print_slanted_status(bundle, report, current_pitch=current_pitch, yaw=yaw)
+            continue
+        if choice == "c":
+            confirm_slanted_candidate(bundle, report, current_pitch=current_pitch, yaw=yaw)
+            continue
+        if choice == "r":
+            current_pitch = slanted_pitch_move(
+                bundle,
+                report,
+                action="RESTORE_BASELINE",
+                delta_pitch=LEFT_TOP_GRASP_PITCH - current_pitch,
+                current_pitch=current_pitch,
+                yaw=yaw,
+            )
+            print("")
+            print("已恢复到掌心朝下基准姿态。")
+            continue
+
+        pitch_actions = {
+            "1": ("PITCH_FORWARD_5_DEG", -math.radians(5)),
+            "2": ("PITCH_BACK_5_DEG", math.radians(5)),
+            "3": ("PITCH_FORWARD_2_DEG", -math.radians(2)),
+            "4": ("PITCH_BACK_2_DEG", math.radians(2)),
+            "5": ("PITCH_FORWARD_1_DEG", -math.radians(1)),
+            "6": ("PITCH_BACK_1_DEG", math.radians(1)),
+        }
+        if choice in pitch_actions:
+            action, delta_pitch = pitch_actions[choice]
+            current_pitch = slanted_pitch_move(
+                bundle,
+                report,
+                action=action,
+                delta_pitch=delta_pitch,
+                current_pitch=current_pitch,
+                yaw=yaw,
+            )
+            continue
+
+        print("")
+        print("输入无效，请重新选择。")
+
+
 def run_experiment(args: argparse.Namespace, report: dict[str, Any]) -> int:
     if args.plan_only:
         report["runtime"]["status"] = "PLAN_ONLY_NO_RABO_MOTION"
         return 0
 
-    include_left = args.mode in ("check", "dry", "dry-grasp-only", "real", "orientation-calibration", "left-direct-grasp", "left-direct-grasp-interactive")
+    include_left = args.mode in ("check", "dry", "dry-grasp-only", "real", "orientation-calibration", "left-direct-grasp", "left-direct-grasp-interactive", "slanted-orientation-calibration")
     include_right = args.mode in ("place", "real")
-    include_left_hand = args.mode in ("dry", "dry-grasp-only", "real", "orientation-calibration", "left-direct-grasp", "left-direct-grasp-interactive")
+    include_left_hand = args.mode in ("dry", "dry-grasp-only", "real", "orientation-calibration", "left-direct-grasp", "left-direct-grasp-interactive", "slanted-orientation-calibration")
     include_right_hand = args.mode in ("place", "real")
     include_pose_setter = args.mode in ("left-direct-grasp", "left-direct-grasp-interactive")
     bundle = None
@@ -2100,9 +2456,11 @@ def run_experiment(args: argparse.Namespace, report: dict[str, Any]) -> int:
             run_left_direct_grasp_mode(bundle, report, args)
         if args.mode == "left-direct-grasp-interactive":
             run_left_direct_grasp_interactive_mode(bundle, report, args)
+        if args.mode == "slanted-orientation-calibration":
+            run_slanted_orientation_calibration_mode(bundle, report, args)
         if not str(report["runtime"].get("status", "")).startswith("ABORTED_BY_USER"):
             report["runtime"]["status"] = "EXECUTED"
-        if args.mode not in ("check", "orientation-calibration", "left-direct-grasp", "left-direct-grasp-interactive") and not args.no_prompt:
+        if args.mode not in ("check", "orientation-calibration", "left-direct-grasp", "left-direct-grasp-interactive", "slanted-orientation-calibration") and not args.no_prompt:
             report["user_observation"] = ask_user_observation(args.mode)
         return 0
     except Exception as exc:
@@ -2123,7 +2481,7 @@ def run_experiment(args: argparse.Namespace, report: dict[str, Any]) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Left-hand grasp V1 parameterized experiment tool.")
     subparsers = parser.add_subparsers(dest="mode", required=True)
-    for mode in ("check", "dry", "dry-grasp-only", "place", "real", "orientation-calibration", "left-direct-grasp", "left-direct-grasp-interactive"):
+    for mode in ("check", "dry", "dry-grasp-only", "place", "real", "orientation-calibration", "left-direct-grasp", "left-direct-grasp-interactive", "slanted-orientation-calibration"):
         sub = subparsers.add_parser(mode)
         sub.set_defaults(
             approach_dz=0.05,
@@ -2152,9 +2510,9 @@ def build_parser() -> argparse.ArgumentParser:
         if mode in ("place", "real"):
             sub.add_argument("--wait-before-release-s", type=float, default=1.5)
             sub.add_argument("--settle-after-release-s", type=float, default=3.0)
-        if mode in ("left-direct-grasp", "left-direct-grasp-interactive"):
+        if mode in ("left-direct-grasp", "left-direct-grasp-interactive", "slanted-orientation-calibration"):
             sub.add_argument("--yaw", type=float, default=0.0, help="Left top-grasp yaw in radians. Roll/pitch stay fixed at 0.0/-1.57.")
-        if mode not in ("check", "orientation-calibration", "left-direct-grasp", "left-direct-grasp-interactive"):
+        if mode not in ("check", "orientation-calibration", "left-direct-grasp", "left-direct-grasp-interactive", "slanted-orientation-calibration"):
             sub.add_argument("--step-delay-s", type=float, default=0.0)
         if mode == "dry-grasp-only":
             sub.add_argument("--staged", action="store_true", help="Use high/mid/low staged descent before final grasp pose.")
@@ -2163,7 +2521,7 @@ def build_parser() -> argparse.ArgumentParser:
             sub.add_argument("--step-confirm", action="store_true", help="Require Enter after each staged waypoint.")
         if mode in ("dry", "place", "real"):
             sub.add_argument("--plan-only", action="store_true", help="Generate derived values and reports without importing or driving Rabo SDK.")
-        if mode not in ("check", "orientation-calibration", "left-direct-grasp", "left-direct-grasp-interactive"):
+        if mode not in ("check", "orientation-calibration", "left-direct-grasp", "left-direct-grasp-interactive", "slanted-orientation-calibration"):
             sub.add_argument("--no-prompt", action="store_true", help="Skip manual observation prompt after motion.")
         sub.add_argument("--mock-pose-check", choices=("pass", "fail"), help=argparse.SUPPRESS)
         sub.add_argument("--mock-pose-check-sequence", choices=("pass", "fail"), nargs="+", help=argparse.SUPPRESS)
