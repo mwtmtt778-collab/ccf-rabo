@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Single Nut B dual-arm transfer V1.
+"""Single Nut B dual-arm transfer V2.
 
 Flow:
-right pick Nut B -> right hover-release at the verified left-grasp position ->
+right pick Nut B -> right hover-release at Official Place B ->
 manual confirmation -> left planner grasp/lift -> left place at Official Place B.
 """
 
@@ -44,9 +44,9 @@ from tools.test_left_grasp_v1 import RIGHT_NUT_B_GRASP_POSE  # noqa: E402
 
 
 TARGET_NUT_B_WORLD_POSE = [-0.2966, 0.0420, 0.2806, 0.0, 0.0, 0.5233]
-RIGHT_RELEASE_Z_BASE = -0.20
+RIGHT_RELEASE_Z_BASE = -0.28
 RIGHT_RELEASE_RPY_BASE = [0.0, 0.8, 0.0]
-RIGHT_RETREAT_DZ = 0.10
+RIGHT_RETREAT_OFFSET = [-0.15, 0.0, 0.10]
 DEFAULT_SETTLE_AFTER_RELEASE_S = 3.0
 DEFAULT_HOLD_AFTER_GRASP_S = 0.7
 
@@ -75,8 +75,15 @@ def pose_kwargs(pose: Pose6) -> dict[str, float]:
     return asdict(pose)
 
 
-def pose_with_z_delta(pose: Pose6, dz: float) -> Pose6:
-    return Pose6(pose.x, pose.y, pose.z + dz, pose.roll, pose.pitch, pose.yaw)
+def pose_with_xyz_offset(pose: Pose6, offset: list[float]) -> Pose6:
+    return Pose6(
+        pose.x + offset[0],
+        pose.y + offset[1],
+        pose.z + offset[2],
+        pose.roll,
+        pose.pitch,
+        pose.yaw,
+    )
 
 
 def safe_shutdown(bundle: Any | None) -> None:
@@ -129,7 +136,18 @@ def pose_check_checked(label: str, arm: Any, pose: Pose6) -> dict[str, Any]:
 
 def build_right_release_pose() -> dict[str, Any]:
     right_base_world = CONFIRMED_BASE_FRAMES["right_arm_base"]["world_pose"]
+    left_base_world = CONFIRMED_BASE_FRAMES["left_arm_base"]["world_pose"]
     initial_nut_world = pose_to_list(NUT_SPECS["B"].nominal_pose)
+    official_place_b_base = pose_to_list(LEFT_PLACE_POSES["B"])
+    official_place_b_world = transform_pose_base_to_world(official_place_b_base, left_base_world)
+    target_release_nut_world = [
+        official_place_b_world[0],
+        official_place_b_world[1],
+        TARGET_NUT_B_WORLD_POSE[2],
+        TARGET_NUT_B_WORLD_POSE[3],
+        TARGET_NUT_B_WORLD_POSE[4],
+        TARGET_NUT_B_WORLD_POSE[5],
+    ]
     right_grasp_world = transform_pose_base_to_world(pose_to_list(RIGHT_NUT_B_GRASP_POSE), right_base_world)
     hand_to_nut_offset_world = [
         right_grasp_world[index] - initial_nut_world[index]
@@ -137,8 +155,8 @@ def build_right_release_pose() -> dict[str, Any]:
     ]
 
     release_hand_world = [
-        TARGET_NUT_B_WORLD_POSE[0] + hand_to_nut_offset_world[0],
-        TARGET_NUT_B_WORLD_POSE[1] + hand_to_nut_offset_world[1],
+        target_release_nut_world[0] + hand_to_nut_offset_world[0],
+        target_release_nut_world[1] + hand_to_nut_offset_world[1],
         right_base_world[2] + RIGHT_RELEASE_Z_BASE,
         *right_grasp_world[3:],
     ]
@@ -151,20 +169,26 @@ def build_right_release_pose() -> dict[str, Any]:
         RIGHT_RELEASE_RPY_BASE[1],
         RIGHT_RELEASE_RPY_BASE[2],
     )
+    retreat_pose = pose_with_xyz_offset(release_pose, RIGHT_RETREAT_OFFSET)
     return {
         "right_base_world": right_base_world,
+        "left_base_world": left_base_world,
         "initial_nut_world": initial_nut_world,
-        "target_nut_world": TARGET_NUT_B_WORLD_POSE,
+        "previous_left_grasp_nut_world": TARGET_NUT_B_WORLD_POSE,
+        "official_place_b_base": official_place_b_base,
+        "official_place_b_world_arm_target": official_place_b_world,
+        "target_release_nut_world": target_release_nut_world,
         "right_grasp_pose_base": pose_to_list(RIGHT_NUT_B_GRASP_POSE),
         "right_grasp_pose_world": right_grasp_world,
         "hand_to_nut_offset_world": hand_to_nut_offset_world,
         "right_release_pose_base": pose_to_list(release_pose),
-        "right_retreat_pose_base": pose_to_list(pose_with_z_delta(release_pose, RIGHT_RETREAT_DZ)),
+        "right_retreat_offset_base": RIGHT_RETREAT_OFFSET,
+        "right_retreat_pose_base": pose_to_list(retreat_pose),
         "release_policy": "SCHEME_B_HOVER_RELEASE_NO_TABLE_PRESS",
     }
 
 
-def preflight(bundle: Any, release_pose: Pose6, retreat_pose: Pose6) -> None:
+def preflight(bundle: Any, release_pose: Pose6, retreat_pose: Pose6, nut_world_xyz: list[float]) -> None:
     print_stage("START")
     print_json("WORLD_ID", WORLD_ID)
     print_json("TARGET_NUT_B_WORLD_POSE", TARGET_NUT_B_WORLD_POSE)
@@ -176,7 +200,7 @@ def preflight(bundle: Any, release_pose: Pose6, retreat_pose: Pose6) -> None:
     pose_check_checked("RIGHT_RETREAT_POSE_CHECK", bundle.right_arm, retreat_pose)
 
     planner = LeftNutGraspPlanner(left_arm=bundle.left_arm, left_hand=bundle.left_hand)
-    left_plan = planner.build_plan(TARGET_NUT_B_WORLD_POSE[:3], yaw_offset=0.0)
+    left_plan = planner.build_plan(nut_world_xyz, yaw_offset=0.0)
     left_preflight = planner.preflight_grasp_chain(left_plan)
     print_json("LEFT_GRASP_PREFLIGHT", left_preflight)
     if not left_preflight["success"]:
@@ -204,10 +228,10 @@ def run_right_flow(bundle: Any, release_pose: Pose6, retreat_pose: Pose6, *, hol
     move_checked("RIGHT_RETREAT", bundle.right_arm, retreat_pose)
 
 
-def run_left_flow(bundle: Any) -> None:
+def run_left_flow(bundle: Any, nut_world_xyz: list[float]) -> None:
     print_stage("LEFT_GRASP")
     planner = LeftNutGraspPlanner(left_arm=bundle.left_arm, left_hand=bundle.left_hand)
-    plan = planner.build_plan(TARGET_NUT_B_WORLD_POSE[:3], yaw_offset=0.0)
+    plan = planner.build_plan(nut_world_xyz, yaw_offset=0.0)
     preflight = planner.preflight_grasp_chain(plan)
     print_json("LEFT_GRASP_PREFLIGHT", preflight)
     if not preflight["success"]:
@@ -254,6 +278,9 @@ def run(args: argparse.Namespace) -> int:
     release_pose = pose_from_list(derived["right_release_pose_base"])
     retreat_pose = pose_from_list(derived["right_retreat_pose_base"])
     print_json("DERIVED_PLAN", derived)
+    print_json("RIGHT_RELEASE_TARGET_WORLD", derived["target_release_nut_world"])
+    print_json("RIGHT_RELEASE_POSE_BASE", derived["right_release_pose_base"])
+    print_json("RIGHT_RETREAT_POSE_BASE", derived["right_retreat_pose_base"])
 
     if args.plan_only:
         return 0
@@ -261,7 +288,7 @@ def run(args: argparse.Namespace) -> int:
     bundle = None
     try:
         bundle = RaboDeviceBundle()
-        preflight(bundle, release_pose, retreat_pose)
+        preflight(bundle, release_pose, retreat_pose, derived["target_release_nut_world"][:3])
         run_right_flow(bundle, release_pose, retreat_pose, hold_after_grasp_s=args.hold_after_grasp_s)
 
         print_stage("WAIT_CONFIRM")
@@ -270,7 +297,7 @@ def run(args: argparse.Namespace) -> int:
             time.sleep(args.settle_after_release_s)
         input("Right hand placement completed.\nCheck Nut position.\nPress ENTER to start left grasp.")
 
-        run_left_flow(bundle)
+        run_left_flow(bundle, derived["target_release_nut_world"][:3])
         print_stage("DONE")
         return 0
     except KeyboardInterrupt:
@@ -287,7 +314,7 @@ def run(args: argparse.Namespace) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run single Nut B right-to-left transfer V1.")
+    parser = argparse.ArgumentParser(description="Run single Nut B right-to-left transfer V2.")
     parser.add_argument("--plan-only", action="store_true", help="Print derived poses only; do not initialize or move robot devices.")
     parser.add_argument("--settle-after-release-s", type=float, default=DEFAULT_SETTLE_AFTER_RELEASE_S)
     parser.add_argument("--hold-after-grasp-s", type=float, default=DEFAULT_HOLD_AFTER_GRASP_S)
