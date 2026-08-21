@@ -38,6 +38,7 @@ EXPECTED_NUTS = 3
 TABLE_INLIER_THRESHOLD_M = 0.006  # documented RANSAC threshold in calibration helper
 MIN_OBJECT_HEIGHT_M = 0.006
 MAX_OBJECT_HEIGHT_M = 0.090
+TABLE_CLEARANCE_CANDIDATES_M = (0.006, 0.010, 0.014, 0.018, 0.022, 0.026)
 VOXEL_SIZE_M = 0.003
 CLUSTER_EPS_M = 0.008
 MIN_CLUSTER_VOXELS = 8
@@ -215,6 +216,61 @@ def cluster_metrics(
     }
 
 
+def detect_at_clearance(
+    finite_camera: np.ndarray,
+    height: np.ndarray,
+    transform: np.ndarray,
+    workspace: dict[str, Any],
+    clearance_m: float,
+) -> dict[str, Any]:
+    height_mask = (height >= clearance_m) & (height <= MAX_OBJECT_HEIGHT_M)
+    above_camera = finite_camera[height_mask]
+    above_world = camera_points_to_world(above_camera, transform)
+    x_min, x_max, y_min, y_max = workspace["bounds_world_xy"]
+    roi_mask = (
+        (above_world[:, 0] >= x_min)
+        & (above_world[:, 0] <= x_max)
+        & (above_world[:, 1] >= y_min)
+        & (above_world[:, 1] <= y_max)
+    )
+    roi_camera = above_camera[roi_mask]
+    if len(roi_camera) == 0:
+        voxels_camera = np.empty((0, 3), dtype=float)
+        voxel_weights = np.empty((0,), dtype=np.int64)
+        components: list[np.ndarray] = []
+    else:
+        voxels_camera, voxel_weights = voxel_downsample(roi_camera)
+        components = euclidean_components(voxels_camera)
+    metrics = [cluster_metrics(voxels_camera, voxel_weights, component, transform) for component in components]
+    eligible = [item for item in metrics if item["eligible_nut_geometry"]]
+    return {
+        "clearance_m": clearance_m,
+        "above_camera": above_camera,
+        "above_world": above_world,
+        "roi_camera": roi_camera,
+        "voxels_camera": voxels_camera,
+        "voxel_weights": voxel_weights,
+        "components": components,
+        "metrics": metrics,
+        "eligible": eligible,
+    }
+
+
+def clearance_summary(trial: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "clearance_m": trial["clearance_m"],
+        "points_after_table_filter": int(len(trial["above_camera"])),
+        "points_in_nut_workspace_roi": int(len(trial["roi_camera"])),
+        "voxel_points": int(len(trial["voxels_camera"])),
+        "raw_cluster_num": int(len(trial["components"])),
+        "eligible_cluster_num": int(len(trial["eligible"])),
+        "raw_clusters": [
+            {key: value for key, value in item.items() if not key.startswith("_")}
+            for item in trial["metrics"]
+        ],
+    }
+
+
 def sample_rows(points: np.ndarray, limit: int = MAX_VISUALIZATION_POINTS) -> np.ndarray:
     if len(points) <= limit:
         return points
@@ -273,6 +329,7 @@ def main() -> int:
             "table_method": "RANSAC_DOMINANT_PLANE",
             "table_inlier_threshold_m": TABLE_INLIER_THRESHOLD_M,
             "object_height_range_m": [MIN_OBJECT_HEIGHT_M, MAX_OBJECT_HEIGHT_M],
+            "table_clearance_candidates_m": list(TABLE_CLEARANCE_CANDIDATES_M),
             "voxel_size_m": VOXEL_SIZE_M,
             "cluster_eps_m": CLUSTER_EPS_M,
             "min_cluster_voxels": MIN_CLUSTER_VOXELS,
@@ -308,27 +365,40 @@ def main() -> int:
             normal = -normal
             offset = -offset
         height = finite @ normal + offset
-        above_table_camera = finite[(height >= MIN_OBJECT_HEIGHT_M) & (height <= MAX_OBJECT_HEIGHT_M)]
-        above_table_world = camera_points_to_world(above_table_camera, transform)
-        x_min, x_max, y_min, y_max = workspace["bounds_world_xy"]
-        roi_mask = (
-            (above_table_world[:, 0] >= x_min)
-            & (above_table_world[:, 0] <= x_max)
-            & (above_table_world[:, 1] >= y_min)
-            & (above_table_world[:, 1] <= y_max)
-        )
-        objects_camera = above_table_camera[roi_mask]
         report["table_plane_camera"] = [float(normal[0]), float(normal[1]), float(normal[2]), float(offset)]
         report["table_inlier_points"] = table_inliers
+        clearance_trials = [
+            detect_at_clearance(finite, height, transform, workspace, clearance)
+            for clearance in TABLE_CLEARANCE_CANDIDATES_M
+        ]
+        exact = [trial for trial in clearance_trials if len(trial["eligible"]) == EXPECTED_NUTS]
+        if exact:
+            chosen = exact[0]
+            selection_reason = "LOWEST_CLEARANCE_WITH_EXPECTED_CLUSTER_COUNT"
+        else:
+            chosen = min(
+                clearance_trials,
+                key=lambda trial: (
+                    abs(len(trial["eligible"]) - EXPECTED_NUTS),
+                    -len(trial["eligible"]),
+                    trial["clearance_m"],
+                ),
+            )
+            selection_reason = "CLOSEST_CLUSTER_COUNT_NO_EXACT_MATCH"
+        report["clearance_trials"] = [clearance_summary(trial) for trial in clearance_trials]
+        report["selected_table_clearance_m"] = chosen["clearance_m"]
+        report["clearance_selection_reason"] = selection_reason
+        above_table_camera = chosen["above_camera"]
+        above_table_world = chosen["above_world"]
+        objects_camera = chosen["roi_camera"]
+        voxels_camera = chosen["voxels_camera"]
+        components = chosen["components"]
+        metrics = chosen["metrics"]
+        eligible = chosen["eligible"]
         report["points_after_table_filter"] = int(len(above_table_camera))
         report["points_in_nut_workspace_roi"] = int(len(objects_camera))
         if len(objects_camera) < MIN_CLUSTER_POINTS:
             raise RuntimeError(f"too few above-table points: {len(objects_camera)}")
-
-        voxels_camera, voxel_weights = voxel_downsample(objects_camera)
-        components = euclidean_components(voxels_camera)
-        metrics = [cluster_metrics(voxels_camera, voxel_weights, component, transform) for component in components]
-        eligible = [item for item in metrics if item["eligible_nut_geometry"]]
         eligible.sort(key=lambda item: item["points"], reverse=True)
         # Stable IDs are spatially ordered in world X then Y, not DBSCAN traversal order.
         selected = sorted(eligible, key=lambda item: (item["center_world"][0], item["center_world"][1]))
