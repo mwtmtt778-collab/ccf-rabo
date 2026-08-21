@@ -162,7 +162,10 @@ def start_receiver() -> CloudReceiver:
     qos = QoSProfile(
         history=HistoryPolicy.KEEP_LAST,
         depth=1,
-        reliability=ReliabilityPolicy.BEST_EFFORT,
+        # The fixed top camera publishes RELIABLE/VOLATILE.  Match it exactly:
+        # the platform's DDS bridge does not reliably deliver this PointCloud2
+        # stream to a BEST_EFFORT subscriber even though discovery succeeds.
+        reliability=ReliabilityPolicy.RELIABLE,
         durability=DurabilityPolicy.VOLATILE,
     )
     receiver = CloudReceiver(node=node, subscription=None, owns_rclpy_context=owns_rclpy_context)
