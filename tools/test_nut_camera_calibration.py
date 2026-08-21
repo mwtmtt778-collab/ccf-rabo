@@ -98,6 +98,7 @@ def result_failed(value: Any) -> tuple[bool, str | None]:
 class CloudReceiver:
     node: Any
     subscription: Any
+    owns_rclpy_context: bool
     latest: Any = None
     latest_received_at: float = 0.0
     frames: int = 0
@@ -124,8 +125,9 @@ class CloudReceiver:
             self.node.destroy_subscription(self.subscription)
         with contextlib.suppress(Exception):
             self.node.destroy_node()
-        with contextlib.suppress(Exception):
-            rclpy.shutdown()
+        if self.owns_rclpy_context:
+            with contextlib.suppress(Exception):
+                rclpy.shutdown()
 
 
 def start_receiver() -> CloudReceiver:
@@ -134,7 +136,12 @@ def start_receiver() -> CloudReceiver:
     from sensor_msgs.msg import PointCloud2
 
     os.environ.setdefault("ROS_LOG_DIR", str(PROJECT_ROOT / "logs" / "ros"))
-    rclpy.init(args=None)
+    # In the platform's agent runtime rclpy may already be initialized by the
+    # controller.  Reuse that context; calling init() again raises
+    # "Context.init() must only be called once".
+    owns_rclpy_context = not rclpy.ok()
+    if owns_rclpy_context:
+        rclpy.init(args=None)
     node = rclpy.create_node("nut_camera_calibration")
     qos = QoSProfile(
         history=HistoryPolicy.KEEP_LAST,
@@ -142,7 +149,7 @@ def start_receiver() -> CloudReceiver:
         reliability=ReliabilityPolicy.BEST_EFFORT,
         durability=DurabilityPolicy.VOLATILE,
     )
-    receiver = CloudReceiver(node=node, subscription=None)
+    receiver = CloudReceiver(node=node, subscription=None, owns_rclpy_context=owns_rclpy_context)
 
     def callback(msg: PointCloud2) -> None:
         receiver.latest = msg
