@@ -145,6 +145,7 @@ def new_nut_result(key: str) -> dict[str, Any]:
         "failed_phase": None,
         "failure_code": None,
         "failure_reason": None,
+        "interrupted": False,
         "phases": [],
     }
 
@@ -198,13 +199,13 @@ def move_right_to_observation(right_bundle: Any, label: str) -> list[list[float]
 def execute_one_nut(
     key: str,
     pose_setter: Any,
+    devices: dict[str, Any],
     *,
     settle_after_release_s: float,
     vision_radius_m: float,
 ) -> dict[str, Any]:
     result = new_nut_result(key)
-    right_bundle = None
-    left_bundle = None
+    right_bundle = devices["right"]
     current_phase = "RESET"
     phase_recorded = False
     try:
@@ -230,16 +231,12 @@ def execute_one_nut(
 
         current_phase = "RIGHT_OBSERVATION_BEFORE_GRASP"
         phase_recorded = False
-        right_bundle = make_right_bundle()
         execute_checked("RIGHT_HAND_OPEN_INITIAL", right_bundle.right_hand, "clench", *list(HAND_OPEN))
         observation_path = move_right_to_observation(right_bundle, "RIGHT_OBSERVATION_BEFORE_GRASP")
         time.sleep(RIGHT_OBSERVATION_STABLE_WAIT_S)
         result["right_observation_before_grasp"] = True
         add_phase(result, current_phase, True, joints=observation_path)
         phase_recorded = True
-        shutdown_bundle(right_bundle)
-        right_bundle = None
-
         current_phase = "VISION_BEFORE_GRASP"
         phase_recorded = False
         nominal_xyz = tuple(float(value) for value in reset_pose[:3])
@@ -262,7 +259,6 @@ def execute_one_nut(
 
         current_phase = "RIGHT_GRASP"
         phase_recorded = False
-        right_bundle = make_right_bundle()
         grasp_pose = RIGHT_GRASP_POSES[key]
         move_checked(f"RIGHT_NUT_{key}_GRASP_POSE", right_bundle.right_arm, grasp_pose)
         execute_checked("RIGHT_THUMB_TUCK", right_bundle.right_hand, "clench", thumb_rotation=1.0)
@@ -340,9 +336,6 @@ def execute_one_nut(
             remaining_wait_s=remaining,
         )
         phase_recorded = True
-        shutdown_bundle(right_bundle)
-        right_bundle = None
-
         current_phase = "VISION_AFTER_RELEASE"
         phase_recorded = False
         released_vision = detect_nut(RELEASE_TARGET_WORLD_XYZ, vision_radius_m)
@@ -365,7 +358,9 @@ def execute_one_nut(
 
         current_phase = "LEFT_GRASP"
         phase_recorded = False
-        left_bundle = make_left_bundle()
+        if devices["left"] is None:
+            devices["left"] = make_left_bundle()
+        left_bundle = devices["left"]
         planner = LeftNutGraspPlanner(left_arm=left_bundle.left_arm, left_hand=left_bundle.left_hand)
         left_result = planner.grasp_world_xyz(released_position, execute=True)
         grasp_pose_left = left_result.get("grasp_pose")
@@ -435,6 +430,14 @@ def execute_one_nut(
         )
         phase_recorded = True
         result["success"] = True
+    except KeyboardInterrupt as exc:
+        reason = repr(exc) or "KeyboardInterrupt()"
+        if not phase_recorded:
+            add_phase(result, current_phase, False, failure_reason=reason)
+        result["failed_phase"] = current_phase
+        result["failure_code"] = "USER_INTERRUPTED"
+        result["failure_reason"] = reason
+        result["interrupted"] = True
     except Exception as exc:
         reason = repr(exc)
         if not phase_recorded:
@@ -443,13 +446,15 @@ def execute_one_nut(
         if current_phase == "VISION_AFTER_RELEASE":
             result["failure_code"] = "VISION_AFTER_RELEASE_FAILED"
         result["failure_reason"] = reason
-    finally:
-        shutdown_bundle(right_bundle)
-        shutdown_left_bundle(left_bundle)
     return result
 
 
-def run_trial(trial_id: int, pose_setter: Any, args: argparse.Namespace) -> dict[str, Any]:
+def run_trial(
+    trial_id: int,
+    pose_setter: Any,
+    devices: dict[str, Any],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
     trial = {
         "trial_id": trial_id,
         "sequence": list(NUT_SEQUENCE),
@@ -458,11 +463,13 @@ def run_trial(trial_id: int, pose_setter: Any, args: argparse.Namespace) -> dict
         "failed_nut": None,
         "failed_phase": None,
         "failure_code": None,
+        "interrupted": False,
     }
     for key in NUT_SEQUENCE:
         result = execute_one_nut(
             key,
             pose_setter,
+            devices,
             settle_after_release_s=float(args.settle_after_release_s),
             vision_radius_m=float(args.vision_target_radius_m),
         )
@@ -471,6 +478,7 @@ def run_trial(trial_id: int, pose_setter: Any, args: argparse.Namespace) -> dict
             trial["failed_nut"] = key
             trial["failed_phase"] = result["failed_phase"]
             trial["failure_code"] = result["failure_code"]
+            trial["interrupted"] = result["interrupted"]
             return trial
     trial["success"] = True
     return trial
@@ -509,10 +517,12 @@ def run(args: argparse.Namespace) -> int:
         "failed_phase": None,
         "failure_code": None,
         "failure_reason": None,
+        "interrupted": False,
         "report_path": str(report_path.relative_to(PROJECT_ROOT)),
     }
 
     pose_setter = None
+    devices = {"right": None, "left": None}
     return_code = 1
     try:
         print("================================")
@@ -520,9 +530,10 @@ def run(args: argparse.Namespace) -> int:
         print("Sequence: B -> A -> C")
         print("================================")
         pose_setter = make_pose_setter()
+        devices["right"] = make_right_bundle()
         for trial_id in range(1, args.trials + 1):
             print(f"\n######## Trial {trial_id}/{args.trials} ########")
-            trial = run_trial(trial_id, pose_setter, args)
+            trial = run_trial(trial_id, pose_setter, devices, args)
             report["trials"].append(trial)
             write_report(report, report_path)
             if not trial["success"]:
@@ -530,19 +541,36 @@ def run(args: argparse.Namespace) -> int:
                 report["failed_nut"] = trial["failed_nut"]
                 report["failed_phase"] = trial["failed_phase"]
                 report["failure_code"] = trial["failure_code"]
+                report["interrupted"] = trial["interrupted"]
                 failed_result = trial["nut_results"][-1]
                 report["failure_reason"] = failed_result["failure_reason"]
                 break
         report["overall_success"] = len(report["trials"]) == args.trials and all(
             trial["success"] for trial in report["trials"]
         )
-        report["status"] = "PASS" if report["overall_success"] else "FAILED"
-        return_code = 0 if report["overall_success"] else 1
+        if report["overall_success"]:
+            report["status"] = "PASS"
+            return_code = 0
+        elif report["interrupted"]:
+            report["status"] = "INTERRUPTED"
+            return_code = 130
+        else:
+            report["status"] = "FAILED"
+            return_code = 1
+    except KeyboardInterrupt as exc:
+        report["status"] = "INTERRUPTED"
+        report["interrupted"] = True
+        report["failure_code"] = "USER_INTERRUPTED"
+        report["failed_phase"] = report["failed_phase"] or "INITIALIZE"
+        report["failure_reason"] = repr(exc) or "KeyboardInterrupt()"
+        return_code = 130
     except Exception as exc:
         report["status"] = "FAILED"
         report["failed_phase"] = report["failed_phase"] or "INITIALIZE"
         report["failure_reason"] = repr(exc)
     finally:
+        shutdown_bundle(devices["right"])
+        shutdown_left_bundle(devices["left"])
         shutdown_pose_setter(pose_setter)
         report["finished_at"] = now_text()
         write_report(report, report_path)
