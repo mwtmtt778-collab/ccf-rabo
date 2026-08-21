@@ -54,6 +54,7 @@ POINT_TIMEOUT_SECONDS = 5.0
 WORLD_FRAME_TOLERANCE_M = 0.03
 SET_POSE_RETRIES = 3
 SET_POSE_RETRY_DELAY_SECONDS = 1.0
+SET_POSE_COOLDOWN_SECONDS = 2.0
 
 
 def relative(path: Path) -> str:
@@ -187,10 +188,17 @@ def cloud_xyz(msg: Any) -> tuple[Any, dict[str, Any]]:
     fields = [field.name for field in msg.fields]
     if not {"x", "y", "z"}.issubset(fields):
         raise ValueError(f"PointCloud2 is missing x/y/z fields; fields={fields}")
-    points = np.asarray(
-        list(point_cloud2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True)),
-        dtype=float,
-    )
+    if hasattr(point_cloud2, "read_points_numpy"):
+        points = np.asarray(
+            point_cloud2.read_points_numpy(msg, field_names=("x", "y", "z"), skip_nans=True),
+            dtype=float,
+        )
+    else:
+        raw = point_cloud2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True)
+        if getattr(getattr(raw, "dtype", None), "names", None):
+            points = np.column_stack([raw[name] for name in ("x", "y", "z")]).astype(float)
+        else:
+            points = np.asarray(list(raw), dtype=float)
     if points.size == 0:
         points = np.empty((0, 3), dtype=float)
     points = points.reshape((-1, 3))
@@ -338,36 +346,48 @@ def main() -> int:
         "other_nuts": {"ids": {"A": NUT_IDS["A"], "C": NUT_IDS["C"]}, "action": "MOVE_OFF_SCENE", "pose": OFF_SCENE_POSE},
         "settle_seconds": SETTLE_SECONDS,
         "set_pose_retries": SET_POSE_RETRIES,
+        "set_pose_cooldown_seconds": SET_POSE_COOLDOWN_SECONDS,
         "world_frame_tolerance_m": WORLD_FRAME_TOLERANCE_M,
         "experiments": [],
         "status": "RUNNING",
     }
     receiver: CloudReceiver | None = None
+    pointcloud_frames_received = 0
     try:
         import numpy as np
         from rabo_dev_kit import SetEntityPose
 
         pose_setter = SetEntityPose(world=WORLD_ID)
-        receiver = start_receiver()
-        receiver.spin_for(1.0)  # establish the subscription before the first move
 
         for label in ("A", "C"):
             set_result = set_pose_with_retry(pose_setter, NUT_IDS[label], OFF_SCENE_POSE)
             report["other_nuts"].setdefault("results", {})[label] = set_result
             if not set_result["ok"]:
                 raise RuntimeError(f"failed to move Nut {label} off scene after {SET_POSE_RETRIES} attempts: {set_result['error']}")
+            # Keep the reliable, high-bandwidth point-cloud stream disconnected
+            # while the set-pose service and simulator settle.
+            time.sleep(SET_POSE_COOLDOWN_SECONDS)
 
         for index, xyz in enumerate(WORLD_POSITIONS, start=1):
             pose = [*xyz, *NUT_RPY]
             trial: dict[str, Any] = {"index": index, "world_xyz": xyz, "nut_b_pose": pose}
-            marker = time.monotonic()
             trial["set_pose"] = set_pose_with_retry(pose_setter, NUT_IDS["B"], pose)
             if not trial["set_pose"]["ok"]:
                 trial["status"] = "SET_POSE_FAILED"
                 report["experiments"].append(trial)
                 raise RuntimeError(f"Nut B set_pose failed at trial {index}: {trial['set_pose']['error']}")
-            receiver.spin_for(SETTLE_SECONDS)
-            msg = receiver.next_after(marker, POINT_TIMEOUT_SECONDS)
+
+            # Subscribe only after set_pose has returned, receive a fresh cloud,
+            # then tear down the subscription before the next service call.
+            receiver = start_receiver()
+            marker = time.monotonic()
+            try:
+                receiver.spin_for(SETTLE_SECONDS)
+                msg = receiver.next_after(marker, POINT_TIMEOUT_SECONDS)
+            finally:
+                pointcloud_frames_received += receiver.frames
+                receiver.close()
+                receiver = None
             if msg is None:
                 trial["status"] = "POINTCLOUD_TIMEOUT"
                 report["experiments"].append(trial)
@@ -404,7 +424,7 @@ def main() -> int:
             report["transform_matrix_camera_to_world"] = transform.tolist()
             report["transform_fit_errors_m"] = errors.tolist()
             report["transform_fit_rmse_m"] = float(np.sqrt(np.mean(errors ** 2)))
-        report["pointcloud_frames_received"] = receiver.frames
+        report["pointcloud_frames_received"] = pointcloud_frames_received
         report["status"] = "PASS"
     except Exception as exc:
         report["status"] = "FAILED"
