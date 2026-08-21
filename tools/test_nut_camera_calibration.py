@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Calibrate the fixed top-camera PointCloud2 frame against Rabo world coordinates.
 
-This is one destructive simulation experiment: it moves Nut A and Nut C out of
-the scene, then places Nut B at four known world positions.  No robot motion or
-gripper command is issued.  The output is always written to
+This is one destructive simulation experiment: it moves Nut A, Nut C, and the
+storage box out of the scene, then places Nut B at four known world positions.
+No robot motion or gripper command is issued.  The output is always written to
 ``reports/nut_camera_calibration/result.json`` (including failure details).
 
 Run from the project root:
@@ -38,11 +38,20 @@ NUT_IDS = {
     "B": "thing_e937f633-faed-4b2e-b609-a7b80825a64a",
     "C": "thing_4a38ffae-a85b-43c9-8b20-abb0cf6dcac7",
 }
+STORAGE_BOX_ID = "thing_8e768252-b4a8-47d7-82fc-320981b50c01"
+STORAGE_BOX_WORLD_XY = [-0.3104, 0.2586]
+BOX_EXCLUSION_RADIUS_M = 0.18
 WORLD_POSITIONS = [
     [-0.30, 0.04, 0.28],
     [-0.40, 0.04, 0.28],
     [-0.30, 0.15, 0.28],
     [-0.40, 0.15, 0.28],
+]
+BOX_SAFE_FALLBACK_POSITIONS = [
+    [-0.30, 0.04, 0.28],
+    [-0.40, 0.04, 0.28],
+    [-0.30, -0.07, 0.28],
+    [-0.40, -0.07, 0.28],
 ]
 # SetEntityPose is the verified client for the supplied /world/.../set_pose
 # endpoint.  The SDK currently exposes no delete-entity API, so A/C are placed
@@ -52,6 +61,8 @@ NUT_RPY = [0.0, 0.0, 0.5233]
 SETTLE_SECONDS = 3.0
 POINT_TIMEOUT_SECONDS = 5.0
 WORLD_FRAME_TOLERANCE_M = 0.03
+CALIBRATION_FIT_TOLERANCE_M = 0.02
+PAIRWISE_DISTANCE_TOLERANCE_M = 0.025
 SET_POSE_RETRIES = 3
 SET_POSE_RETRY_DELAY_SECONDS = 1.0
 SET_POSE_COOLDOWN_SECONDS = 2.0
@@ -109,6 +120,12 @@ def set_pose_with_retry(pose_setter: Any, entity_id: str, pose: list[float]) -> 
         if attempt < SET_POSE_RETRIES:
             time.sleep(SET_POSE_RETRY_DELAY_SECONDS)
     return {"ok": False, "attempts": attempts, "error": attempts[-1].get("error") if attempts else "no attempts"}
+
+
+def clear_of_storage_box(position: list[float]) -> bool:
+    dx = float(position[0]) - STORAGE_BOX_WORLD_XY[0]
+    dy = float(position[1]) - STORAGE_BOX_WORLD_XY[1]
+    return math.hypot(dx, dy) >= BOX_EXCLUSION_RADIUS_M
 
 
 @dataclass
@@ -190,11 +207,11 @@ def cloud_xyz(msg: Any) -> tuple[Any, dict[str, Any]]:
         raise ValueError(f"PointCloud2 is missing x/y/z fields; fields={fields}")
     if hasattr(point_cloud2, "read_points_numpy"):
         points = np.asarray(
-            point_cloud2.read_points_numpy(msg, field_names=("x", "y", "z"), skip_nans=True),
+            point_cloud2.read_points_numpy(msg, field_names=("x", "y", "z"), skip_nans=False),
             dtype=float,
         )
     else:
-        raw = point_cloud2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True)
+        raw = point_cloud2.read_points(msg, field_names=("x", "y", "z"), skip_nans=False)
         if getattr(getattr(raw, "dtype", None), "names", None):
             points = np.column_stack([raw[name] for name in ("x", "y", "z")]).astype(float)
         else:
@@ -202,14 +219,93 @@ def cloud_xyz(msg: Any) -> tuple[Any, dict[str, Any]]:
     if points.size == 0:
         points = np.empty((0, 3), dtype=float)
     points = points.reshape((-1, 3))
-    points = points[np.isfinite(points).all(axis=1)]
+    finite_count = int(np.count_nonzero(np.isfinite(points).all(axis=1)))
     summary = {
         "frame_id": str(msg.header.frame_id),
         "stamp": {"sec": int(msg.header.stamp.sec), "nanosec": int(msg.header.stamp.nanosec)},
         "width": int(msg.width), "height": int(msg.height), "point_step": int(msg.point_step),
-        "fields": fields, "finite_xyz_count": int(len(points)),
+        "fields": fields, "finite_xyz_count": finite_count,
     }
     return points, summary
+
+
+def extract_nut_center_from_background(points: Any, background: Any) -> tuple[Any, dict[str, Any]]:
+    """Extract Nut B as the near-table component that differs from an empty scene."""
+    import numpy as np
+
+    if points.shape != background.shape:
+        raise ValueError(f"point cloud shape changed: current={points.shape}, background={background.shape}")
+    finite_background = background[np.isfinite(background).all(axis=1)]
+    normal, offset, table_inliers = fit_table_plane(finite_background)
+    delta = np.linalg.norm(points - background, axis=1)
+    signed = points @ normal + offset
+    changed = np.isfinite(delta) & (delta >= 0.008) & (delta <= 0.50)
+    positive = points[changed & (signed >= 0.006) & (signed <= 0.10)]
+    negative = points[changed & (signed <= -0.006) & (signed >= -0.10)]
+    if len(positive) >= 8 and len(negative) < 8:
+        candidates, side = positive, "positive"
+    elif len(negative) >= 8 and len(positive) < 8:
+        candidates, side = negative, "negative"
+    elif len(positive) <= len(negative):
+        candidates, side = positive, "positive"
+    else:
+        candidates, side = negative, "negative"
+    if len(candidates) < 8:
+        raise ValueError(
+            f"no changed near-table region; changed={int(np.count_nonzero(changed))} "
+            f"positive={len(positive)} negative={len(negative)}"
+        )
+    component = largest_voxel_component(candidates, voxel_m=0.010)
+    if len(component) < 8:
+        raise ValueError(f"largest changed component too small: {len(component)}")
+    center = component.mean(axis=0)
+    diagnostics = {
+        "method": "EMPTY_SCENE_BACKGROUND_DIFFERENCE",
+        "table_plane": [float(normal[0]), float(normal[1]), float(normal[2]), float(offset)],
+        "table_inlier_count": table_inliers,
+        "changed_point_count": int(np.count_nonzero(changed)),
+        "positive_changed_protrusion_count": int(len(positive)),
+        "negative_changed_protrusion_count": int(len(negative)),
+        "selected_side": side,
+        "selected_component_count": int(len(component)),
+        "selected_component_bbox_min": component.min(axis=0).tolist(),
+        "selected_component_bbox_max": component.max(axis=0).tolist(),
+        "selected_component_extent_m": (component.max(axis=0) - component.min(axis=0)).tolist(),
+    }
+    return center, diagnostics
+
+
+def pairwise_distance_error(camera: Any, world: Any) -> tuple[float, list[dict[str, Any]]]:
+    """Rigid transforms preserve distances; use that fact to reject bad detections."""
+    import numpy as np
+
+    rows: list[dict[str, Any]] = []
+    maximum = 0.0
+    for i in range(len(camera)):
+        for j in range(i + 1, len(camera)):
+            camera_distance = float(np.linalg.norm(camera[i] - camera[j]))
+            world_distance = float(np.linalg.norm(world[i] - world[j]))
+            error = abs(camera_distance - world_distance)
+            maximum = max(maximum, error)
+            rows.append({
+                "pair": [i + 1, j + 1],
+                "camera_distance_m": camera_distance,
+                "world_distance_m": world_distance,
+                "absolute_error_m": error,
+            })
+    return maximum, rows
+
+
+def capture_fresh_cloud() -> tuple[Any | None, int]:
+    """Create a short-lived reliable subscription and return a fresh cloud."""
+    receiver = start_receiver()
+    marker = time.monotonic()
+    try:
+        receiver.spin_for(SETTLE_SECONDS)
+        message = receiver.next_after(marker, POINT_TIMEOUT_SECONDS)
+        return message, receiver.frames
+    finally:
+        receiver.close()
 
 
 def fit_table_plane(points: Any) -> tuple[Any, float, int]:
@@ -343,11 +439,20 @@ def main() -> int:
         "set_pose_service": SET_POSE_SERVICE,
         "pointcloud_topic": POINTCLOUD_TOPIC,
         "nut_b_id": NUT_IDS["B"],
+        "storage_box": {
+            "id": STORAGE_BOX_ID,
+            "known_world_xy": STORAGE_BOX_WORLD_XY,
+            "exclusion_radius_m": BOX_EXCLUSION_RADIUS_M,
+            "requested_action": "MOVE_OFF_SCENE",
+            "pose": OFF_SCENE_POSE,
+        },
         "other_nuts": {"ids": {"A": NUT_IDS["A"], "C": NUT_IDS["C"]}, "action": "MOVE_OFF_SCENE", "pose": OFF_SCENE_POSE},
         "settle_seconds": SETTLE_SECONDS,
         "set_pose_retries": SET_POSE_RETRIES,
         "set_pose_cooldown_seconds": SET_POSE_COOLDOWN_SECONDS,
         "world_frame_tolerance_m": WORLD_FRAME_TOLERANCE_M,
+        "calibration_fit_tolerance_m": CALIBRATION_FIT_TOLERANCE_M,
+        "pairwise_distance_tolerance_m": PAIRWISE_DISTANCE_TOLERANCE_M,
         "experiments": [],
         "status": "RUNNING",
     }
@@ -359,6 +464,23 @@ def main() -> int:
 
         pose_setter = SetEntityPose(world=WORLD_ID)
 
+        box_set_result = set_pose_with_retry(pose_setter, STORAGE_BOX_ID, OFF_SCENE_POSE)
+        report["storage_box"]["set_pose"] = box_set_result
+        if box_set_result["ok"]:
+            report["storage_box"]["status"] = "MOVED_OFF_SCENE"
+            experiment_positions = [list(position) for position in WORLD_POSITIONS]
+        else:
+            report["storage_box"]["status"] = "MOVE_FAILED_USING_SAFE_POSITIONS"
+            experiment_positions = [
+                list(position) for position in BOX_SAFE_FALLBACK_POSITIONS if clear_of_storage_box(position)
+            ]
+            if len(experiment_positions) < 4:
+                raise RuntimeError(
+                    f"storage box could not be moved and only {len(experiment_positions)} safe calibration positions remain"
+                )
+        report["selected_world_positions"] = experiment_positions
+        time.sleep(SET_POSE_COOLDOWN_SECONDS)
+
         for label in ("A", "C"):
             set_result = set_pose_with_retry(pose_setter, NUT_IDS[label], OFF_SCENE_POSE)
             report["other_nuts"].setdefault("results", {})[label] = set_result
@@ -368,7 +490,22 @@ def main() -> int:
             # while the set-pose service and simulator settle.
             time.sleep(SET_POSE_COOLDOWN_SECONDS)
 
-        for index, xyz in enumerate(WORLD_POSITIONS, start=1):
+        # Capture the same fixed-camera scene with every nut absent.  Comparing
+        # each trial against this organized cloud isolates Nut B instead of a
+        # large, stationary robot/table protrusion.
+        background_set = set_pose_with_retry(pose_setter, NUT_IDS["B"], OFF_SCENE_POSE)
+        report["background"] = {"nut_b_set_pose": background_set}
+        if not background_set["ok"]:
+            raise RuntimeError(f"failed to move Nut B off scene for background: {background_set['error']}")
+        time.sleep(SET_POSE_COOLDOWN_SECONDS)
+        background_msg, background_frames = capture_fresh_cloud()
+        pointcloud_frames_received += background_frames
+        if background_msg is None:
+            raise RuntimeError("no PointCloud2 received for empty-scene background")
+        background_points, background_info = cloud_xyz(background_msg)
+        report["background"]["pointcloud"] = background_info
+
+        for index, xyz in enumerate(experiment_positions, start=1):
             pose = [*xyz, *NUT_RPY]
             trial: dict[str, Any] = {"index": index, "world_xyz": xyz, "nut_b_pose": pose}
             trial["set_pose"] = set_pose_with_retry(pose_setter, NUT_IDS["B"], pose)
@@ -379,22 +516,15 @@ def main() -> int:
 
             # Subscribe only after set_pose has returned, receive a fresh cloud,
             # then tear down the subscription before the next service call.
-            receiver = start_receiver()
-            marker = time.monotonic()
-            try:
-                receiver.spin_for(SETTLE_SECONDS)
-                msg = receiver.next_after(marker, POINT_TIMEOUT_SECONDS)
-            finally:
-                pointcloud_frames_received += receiver.frames
-                receiver.close()
-                receiver = None
+            msg, trial_frames = capture_fresh_cloud()
+            pointcloud_frames_received += trial_frames
             if msg is None:
                 trial["status"] = "POINTCLOUD_TIMEOUT"
                 report["experiments"].append(trial)
                 raise RuntimeError(f"no PointCloud2 received after trial {index}")
             points, cloud_info = cloud_xyz(msg)
             trial["pointcloud"] = cloud_info
-            center, segmentation = extract_nut_center(points)
+            center, segmentation = extract_nut_center_from_background(points, background_points)
             trial["camera_xyz"] = center.tolist()
             trial["pointcloud_center"] = center.tolist()
             trial["segmentation"] = segmentation
@@ -403,10 +533,19 @@ def main() -> int:
             report["experiments"].append(trial)
 
         valid = [item for item in report["experiments"] if item.get("status") == "OK"]
-        if len(valid) != len(WORLD_POSITIONS):
-            raise RuntimeError(f"only {len(valid)}/{len(WORLD_POSITIONS)} trials completed")
+        if len(valid) != len(experiment_positions):
+            raise RuntimeError(f"only {len(valid)}/{len(experiment_positions)} trials completed")
         camera = np.asarray([item["camera_xyz"] for item in valid], dtype=float)
         world = np.asarray([item["world_xyz"] for item in valid], dtype=float)
+        maximum_pairwise_error, pairwise_rows = pairwise_distance_error(camera, world)
+        report["pairwise_distance_checks"] = pairwise_rows
+        report["max_pairwise_distance_error_m"] = maximum_pairwise_error
+        if maximum_pairwise_error > PAIRWISE_DISTANCE_TOLERANCE_M:
+            report["frame_decision"] = "CALIBRATION_REJECTED_BAD_NUT_DETECTION"
+            raise RuntimeError(
+                f"detected camera points violate rigid-distance consistency: "
+                f"{maximum_pairwise_error:.6f} m > {PAIRWISE_DISTANCE_TOLERANCE_M:.6f} m"
+            )
         raw_errors = np.linalg.norm(camera - world, axis=1)
         report["raw_world_frame_errors_m"] = raw_errors.tolist()
         report["raw_world_frame_rmse_m"] = float(np.sqrt(np.mean(raw_errors ** 2)))
@@ -424,6 +563,12 @@ def main() -> int:
             report["transform_matrix_camera_to_world"] = transform.tolist()
             report["transform_fit_errors_m"] = errors.tolist()
             report["transform_fit_rmse_m"] = float(np.sqrt(np.mean(errors ** 2)))
+            if report["transform_fit_rmse_m"] > CALIBRATION_FIT_TOLERANCE_M:
+                report["frame_decision"] = "CALIBRATION_REJECTED_HIGH_FIT_ERROR"
+                raise RuntimeError(
+                    f"camera_to_world fit RMSE {report['transform_fit_rmse_m']:.6f} m exceeds "
+                    f"{CALIBRATION_FIT_TOLERANCE_M:.6f} m"
+                )
         report["pointcloud_frames_received"] = pointcloud_frames_received
         report["status"] = "PASS"
     except Exception as exc:
