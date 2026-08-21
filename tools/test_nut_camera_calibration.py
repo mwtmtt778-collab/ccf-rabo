@@ -52,6 +52,8 @@ NUT_RPY = [0.0, 0.0, 0.5233]
 SETTLE_SECONDS = 3.0
 POINT_TIMEOUT_SECONDS = 5.0
 WORLD_FRAME_TOLERANCE_M = 0.03
+SET_POSE_RETRIES = 3
+SET_POSE_RETRY_DELAY_SECONDS = 1.0
 
 
 def relative(path: Path) -> str:
@@ -92,6 +94,20 @@ def result_failed(value: Any) -> tuple[bool, str | None]:
     if isinstance(value, str) and any(word in value.lower() for word in ("error", "fail", "exception")):
         return True, value
     return False, None
+
+
+def set_pose_with_retry(pose_setter: Any, entity_id: str, pose: list[float]) -> dict[str, Any]:
+    """Retry transient Rabo set-pose service timeouts, preserving every result."""
+    attempts: list[dict[str, Any]] = []
+    for attempt in range(1, SET_POSE_RETRIES + 1):
+        result = pose_setter.set(entity_id, tuple(pose))
+        failed, reason = result_failed(result)
+        attempts.append({"attempt": attempt, "return": jsonable(result), "ok": not failed, "error": reason})
+        if not failed:
+            return {"ok": True, "attempts": attempts}
+        if attempt < SET_POSE_RETRIES:
+            time.sleep(SET_POSE_RETRY_DELAY_SECONDS)
+    return {"ok": False, "attempts": attempts, "error": attempts[-1].get("error") if attempts else "no attempts"}
 
 
 @dataclass
@@ -318,6 +334,7 @@ def main() -> int:
         "nut_b_id": NUT_IDS["B"],
         "other_nuts": {"ids": {"A": NUT_IDS["A"], "C": NUT_IDS["C"]}, "action": "MOVE_OFF_SCENE", "pose": OFF_SCENE_POSE},
         "settle_seconds": SETTLE_SECONDS,
+        "set_pose_retries": SET_POSE_RETRIES,
         "world_frame_tolerance_m": WORLD_FRAME_TOLERANCE_M,
         "experiments": [],
         "status": "RUNNING",
@@ -332,23 +349,20 @@ def main() -> int:
         receiver.spin_for(1.0)  # establish the subscription before the first move
 
         for label in ("A", "C"):
-            ret = pose_setter.set(NUT_IDS[label], tuple(OFF_SCENE_POSE))
-            failed, reason = result_failed(ret)
-            report["other_nuts"].setdefault("results", {})[label] = {"return": jsonable(ret), "ok": not failed, "error": reason}
-            if failed:
-                raise RuntimeError(f"failed to move Nut {label} off scene: {reason}")
+            set_result = set_pose_with_retry(pose_setter, NUT_IDS[label], OFF_SCENE_POSE)
+            report["other_nuts"].setdefault("results", {})[label] = set_result
+            if not set_result["ok"]:
+                raise RuntimeError(f"failed to move Nut {label} off scene after {SET_POSE_RETRIES} attempts: {set_result['error']}")
 
         for index, xyz in enumerate(WORLD_POSITIONS, start=1):
             pose = [*xyz, *NUT_RPY]
             trial: dict[str, Any] = {"index": index, "world_xyz": xyz, "nut_b_pose": pose}
             marker = time.monotonic()
-            ret = pose_setter.set(NUT_IDS["B"], tuple(pose))
-            failed, reason = result_failed(ret)
-            trial["set_pose"] = {"return": jsonable(ret), "ok": not failed, "error": reason}
-            if failed:
+            trial["set_pose"] = set_pose_with_retry(pose_setter, NUT_IDS["B"], pose)
+            if not trial["set_pose"]["ok"]:
                 trial["status"] = "SET_POSE_FAILED"
                 report["experiments"].append(trial)
-                raise RuntimeError(f"Nut B set_pose failed at trial {index}: {reason}")
+                raise RuntimeError(f"Nut B set_pose failed at trial {index}: {trial['set_pose']['error']}")
             receiver.spin_for(SETTLE_SECONDS)
             msg = receiver.next_after(marker, POINT_TIMEOUT_SECONDS)
             if msg is None:
