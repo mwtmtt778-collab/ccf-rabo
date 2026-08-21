@@ -28,6 +28,7 @@ from tools.test_nut_camera_calibration import (  # noqa: E402
     cloud_xyz,
     fit_table_plane,
 )
+from agents.three_nut_expert.config import NUT_SPECS  # noqa: E402
 
 
 OUTPUT_DIR = PROJECT_ROOT / "reports" / "nut_pointcloud_detection"
@@ -38,15 +39,38 @@ TABLE_INLIER_THRESHOLD_M = 0.006  # documented RANSAC threshold in calibration h
 MIN_OBJECT_HEIGHT_M = 0.006
 MAX_OBJECT_HEIGHT_M = 0.090
 VOXEL_SIZE_M = 0.003
-CLUSTER_EPS_M = 0.012
+CLUSTER_EPS_M = 0.008
 MIN_CLUSTER_VOXELS = 8
 MIN_CLUSTER_POINTS = 40
 MIN_NUT_XY_EXTENT_M = 0.012
 MAX_NUT_XY_EXTENT_M = 0.100
 MAX_NUT_Z_EXTENT_M = 0.080
+NUT_WORKSPACE_MARGIN_X_M = 0.16
+NUT_WORKSPACE_MARGIN_Y_M = 0.10
 MAX_VISUALIZATION_POINTS = 15000
 
 COLORS = ["#e41a1c", "#377eb8", "#4daf4a", "#984ea3", "#ff7f00", "#a65628"]
+
+
+def configured_nut_workspace() -> dict[str, Any]:
+    nominal = {
+        key: [float(spec.nominal_pose.x), float(spec.nominal_pose.y), float(spec.nominal_pose.z)]
+        for key, spec in NUT_SPECS.items()
+    }
+    xs = [value[0] for value in nominal.values()]
+    ys = [value[1] for value in nominal.values()]
+    return {
+        "source": "agents.three_nut_expert.config.NUT_SPECS",
+        "nominal_centers_world": nominal,
+        "bounds_world_xy": [
+            min(xs) - NUT_WORKSPACE_MARGIN_X_M,
+            max(xs) + NUT_WORKSPACE_MARGIN_X_M,
+            min(ys) - NUT_WORKSPACE_MARGIN_Y_M,
+            max(ys) + NUT_WORKSPACE_MARGIN_Y_M,
+        ],
+        "margin_xy_m": [NUT_WORKSPACE_MARGIN_X_M, NUT_WORKSPACE_MARGIN_Y_M],
+        "note": "Loose ROI only; nominal coordinates are not used as detected centers.",
+    }
 
 
 def jsonable(value: Any) -> Any:
@@ -161,13 +185,20 @@ def cluster_metrics(
     bbox_max = world.max(axis=0)
     size = bbox_max - bbox_min
     points = int(weights.sum())
-    eligible = (
-        points >= MIN_CLUSTER_POINTS
-        and max(float(size[0]), float(size[1])) >= MIN_NUT_XY_EXTENT_M
-        and float(size[0]) <= MAX_NUT_XY_EXTENT_M
-        and float(size[1]) <= MAX_NUT_XY_EXTENT_M
-        and float(size[2]) <= MAX_NUT_Z_EXTENT_M
-    )
+    rejection_reasons: list[str] = []
+    if points < MIN_CLUSTER_POINTS:
+        rejection_reasons.append("TOO_FEW_POINTS")
+    if float(size[0]) < MIN_NUT_XY_EXTENT_M:
+        rejection_reasons.append("X_EXTENT_TOO_SMALL")
+    if float(size[1]) < MIN_NUT_XY_EXTENT_M:
+        rejection_reasons.append("Y_EXTENT_TOO_SMALL")
+    if float(size[0]) > MAX_NUT_XY_EXTENT_M:
+        rejection_reasons.append("X_EXTENT_TOO_LARGE")
+    if float(size[1]) > MAX_NUT_XY_EXTENT_M:
+        rejection_reasons.append("Y_EXTENT_TOO_LARGE")
+    if float(size[2]) > MAX_NUT_Z_EXTENT_M:
+        rejection_reasons.append("Z_EXTENT_TOO_LARGE")
+    eligible = not rejection_reasons
     return {
         "points": points,
         "voxel_points": int(len(component)),
@@ -178,6 +209,7 @@ def cluster_metrics(
         "bbox_max_world": bbox_max.tolist(),
         "size": size.tolist(),
         "eligible_nut_geometry": eligible,
+        "rejection_reasons": rejection_reasons,
         "_camera_points": camera,
         "_world_points": world,
     }
@@ -256,6 +288,8 @@ def main() -> int:
     try:
         transform, calibration_source = load_camera_to_world()
         report["camera_to_world_source"] = calibration_source
+        workspace = configured_nut_workspace()
+        report["nut_workspace_roi"] = workspace
         message, frames = capture_fresh_cloud()
         report["pointcloud_frames_received"] = frames
         if message is None:
@@ -274,10 +308,20 @@ def main() -> int:
             normal = -normal
             offset = -offset
         height = finite @ normal + offset
-        objects_camera = finite[(height >= MIN_OBJECT_HEIGHT_M) & (height <= MAX_OBJECT_HEIGHT_M)]
+        above_table_camera = finite[(height >= MIN_OBJECT_HEIGHT_M) & (height <= MAX_OBJECT_HEIGHT_M)]
+        above_table_world = camera_points_to_world(above_table_camera, transform)
+        x_min, x_max, y_min, y_max = workspace["bounds_world_xy"]
+        roi_mask = (
+            (above_table_world[:, 0] >= x_min)
+            & (above_table_world[:, 0] <= x_max)
+            & (above_table_world[:, 1] >= y_min)
+            & (above_table_world[:, 1] <= y_max)
+        )
+        objects_camera = above_table_camera[roi_mask]
         report["table_plane_camera"] = [float(normal[0]), float(normal[1]), float(normal[2]), float(offset)]
         report["table_inlier_points"] = table_inliers
-        report["points_after_table_filter"] = int(len(objects_camera))
+        report["points_after_table_filter"] = int(len(above_table_camera))
+        report["points_in_nut_workspace_roi"] = int(len(objects_camera))
         if len(objects_camera) < MIN_CLUSTER_POINTS:
             raise RuntimeError(f"too few above-table points: {len(objects_camera)}")
 
@@ -291,6 +335,10 @@ def main() -> int:
 
         report["voxel_points"] = int(len(voxels_camera))
         report["raw_cluster_num"] = int(len(components))
+        report["raw_clusters"] = [
+            {key: value for key, value in item.items() if not key.startswith("_")}
+            for item in metrics
+        ]
         report["eligible_cluster_num"] = int(len(eligible))
         report["cluster_num"] = int(len(selected))
         report["warning"] = None if len(selected) == EXPECTED_NUTS else f"Expected 3 clusters, got {len(selected)}"
@@ -302,13 +350,25 @@ def main() -> int:
         raw_world = camera_points_to_world(finite, transform)
         objects_world = camera_points_to_world(objects_camera, transform)
         save_svg_projection(OUTPUT_DIR / "raw_pointcloud.svg", [raw_world], ["#8da0cb"], "Raw top-camera point cloud")
-        save_svg_projection(OUTPUT_DIR / "objects_no_table.svg", [objects_world], ["#66c2a5"], "Above-table points")
+        save_svg_projection(
+            OUTPUT_DIR / "objects_no_table.svg",
+            [above_table_world],
+            ["#66c2a5"],
+            "Above-table points",
+        )
+        save_svg_projection(
+            OUTPUT_DIR / "nut_workspace_roi.svg",
+            [objects_world],
+            ["#ffd92f"],
+            "Above-table points inside Nut workspace ROI",
+        )
         cluster_world_groups = [item["_world_points"] for item in selected]
         if cluster_world_groups:
             save_svg_projection(OUTPUT_DIR / "clusters.svg", cluster_world_groups, COLORS, "Nut candidate clusters")
         report["visualizations"] = {
             "raw": "reports/nut_pointcloud_detection/raw_pointcloud.svg",
             "objects_no_table": "reports/nut_pointcloud_detection/objects_no_table.svg",
+            "nut_workspace_roi": "reports/nut_pointcloud_detection/nut_workspace_roi.svg",
             "clusters": "reports/nut_pointcloud_detection/clusters.svg" if cluster_world_groups else None,
         }
         report["status"] = "PASS" if len(selected) == EXPECTED_NUTS else "CHECK"
