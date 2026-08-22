@@ -52,7 +52,7 @@ from tools.test_dual_closed_loop_v2_2 import (  # noqa: E402
 )
 from tools.test_left_grasp_v1 import RIGHT_NUT_B_GRASP_POSE  # noqa: E402
 from tools.test_nut_camera_calibration import set_pose_with_retry  # noqa: E402
-from tools.motion_monitor import MotionMonitor  # noqa: E402
+from tools.motion_monitor import MotionMonitor, extract_joint_target  # noqa: E402
 from tools.test_right_release_stability import (  # noqa: E402
     DEFAULT_HOLD_AFTER_GRASP_S,
     DEFAULT_SETTLE_AFTER_RELEASE_S,
@@ -320,6 +320,8 @@ def run_right_action(
         except Exception as monitor_exc:
             print(f"【MotionMonitor警告】启动失败：{monitor_exc!r}", flush=True)
     try:
+        if monitor_started and monitor is not None and monitor_target_joint is not None:
+            monitor.set_target_joint(monitor_target_joint, source="caller_before_motion")
         value = fn()
     except BaseException as exc:
         timer.cancel()
@@ -426,6 +428,10 @@ def move_right_checked_debug(
     monitor: MotionMonitor | None = None,
 ) -> Any:
     pose_values = pose_to_list(pose)
+    monitor_target_joint = None
+    monitor_extra = None
+    if monitor is not None and monitor.enabled:
+        monitor_target_joint, monitor_extra = pose_check_target_joint(right_arm, pose)
     return run_right_action(
         result,
         action_cn=action_cn,
@@ -437,7 +443,9 @@ def move_right_checked_debug(
         monitor=monitor,
         monitor_arm=right_arm,
         monitor_phase_name=label,
+        monitor_target_joint=monitor_target_joint,
         monitor_target_ee_pose=pose_values,
+        extra={"motion_monitor_target_joint_lookup": monitor_extra} if monitor_extra else None,
     )
 
 
@@ -463,12 +471,12 @@ def execute_right_checked_debug(
     )
 
 
-def validate_static_contract() -> None:
+def validate_static_contract(sequence: tuple[str, ...] = NUT_SEQUENCE) -> None:
     if NUT_SEQUENCE != ("B", "A", "C"):
         raise ThreeNutClosedLoopError("Nut sequence must remain B,A,C")
-    missing_ids = [key for key in NUT_SEQUENCE if not NUT_IDS.get(key)]
-    missing_grasps = [key for key in NUT_SEQUENCE if key not in RIGHT_GRASP_POSES]
-    missing_places = [key for key in NUT_SEQUENCE if key not in LEFT_PLACE_POSES]
+    missing_ids = [key for key in sequence if not NUT_IDS.get(key)]
+    missing_grasps = [key for key in sequence if key not in RIGHT_GRASP_POSES]
+    missing_places = [key for key in sequence if key not in LEFT_PLACE_POSES]
     if missing_ids:
         raise ThreeNutClosedLoopError(f"missing real entity IDs for: {missing_ids}")
     if missing_grasps:
@@ -477,6 +485,44 @@ def validate_static_contract() -> None:
         raise ThreeNutClosedLoopError(f"missing existing place poses for: {missing_places}")
     if pose_to_list(RIGHT_GRASP_POSES["B"]) != pose_to_list(RIGHT_NUT_B_GRASP_POSE):
         raise ThreeNutClosedLoopError("Nut B frozen grasp pose was changed")
+
+
+def parse_sequence_arg(value: str) -> tuple[str, ...]:
+    cleaned = value.replace(" ", "").upper()
+    if not cleaned:
+        raise ThreeNutClosedLoopError("--sequence must not be empty")
+    if "," in cleaned:
+        sequence = tuple(item for item in cleaned.split(",") if item)
+    else:
+        sequence = tuple(cleaned)
+    invalid = [key for key in sequence if key not in NUT_SEQUENCE]
+    if invalid:
+        raise ThreeNutClosedLoopError(f"--sequence contains invalid nut IDs: {invalid}")
+    return sequence
+
+
+def pose_check_target_joint(arm: Any, pose: Pose6) -> tuple[list[float] | None, dict[str, Any]]:
+    pose_values = pose_to_list(pose)
+    if not hasattr(arm, "pose_check"):
+        return None, {"ok": False, "reason": "right_arm.pose_check unavailable"}
+    try:
+        raw = arm.pose_check(
+            pose_values[0],
+            pose_values[1],
+            pose_values[2],
+            roll=pose_values[3],
+            pitch=pose_values[4],
+            yaw=pose_values[5],
+        )
+    except Exception as exc:
+        return None, {"ok": False, "reason": repr(exc), "source": "right_arm.pose_check"}
+    target_joint = extract_joint_target(raw)
+    return target_joint, {
+        "ok": target_joint is not None,
+        "source": "right_arm.pose_check",
+        "raw": jsonable(raw),
+        "target_joint_found": target_joint is not None,
+    }
 
 
 def make_pose_setter() -> Any:
@@ -936,6 +982,7 @@ def execute_one_nut(
 
 def run_trial(
     trial_id: int,
+    sequence: tuple[str, ...],
     pose_setter: Any,
     devices: dict[str, Any],
     args: argparse.Namespace,
@@ -943,7 +990,7 @@ def run_trial(
 ) -> dict[str, Any]:
     trial = {
         "trial_id": trial_id,
-        "sequence": list(NUT_SEQUENCE),
+        "sequence": list(sequence),
         "nut_results": [],
         "success": False,
         "failed_nut": None,
@@ -953,7 +1000,7 @@ def run_trial(
         "interrupted": False,
         "debug_trace": [],
     }
-    for key in NUT_SEQUENCE:
+    for key in sequence:
         result = execute_one_nut(
             key,
             pose_setter,
@@ -976,25 +1023,26 @@ def run_trial(
 
 
 def run(args: argparse.Namespace) -> int:
-    validate_static_contract()
+    sequence = parse_sequence_arg(args.sequence)
+    validate_static_contract(sequence)
     started = datetime.now().astimezone()
     report_path = REPORT_DIR / f"three_nut_trial_{started.strftime('%Y%m%d_%H%M%S')}.json"
     report: dict[str, Any] = {
         "experiment": "three_nut_closed_loop_v1",
         "timestamp": started.isoformat(timespec="seconds"),
         "status": "RUNNING",
-        "sequence": list(NUT_SEQUENCE),
+        "sequence": list(sequence),
         "config": {
-            "nut_ids": {key: NUT_IDS[key] for key in NUT_SEQUENCE},
-            "nut_nominal_poses": {key: pose_to_list(NUT_SPECS[key].nominal_pose) for key in NUT_SEQUENCE},
-            "right_grasp_poses": {key: pose_to_list(RIGHT_GRASP_POSES[key]) for key in NUT_SEQUENCE},
+            "nut_ids": {key: NUT_IDS[key] for key in sequence},
+            "nut_nominal_poses": {key: pose_to_list(NUT_SPECS[key].nominal_pose) for key in sequence},
+            "right_grasp_poses": {key: pose_to_list(RIGHT_GRASP_POSES[key]) for key in sequence},
             "right_grasp_pose_sources": RIGHT_GRASP_POSE_SOURCES,
             "right_release_pose": pose_to_list(RIGHT_RELEASE_POSE),
             "release_target_world_xyz": list(RELEASE_TARGET_WORLD_XYZ),
             "right_release_safe_height_offset_z_m": RIGHT_RELEASE_SAFE_HEIGHT_OFFSET_Z,
             "right_observation_joints": [list(joints) for joints in RIGHT_OBSERVATION_JOINTS],
             "left_safe_lift_delta_z_m": LEFT_SAFE_LIFT_DELTA_Z_M,
-            "left_place_poses": {key: pose_to_list(LEFT_PLACE_POSES[key]) for key in NUT_SEQUENCE},
+            "left_place_poses": {key: pose_to_list(LEFT_PLACE_POSES[key]) for key in sequence},
             "place_pose_sources": PLACE_POSE_SOURCES,
             "settle_after_release_s": float(args.settle_after_release_s),
             "vision_target_radius_m": float(args.vision_target_radius_m),
@@ -1027,13 +1075,13 @@ def run(args: argparse.Namespace) -> int:
     try:
         print("================================")
         print("Three Nut closed loop V1")
-        print("Sequence: B -> A -> C")
+        print(f"Sequence: {' -> '.join(sequence)}")
         print("================================")
         pose_setter = make_pose_setter()
         devices["right"] = make_right_bundle()
         for trial_id in range(1, args.trials + 1):
             print(f"\n######## Trial {trial_id}/{args.trials} ########")
-            trial = run_trial(trial_id, pose_setter, devices, args, monitor)
+            trial = run_trial(trial_id, sequence, pose_setter, devices, args, monitor)
             report["trials"].append(trial)
             report["debug_trace"].extend(trial.get("debug_trace", []))
             write_report(report, report_path)
@@ -1116,6 +1164,11 @@ def parse_args() -> argparse.Namespace:
         help="Number of complete B,A,C trials; stops after the first failed trial (default: 1).",
     )
     parser.add_argument(
+        "--sequence",
+        default="B,A,C",
+        help="Nut execution sequence, e.g. B,A,C or A (default: B,A,C).",
+    )
+    parser.add_argument(
         "--settle-after-release-s",
         type=float,
         default=DEFAULT_SETTLE_AFTER_RELEASE_S,
@@ -1133,6 +1186,10 @@ def parse_args() -> argparse.Namespace:
         help="enable motion diagnostic monitor",
     )
     args = parser.parse_args()
+    try:
+        parse_sequence_arg(args.sequence)
+    except ThreeNutClosedLoopError as exc:
+        parser.error(str(exc))
     if args.trials < 1:
         parser.error("--trials must be >= 1")
     minimum_wait = RIGHT_RELEASE_OPEN_WAIT_S + RIGHT_OBSERVATION_STABLE_WAIT_S
