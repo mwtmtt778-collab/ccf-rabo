@@ -24,6 +24,7 @@ import statistics
 import subprocess
 import threading
 import time
+from queue import Empty, Full, Queue
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -205,16 +206,24 @@ def save_first_image(msg: Any, type_name: str, path_prefix: Path) -> tuple[str |
         elif encoding in {"rgb8", "bgr8", "rgba8", "bgra8"}:
             channels = 4 if "a8" in encoding else 3
             row_width = width * channels
-            pixels = bytearray()
-            for row in range(height):
-                row_data = data[row * step : row * step + row_width]
-                for col in range(0, len(row_data), channels):
-                    pixel = row_data[col : col + channels]
-                    if encoding.startswith("bgr"):
-                        pixels.extend((pixel[2], pixel[1], pixel[0]))
-                    else:
-                        pixels.extend((pixel[0], pixel[1], pixel[2]))
-            payload = b"P6\n%d %d\n255\n" % (width, height) + bytes(pixels)
+            rows = [data[row * step : row * step + row_width] for row in range(height)]
+            if encoding == "rgb8":
+                # The verified streams are rgb8.  Preserve their row bytes
+                # directly instead of walking 2M pixels in the ROS callback.
+                pixels = b"".join(rows)
+            else:
+                converted = bytearray(width * height * 3)
+                output_index = 0
+                for row_data in rows:
+                    for col in range(0, len(row_data), channels):
+                        pixel = row_data[col : col + channels]
+                        if encoding.startswith("bgr"):
+                            converted[output_index : output_index + 3] = pixel[2::-1]
+                        else:
+                            converted[output_index : output_index + 3] = pixel[:3]
+                        output_index += 3
+                pixels = bytes(converted)
+            payload = b"P6\n%d %d\n255\n" % (width, height) + pixels
             path = path_prefix.with_suffix(".ppm")
         else:
             return None, f"unsupported image encoding: {encoding}"
@@ -235,6 +244,7 @@ class CameraRecord:
     sample_path: str | None = None
     sample_error: str | None = None
     subscribe_error: str | None = None
+    sample_queued: bool = False
 
 
 class CameraSampler:
@@ -253,6 +263,8 @@ class CameraSampler:
         self._executor: Any = None
         self._owns_rclpy_context = False
         self._subscriptions: list[Any] = []
+        self._image_queue: Queue[tuple[CameraRecord, Any]] = Queue(maxsize=max(1, len(self.records)))
+        self._writer_thread: threading.Thread | None = None
         self.init_error: str | None = None
 
     def start(self) -> None:
@@ -274,7 +286,7 @@ class CameraSampler:
             self._executor.add_node(self._node)
             qos = QoSProfile(
                 history=HistoryPolicy.KEEP_LAST,
-                depth=10,
+                depth=1,
                 # The three verified Rabo RGB publishers are
                 # RELIABLE/VOLATILE.  Match them exactly; this also avoids the
                 # platform bridge behavior where discovery succeeds but no
@@ -295,6 +307,12 @@ class CameraSampler:
                 except Exception as exc:
                     record.subscribe_error = repr(exc)
             self._thread = threading.Thread(target=self._spin, name="act-probe-camera", daemon=True)
+            self._writer_thread = threading.Thread(
+                target=self._write_images,
+                name="act-probe-image-writer",
+                daemon=True,
+            )
+            self._writer_thread.start()
             self._thread.start()
         except Exception as exc:
             self.init_error = repr(exc)
@@ -319,15 +337,30 @@ class CameraSampler:
                     "format": getattr(msg, "format", None),
                     "data_len": len(getattr(msg, "data", [])),
                 }
-                sample_path, sample_error = save_first_image(
-                    msg,
-                    record.type_name,
-                    self.output_dir / f"sample_{record.label}",
-                )
-                record.sample_path = sample_path
-                record.sample_error = sample_error
+                if not record.sample_queued:
+                    try:
+                        self._image_queue.put_nowait((record, msg))
+                        record.sample_queued = True
+                    except Full:
+                        record.sample_error = "image writer queue was full"
 
         return callback
+
+    def _write_images(self) -> None:
+        while not self._stop.is_set() or not self._image_queue.empty():
+            try:
+                record, msg = self._image_queue.get(timeout=0.05)
+            except Empty:
+                continue
+            sample_path, sample_error = save_first_image(
+                msg,
+                record.type_name,
+                self.output_dir / f"sample_{record.label}",
+            )
+            with self._lock:
+                record.sample_path = sample_path
+                record.sample_error = sample_error
+            self._image_queue.task_done()
 
     def _spin(self) -> None:
         assert self._executor is not None
@@ -349,6 +382,8 @@ class CameraSampler:
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=2.0)
+        if self._writer_thread is not None:
+            self._writer_thread.join(timeout=2.0)
         if self._node is not None:
             for subscription in self._subscriptions:
                 with contextlib.suppress(Exception):
@@ -369,7 +404,7 @@ class CameraSampler:
 class IntegratedRecordingProbe:
     """Background probe that reuses device clients owned by an experiment."""
 
-    def __init__(self, output_dir: Path, target_fps: float = 30.0):
+    def __init__(self, output_dir: Path, target_fps: float = 10.0):
         if target_fps <= 0:
             raise ValueError("target_fps must be > 0")
         self.output_dir = output_dir
@@ -382,6 +417,8 @@ class IntegratedRecordingProbe:
         self.hand_after: dict[str, Any] = {}
         self.samples: list[dict[str, Any]] = []
         self.errors: list[dict[str, Any]] = []
+        self.phase_markers: list[dict[str, Any]] = []
+        self._phase_lock = threading.Lock()
         self.overrun_periods = 0
         self.started_at = now_text()
         self.start_monotonic: float | None = None
@@ -431,6 +468,20 @@ class IntegratedRecordingProbe:
             "camera_sampler_init_error": self.camera_sampler.init_error,
         }
 
+    def mark_phase(self, phase: str, event: str = "ENTER", **details: Any) -> None:
+        """Attach task phase timing without changing the task's control flow."""
+        if not self._started or self.start_monotonic is None:
+            return
+        marker = {
+            "time_s": time.monotonic() - self.start_monotonic,
+            "timestamp": now_text(),
+            "phase": str(phase),
+            "event": str(event),
+            "details": jsonable(details),
+        }
+        with self._phase_lock:
+            self.phase_markers.append(marker)
+
     def _sample_loop(self) -> None:
         assert self.start_monotonic is not None
         interval = 1.0 / self.target_fps
@@ -443,7 +494,7 @@ class IntegratedRecordingProbe:
 
             read_start = time.monotonic()
             try:
-                state, components = read_state26(self.devices)
+                state, components, component_durations = read_state26_timed(self.devices)
                 read_end = time.monotonic()
                 self.samples.append(
                     {
@@ -451,6 +502,7 @@ class IntegratedRecordingProbe:
                         "read_duration_s": read_end - read_start,
                         "state": state,
                         "components": components,
+                        "component_read_duration_s": component_durations,
                     }
                 )
             except Exception as exc:
@@ -498,6 +550,7 @@ class IntegratedRecordingProbe:
             "errors": self.errors,
             "overrun_periods": self.overrun_periods,
             "elapsed_s": self.elapsed_s,
+            "phase_markers": list(self.phase_markers),
         }
         report = summarize_probe(
             state_run=state_run,
@@ -586,6 +639,27 @@ def read_state26(devices: dict[str, Any]) -> tuple[list[float], dict[str, list[f
     return state, components
 
 
+def read_state26_timed(
+    devices: dict[str, Any],
+) -> tuple[list[float], dict[str, list[float]], dict[str, float]]:
+    specs = (
+        ("left_arm", "left_arm", "get_joint_angles", 7),
+        ("right_arm", "right_arm", "get_joint_angles", 7),
+        ("left_hand_clench", "left_hand", "get_clench", 6),
+        ("right_hand_clench", "right_hand", "get_clench", 6),
+    )
+    components: dict[str, list[float]] = {}
+    durations: dict[str, float] = {}
+    for component_name, device_name, method_name, expected_dim in specs:
+        started = time.monotonic()
+        components[component_name] = read_component(
+            devices[device_name], method_name, expected_dim
+        )
+        durations[component_name] = time.monotonic() - started
+    state = [value for name in EXPECTED_COMPONENT_DIMS for value in components[name]]
+    return state, components, durations
+
+
 def read_hand_joint_dimensions(devices: dict[str, Any]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for name in ("left_hand", "right_hand"):
@@ -643,6 +717,51 @@ def nearest_offsets(reference_times: list[float], camera_times: list[float]) -> 
     }
 
 
+def fixed_rate_resampling_summary(times: list[float], target_fps: float) -> dict[str, Any]:
+    period = 1.0 / target_fps
+    if len(times) < 2:
+        return {
+            "target_fps": target_fps,
+            "period_s": period,
+            "feasible": False,
+            "reason": "fewer than two valid samples",
+            "grid_count": 0,
+        }
+    intervals = [b - a for a, b in zip(times, times[1:])]
+    grid_count = int(math.floor((times[-1] - times[0]) / period)) + 1
+    largest_gap = max(intervals)
+    gaps_over_two_periods = sum(gap > 2.0 * period for gap in intervals)
+    feasible = largest_gap <= 2.0 * period
+    return {
+        "target_fps": target_fps,
+        "period_s": period,
+        "grid_count": grid_count,
+        "source_span_s": times[-1] - times[0],
+        "largest_source_gap_s": largest_gap,
+        "gaps_over_two_periods": gaps_over_two_periods,
+        "linear_interpolation_possible": True,
+        "feasible": feasible,
+        "criterion": "largest source gap <= 2 * target period",
+        "reason": None if feasible else "source stream has gaps wider than two target periods",
+    }
+
+
+def duration_by_component(samples: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
+    for name in EXPECTED_COMPONENT_DIMS:
+        values = [
+            float(sample["component_read_duration_s"][name])
+            for sample in samples
+            if name in sample.get("component_read_duration_s", {})
+        ]
+        result[name] = {
+            "sample_count": len(values),
+            "mean_s": statistics.fmean(values) if values else None,
+            "max_s": max(values) if values else None,
+        }
+    return result
+
+
 def sample_states(devices: dict[str, Any], duration: float, target_fps: float) -> dict[str, Any]:
     interval = 1.0 / target_fps
     start = time.monotonic()
@@ -661,7 +780,7 @@ def sample_states(devices: dict[str, Any], duration: float, target_fps: float) -
 
         read_start = time.monotonic()
         try:
-            state, components = read_state26(devices)
+            state, components, component_durations = read_state26_timed(devices)
             read_end = time.monotonic()
             samples.append(
                 {
@@ -669,6 +788,7 @@ def sample_states(devices: dict[str, Any], duration: float, target_fps: float) -
                     "read_duration_s": read_end - read_start,
                     "state": state,
                     "components": components,
+                    "component_read_duration_s": component_durations,
                 }
             )
         except Exception as exc:
@@ -726,7 +846,9 @@ def summarize_probe(
         "read_error_count": len(state_run["errors"]),
         "read_duration_mean_s": statistics.fmean(read_durations) if read_durations else None,
         "read_duration_max_s": max(read_durations) if read_durations else None,
+        "component_read_durations": duration_by_component(samples),
         "overrun_periods": state_run["overrun_periods"],
+        "fixed_rate_resampling": fixed_rate_resampling_summary(state_times, target_fps),
         "per_dimension_range": ranges,
         "component_ranges": component_ranges,
         "max_state_range": max(ranges) if ranges else None,
@@ -743,6 +865,7 @@ def summarize_probe(
             }
             continue
         camera_rate = rate_summary(record.arrivals, target_fps)
+        ros_stamp_rate = rate_summary(record.ros_stamps, target_fps)
         cameras[label] = {
             "status": "AVAILABLE" if record.arrivals else "NO_FRAMES",
             "topic": record.topic,
@@ -753,6 +876,10 @@ def summarize_probe(
             "interval_std_s": camera_rate["interval_std_s"],
             "interval_max_s": camera_rate["interval_max_s"],
             "ros_stamp_count": len(record.ros_stamps),
+            "ros_stamp_effective_fps": ros_stamp_rate["effective_fps"],
+            "ros_stamp_interval_mean_s": ros_stamp_rate["interval_mean_s"],
+            "ros_stamp_interval_max_s": ros_stamp_rate["interval_max_s"],
+            "fixed_rate_resampling": fixed_rate_resampling_summary(record.arrivals, target_fps),
             "first_summary": record.first_summary,
             "sample_path": record.sample_path,
             "sample_error": record.sample_error,
@@ -765,12 +892,35 @@ def summarize_probe(
     state_ready = bool(samples) and not state_run["errors"] and effective_fps >= target_fps * 0.9
     cameras_available = all(item["status"] == "AVAILABLE" for item in cameras.values())
     camera_rates_ready = all((item.get("effective_fps") or 0.0) >= target_fps * 0.9 for item in cameras.values())
+    camera_resampling_ready = all(
+        item.get("fixed_rate_resampling", {}).get("feasible", False)
+        for item in cameras.values()
+    )
     hand_motion = {
         side: max(component_ranges.get(f"{side}_hand_clench", []) or [0.0]) > 1e-4
         for side in ("left", "right")
     }
+    phase_markers = list(state_run.get("phase_markers", []))
+    reached_phases = {marker.get("phase") for marker in phase_markers}
+    hand_phase_coverage = {
+        "left": any(
+            phase in reached_phases for phase in {"LEFT_GRASP_COMMAND", "LEFT_RELEASE_OPEN"}
+        ),
+        "right": any(
+            phase in reached_phases for phase in {"RIGHT_GRASP_FORCE", "RIGHT_RELEASE_OPEN"}
+        ),
+    }
     ready_label = f"READY_{target_fps:g}HZ"
-    result = ready_label if state_ready and cameras_available and camera_rates_ready else "CHECK"
+    state_resampling_ready = state_summary["fixed_rate_resampling"]["feasible"]
+    result = (
+        ready_label
+        if state_ready
+        and state_resampling_ready
+        and cameras_available
+        and camera_rates_ready
+        and camera_resampling_ready
+        else "CHECK"
+    )
 
     return {
         "generated_at": now_text(),
@@ -783,12 +933,18 @@ def summarize_probe(
             "derived_action_pairs_available": len(samples) >= 2,
             "all_three_cameras_available": cameras_available,
             "all_three_camera_rates_ready": camera_rates_ready,
+            "all_three_camera_resampling_feasible": camera_resampling_ready,
             "left_hand_clench_changed": hand_motion["left"],
             "right_hand_clench_changed": hand_motion["right"],
+            "left_hand_clench_change_evaluated": hand_phase_coverage["left"],
+            "right_hand_clench_change_evaluated": hand_phase_coverage["right"],
+            "fixed_rate_resampling_feasible": state_summary["fixed_rate_resampling"]["feasible"],
         },
         "state": state_summary,
         "state_samples": samples,
         "state_errors": state_run["errors"],
+        "phase_markers": phase_markers,
+        "reached_phases": sorted(phase for phase in reached_phases if phase),
         "hand_joint_angles_before": hand_joints_before,
         "hand_joint_angles_after": hand_joints_after,
         "cameras": cameras,
@@ -796,9 +952,10 @@ def summarize_probe(
         "camera_sampler_init_error": camera_sampler.init_error,
         "shutdown_errors": shutdown_errors,
         "interpretation": {
-            "clench_unchanged": "如果探针期间没有执行抓取/释放，这是正常的；执行过仍无变化则需要检查get_clench语义。",
+            "clench_unchanged": "仅在阶段标记确认执行过对应抓取/释放后评估；执行过仍无变化则需要检查get_clench语义。",
             "alignment": "相机对齐误差按本机接收时间估算，不等同于硬件时间戳精度。",
-            "ready": f"{ready_label}要求26维状态及三路相机都达到目标频率的90%。",
+            "camera_rate": "effective_fps是回调接收/处理频率；ros_stamp_effective_fps更接近发布源频率，但仍取决于发布方时间戳质量。",
+            "ready": f"{ready_label}要求26维状态及三路相机达到目标频率的90%，且最大采样间隙不超过两个目标周期。",
         },
     }
 
@@ -822,13 +979,30 @@ def render_markdown(report: dict[str, Any]) -> str:
         f"- 平均读取耗时：`{state['read_duration_mean_s']}` 秒",
         f"- 最大读取耗时：`{state['read_duration_max_s']}` 秒",
         f"- 错过周期：`{state['overrun_periods']}`",
-        f"- 左手 clench 有变化：`{report['checks']['left_hand_clench_changed']}`",
-        f"- 右手 clench 有变化：`{report['checks']['right_hand_clench_changed']}`",
+        f"- 固定频率重采样可行：`{report['checks']['fixed_rate_resampling_feasible']}`",
+        f"- 最大源状态间隔：`{state['fixed_rate_resampling'].get('largest_source_gap_s')}` 秒",
+        f"- 左手 clench 已评估/有变化：`{report['checks']['left_hand_clench_change_evaluated']}` / `{report['checks']['left_hand_clench_changed']}`",
+        f"- 右手 clench 已评估/有变化：`{report['checks']['right_hand_clench_change_evaluated']}` / `{report['checks']['right_hand_clench_changed']}`",
+        "",
+        "### 分组件读取耗时",
+        "",
+        "| 组件 | 样本数 | 平均耗时(s) | 最大耗时(s) |",
+        "| --- | ---: | ---: | ---: |",
+    ]
+    for name, timing in state["component_read_durations"].items():
+        lines.append(
+            f"| {name} | {timing['sample_count']} | {timing['mean_s']} | {timing['max_s']} |"
+        )
+    lines += [
+        "",
+        f"## 任务阶段（{len(report.get('phase_markers', []))} 个标记）",
+        "",
+        f"- 已到达：`{', '.join(report.get('reached_phases', [])) or '无（独立探针模式正常）'}`",
         "",
         "## RGB相机",
         "",
-        "| 相机 | 状态 | 帧数 | 实际FPS | 分辨率/编码 | 最近状态帧最大偏差(s) |",
-        "| --- | --- | ---: | ---: | --- | ---: |",
+        "| 相机 | 状态 | 帧数 | 接收FPS | ROS戳FPS | 分辨率/编码 | 最近状态帧最大偏差(s) |",
+        "| --- | --- | ---: | ---: | ---: | --- | ---: |",
     ]
     for label, camera in report["cameras"].items():
         summary = camera.get("first_summary") or {}
@@ -836,15 +1010,17 @@ def render_markdown(report: dict[str, Any]) -> str:
         alignment = camera.get("state_receive_alignment") or {}
         lines.append(
             f"| {label} | {camera.get('status')} | {camera.get('frame_count')} | "
-            f"{camera.get('effective_fps')} | {image_text} | {alignment.get('max_abs_offset_s')} |"
+            f"{camera.get('effective_fps')} | {camera.get('ros_stamp_effective_fps')} | "
+            f"{image_text} | {alignment.get('max_abs_offset_s')} |"
         )
     lines += [
         "",
         "## 判断方法",
         "",
-        f"- `READY_{report['requested_fps']:g}HZ`：26维状态及三路RGB都达到目标频率的90%。",
+        f"- `READY_{report['requested_fps']:g}HZ`：26维状态及三路RGB达到目标频率的90%，且最大间隙不超过两个目标周期。",
         "- `CHECK`：查看JSON中的状态读取错误、相机订阅错误、实际频率和首帧信息。",
-        "- 如果探针期间明确执行过抓取和释放，但对应 `clench_changed=false`，暂不应把该6维量作为ACT手部状态。",
+        "- 仅当对应抓取/释放阶段已被标记时，才解释 `clench_changed`。",
+        "- 相机接收FPS表示本进程实际处理吞吐；ROS戳FPS用于辅助判断发布源频率。",
         "- 每路相机的首帧样本保存在本报告同目录，可人工确认画面和相机身份。",
         "",
     ]
@@ -854,7 +1030,7 @@ def render_markdown(report: dict[str, Any]) -> str:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="只读检查ACT采样所需的三路RGB和26维机器人状态。")
     parser.add_argument("--duration", type=float, default=20.0, help="采样持续时间，默认20秒。")
-    parser.add_argument("--fps", type=float, default=30.0, help="目标状态采样频率，默认30Hz。")
+    parser.add_argument("--fps", type=float, default=10.0, help="目标状态采样频率，默认10Hz。")
     parser.add_argument("--start-delay", type=float, default=3.0, help="初始化后倒计时秒数。")
     parser.add_argument("--output-dir", type=Path, help="输出目录；默认按时间创建在outputs/act_recording_probe。")
     return parser
@@ -957,7 +1133,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"结论：{report['result']}", flush=True)
     print(f"JSON：{json_path}", flush=True)
     print(f"报告：{markdown_path}", flush=True)
-    return 0 if report["result"] == "READY_30HZ" else 2
+    return 0 if report["result"] == f"READY_{args.fps:g}HZ" else 2
 
 
 if __name__ == "__main__":

@@ -655,11 +655,14 @@ def execute_one_nut(
     settle_after_release_s: float,
     vision_radius_m: float,
     monitor: MotionMonitor | None = None,
+    recording_probe: IntegratedRecordingProbe | None = None,
 ) -> dict[str, Any]:
     result = new_nut_result(key)
     right_bundle = devices["right"]
     current_phase = "RESET"
     phase_recorded = False
+    if recording_probe is not None:
+        recording_probe.mark_phase(current_phase, nut=key)
     try:
         print("\n================================")
         print(f"Nut {key}")
@@ -682,6 +685,8 @@ def execute_one_nut(
         phase_recorded = True
 
         current_phase = "RIGHT_OBSERVATION_BEFORE_GRASP"
+        if recording_probe is not None:
+            recording_probe.mark_phase(current_phase, nut=key)
         phase_recorded = False
         execute_right_checked_debug(
             result,
@@ -704,6 +709,8 @@ def execute_one_nut(
         add_phase(result, current_phase, True, joints=observation_path)
         phase_recorded = True
         current_phase = "VISION_BEFORE_GRASP"
+        if recording_probe is not None:
+            recording_probe.mark_phase(current_phase, nut=key)
         phase_recorded = False
         nominal_xyz = tuple(float(value) for value in reset_pose[:3])
         initial_vision = detect_nut(nominal_xyz, vision_radius_m)
@@ -724,6 +731,8 @@ def execute_one_nut(
         phase_recorded = True
 
         current_phase = "RIGHT_GRASP"
+        if recording_probe is not None:
+            recording_probe.mark_phase(current_phase, nut=key)
         phase_recorded = False
         grasp_pose = RIGHT_GRASP_POSES[key]
         move_right_checked_debug(
@@ -745,6 +754,8 @@ def execute_one_nut(
             "clench",
             thumb_rotation=1.0,
         )
+        if recording_probe is not None:
+            recording_probe.mark_phase("RIGHT_GRASP_FORCE", event="COMMAND", nut=key)
         execute_right_checked_debug(
             result,
             "右手抓取施力",
@@ -768,6 +779,8 @@ def execute_one_nut(
         phase_recorded = True
 
         current_phase = "RIGHT_LIFT"
+        if recording_probe is not None:
+            recording_probe.mark_phase(current_phase, nut=key)
         phase_recorded = False
         for index, lift_pose in enumerate(RIGHT_LIFT_POSES, start=1):
             move_right_checked_debug(
@@ -784,6 +797,8 @@ def execute_one_nut(
         phase_recorded = True
 
         current_phase = "RIGHT_RELEASE"
+        if recording_probe is not None:
+            recording_probe.mark_phase(current_phase, nut=key)
         phase_recorded = False
         move_right_checked_debug(
             result,
@@ -794,6 +809,8 @@ def execute_one_nut(
             pose=RIGHT_RELEASE_POSE,
             monitor=monitor,
         )
+        if recording_probe is not None:
+            recording_probe.mark_phase("RIGHT_RELEASE_OPEN", event="COMMAND", nut=key)
         execute_right_checked_debug(
             result,
             "右手释放张开",
@@ -818,6 +835,8 @@ def execute_one_nut(
         phase_recorded = True
 
         current_phase = "RIGHT_SAFE_RETREAT"
+        if recording_probe is not None:
+            recording_probe.mark_phase(current_phase, nut=key)
         phase_recorded = False
         time.sleep(RIGHT_RELEASE_OPEN_WAIT_S)
         safe_height_pose = build_right_release_safe_height_pose()
@@ -841,6 +860,8 @@ def execute_one_nut(
         phase_recorded = True
 
         current_phase = "RIGHT_OBSERVATION_AFTER_RELEASE"
+        if recording_probe is not None:
+            recording_probe.mark_phase(current_phase, nut=key)
         phase_recorded = False
         observation_path = move_right_to_observation(
             result,
@@ -854,6 +875,8 @@ def execute_one_nut(
         phase_recorded = True
 
         current_phase = "WAIT_SETTLE"
+        if recording_probe is not None:
+            recording_probe.mark_phase(current_phase, nut=key)
         phase_recorded = False
         elapsed = time.monotonic() - release_monotonic
         remaining = max(0.0, settle_after_release_s - elapsed)
@@ -867,6 +890,8 @@ def execute_one_nut(
         )
         phase_recorded = True
         current_phase = "VISION_AFTER_RELEASE"
+        if recording_probe is not None:
+            recording_probe.mark_phase(current_phase, nut=key)
         phase_recorded = False
         released_vision = detect_nut(RELEASE_TARGET_WORLD_XYZ, vision_radius_m)
         if not released_vision.get("detected") or not released_vision.get("nut_world_xyz"):
@@ -887,11 +912,15 @@ def execute_one_nut(
         phase_recorded = True
 
         current_phase = "LEFT_GRASP"
+        if recording_probe is not None:
+            recording_probe.mark_phase(current_phase, nut=key)
         phase_recorded = False
         if devices["left"] is None:
             devices["left"] = make_left_bundle()
         left_bundle = devices["left"]
         planner = LeftNutGraspPlanner(left_arm=left_bundle.left_arm, left_hand=left_bundle.left_hand)
+        if recording_probe is not None:
+            recording_probe.mark_phase("LEFT_GRASP_COMMAND", event="COMMAND", nut=key)
         left_result = planner.grasp_world_xyz(released_position, execute=True)
         grasp_pose_left = left_result.get("grasp_pose")
         if not left_result.get("success"):
@@ -910,6 +939,8 @@ def execute_one_nut(
         phase_recorded = True
 
         current_phase = "LEFT_SAFE_LIFT"
+        if recording_probe is not None:
+            recording_probe.mark_phase(current_phase, nut=key)
         phase_recorded = False
         safe_lift_pose = safe_lift_pose_from_grasp(grasp_pose_left)
         safe_lift_result = planner.move_to_pose("LEFT_SAFE_LIFT", safe_lift_pose)
@@ -929,6 +960,8 @@ def execute_one_nut(
         phase_recorded = True
 
         current_phase = "LEFT_PLACE"
+        if recording_probe is not None:
+            recording_probe.mark_phase(current_phase, nut=key)
         phase_recorded = False
         place_pose = LEFT_PLACE_POSES[key]
         place_pose_values = pose_to_list(place_pose)
@@ -936,6 +969,8 @@ def execute_one_nut(
         if not place_check.get("pass"):
             raise ThreeNutClosedLoopError(f"place pose_check failed: {place_check.get('reason')}")
         move_checked(f"LEFT_PLACE_{key}", left_bundle.left_arm, place_pose)
+        if recording_probe is not None:
+            recording_probe.mark_phase("LEFT_RELEASE_OPEN", event="COMMAND", nut=key)
         execute_checked("LEFT_RELEASE_OPEN", left_bundle.left_hand, "clench", *list(HAND_OPEN))
         result["place"] = True
         add_phase(
@@ -951,6 +986,8 @@ def execute_one_nut(
         # The right arm already remains at observation while the left arm
         # completes grasp/place; record that invariant at task completion.
         current_phase = "RIGHT_FINAL_OBSERVATION"
+        if recording_probe is not None:
+            recording_probe.mark_phase(current_phase, nut=key)
         phase_recorded = False
         add_phase(
             result,
@@ -988,6 +1025,7 @@ def run_trial(
     devices: dict[str, Any],
     args: argparse.Namespace,
     monitor: MotionMonitor | None,
+    recording_probe: IntegratedRecordingProbe | None = None,
 ) -> dict[str, Any]:
     trial = {
         "trial_id": trial_id,
@@ -1009,6 +1047,7 @@ def run_trial(
             settle_after_release_s=float(args.settle_after_release_s),
             vision_radius_m=float(args.vision_target_radius_m),
             monitor=monitor,
+            recording_probe=recording_probe,
         )
         trial["nut_results"].append(result)
         trial["debug_trace"].extend(result.get("debug_trace", []))
@@ -1119,7 +1158,25 @@ def run(args: argparse.Namespace) -> int:
             print(f"发现RGB相机：{probe_start.get('camera_count', 0)}/3", flush=True)
         for trial_id in range(1, args.trials + 1):
             print(f"\n######## Trial {trial_id}/{args.trials} ########")
-            trial = run_trial(trial_id, sequence, pose_setter, devices, args, monitor)
+            if recording_probe is not None:
+                recording_probe.mark_phase("TRIAL", event="ENTER", trial_id=trial_id)
+            trial = run_trial(
+                trial_id,
+                sequence,
+                pose_setter,
+                devices,
+                args,
+                monitor,
+                recording_probe,
+            )
+            if recording_probe is not None:
+                recording_probe.mark_phase(
+                    "TRIAL",
+                    event="EXIT",
+                    trial_id=trial_id,
+                    success=trial["success"],
+                    failed_phase=trial.get("failed_phase"),
+                )
             report["trials"].append(trial)
             report["debug_trace"].extend(trial.get("debug_trace", []))
             write_report(report, report_path)
@@ -1262,8 +1319,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--recording-probe-fps",
         type=float,
-        default=30.0,
-        help="target state sampling frequency for --recording-probe (default: 30Hz)",
+        default=10.0,
+        help="target state sampling frequency for --recording-probe (default: 10Hz)",
     )
     args = parser.parse_args()
     try:
