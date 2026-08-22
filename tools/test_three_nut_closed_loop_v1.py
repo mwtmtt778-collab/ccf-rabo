@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -83,6 +84,7 @@ PLACE_POSE_SOURCES = {
     key: f"agents.three_nut_expert.config.LEFT_PLACE_POSES[{key}]"
     for key in NUT_SEQUENCE
 }
+RIGHT_ACTION_WARN_AFTER_S = 10.0
 
 
 class ThreeNutClosedLoopError(RuntimeError):
@@ -91,6 +93,331 @@ class ThreeNutClosedLoopError(RuntimeError):
 
 def now_text() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def compact_json(value: Any) -> str:
+    return json.dumps(jsonable(value), ensure_ascii=False, separators=(",", ":"))
+
+
+def print_right_action_start(
+    *,
+    action_cn: str,
+    action_en: str,
+    target: Any,
+    start_time: str,
+    call_label: str | None = None,
+    method: str | None = None,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    print("\n【右手动作开始】", flush=True)
+    print(f"动作名称：{action_cn}", flush=True)
+    print(f"动作英文：{action_en}", flush=True)
+    if call_label:
+        print(f"调用标签：{call_label}", flush=True)
+    if method:
+        print(f"调用方法：{method}", flush=True)
+    if extra:
+        for key, value in extra.items():
+            print(f"{key}：{compact_json(value)}", flush=True)
+    print(f"目标：{compact_json(target)}", flush=True)
+    print(f"时间：{start_time}", flush=True)
+
+
+def print_right_action_done(
+    *,
+    action_cn: str,
+    action_en: str,
+    elapsed_s: float,
+    start_time: str,
+    end_time: str,
+    timed_out: bool,
+    call_label: str | None = None,
+    method: str | None = None,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    print("\n【右手动作完成】", flush=True)
+    print(f"动作名称：{action_cn}", flush=True)
+    print(f"动作英文：{action_en}", flush=True)
+    if call_label:
+        print(f"调用标签：{call_label}", flush=True)
+    if method:
+        print(f"调用方法：{method}", flush=True)
+    if extra:
+        for key, value in extra.items():
+            print(f"{key}：{compact_json(value)}", flush=True)
+    print(f"开始：{start_time}", flush=True)
+    print(f"结束：{end_time}", flush=True)
+    print(f"耗时：{elapsed_s:.2f} 秒", flush=True)
+    print(f"是否超时：{'是' if timed_out else '否'}", flush=True)
+
+
+def print_right_action_failed(
+    *,
+    action_cn: str,
+    action_en: str,
+    elapsed_s: float,
+    start_time: str,
+    end_time: str,
+    timed_out: bool,
+    error: BaseException,
+    call_label: str | None = None,
+    method: str | None = None,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    print("\n【右手动作失败】", flush=True)
+    print(f"动作名称：{action_cn}", flush=True)
+    print(f"动作英文：{action_en}", flush=True)
+    if call_label:
+        print(f"调用标签：{call_label}", flush=True)
+    if method:
+        print(f"调用方法：{method}", flush=True)
+    if extra:
+        for key, value in extra.items():
+            print(f"{key}：{compact_json(value)}", flush=True)
+    print(f"开始：{start_time}", flush=True)
+    print(f"结束：{end_time}", flush=True)
+    print(f"耗时：{elapsed_s:.2f} 秒", flush=True)
+    print(f"是否超时：{'是' if timed_out else '否'}", flush=True)
+    print(f"错误信息：{error!r}", flush=True)
+
+
+def append_right_debug_trace(
+    result: dict[str, Any],
+    *,
+    action_cn: str,
+    action_en: str,
+    status: str,
+    start_time: str,
+    target: Any,
+    end_time: str = "",
+    elapsed_s: float | str = "",
+    error: str = "",
+    call_label: str | None = None,
+    method: str | None = None,
+    timed_out: bool | None = None,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    entry: dict[str, Any] = {
+        "arm": "right",
+        "动作": action_cn,
+        "动作英文": action_en,
+        "状态": status,
+        "开始时间": start_time,
+        "结束时间": end_time,
+        "耗时_s": elapsed_s,
+        "目标": target,
+        "错误信息": error,
+    }
+    if call_label:
+        entry["调用标签"] = call_label
+    if method:
+        entry["调用方法"] = method
+    if timed_out is not None:
+        entry["是否超过10秒"] = bool(timed_out)
+    if extra:
+        entry.update(extra)
+    result.setdefault("debug_trace", []).append(jsonable(entry))
+
+
+def right_phase_failure_note(phase: str) -> str:
+    notes = {
+        "RIGHT_GRASP": "右手抓取阶段执行异常，需结合最后一个右手动作判断是移动、拇指预收还是抓取施力未返回",
+        "RIGHT_LIFT": "右手抬升阶段执行异常，需检查对应 RIGHT_LIFT 子动作是否阻塞",
+        "RIGHT_RELEASE": "右手释放阶段执行异常，需检查释放位移动或张开手指是否未返回",
+        "RIGHT_SAFE_RETREAT": "右手移动到释放后安全高度时未返回或执行异常",
+        "RIGHT_OBSERVATION_AFTER_RELEASE": "右手释放后返回观察位置时未返回或执行异常",
+        "RIGHT_OBSERVATION_BEFORE_GRASP": "右手抓取前返回观察位置时未返回或执行异常",
+    }
+    return notes.get(phase, f"{phase} 阶段执行异常")
+
+
+def record_failure_detail(
+    result: dict[str, Any],
+    *,
+    phase: str,
+    exc: BaseException,
+) -> None:
+    result["failure_detail"] = {
+        "失败阶段": phase,
+        "中文说明": right_phase_failure_note(phase),
+        "当前动作": result.get("current_right_action") or phase,
+        "最后成功动作": result.get("last_success_right_action") or "",
+        "异常时间": now_text(),
+        "异常类型": type(exc).__name__,
+        "异常信息": repr(exc),
+    }
+
+
+def run_right_action(
+    result: dict[str, Any],
+    *,
+    action_cn: str,
+    action_en: str,
+    target: Any,
+    call_label: str,
+    method: str,
+    fn: Any,
+    extra: dict[str, Any] | None = None,
+) -> Any:
+    start_time = now_text()
+    start_monotonic = time.monotonic()
+    timed_out_event = threading.Event()
+    previous_action = result.get("current_right_action")
+    result["current_right_action"] = call_label
+    append_right_debug_trace(
+        result,
+        action_cn=action_cn,
+        action_en=action_en,
+        status="开始",
+        start_time=start_time,
+        target=target,
+        call_label=call_label,
+        method=method,
+        extra=extra,
+    )
+    print_right_action_start(
+        action_cn=action_cn,
+        action_en=action_en,
+        target=target,
+        start_time=start_time,
+        call_label=call_label,
+        method=method,
+        extra=extra,
+    )
+
+    def warn_if_still_running() -> None:
+        timed_out_event.set()
+        print("\n【警告】", flush=True)
+        print("右手动作超过10秒未返回：", flush=True)
+        print(f"动作名称：{action_cn}", flush=True)
+        print(f"动作英文：{action_en}", flush=True)
+        print(f"当前动作：{call_label}", flush=True)
+        print("疑似：", flush=True)
+        print("- 控制接口阻塞", flush=True)
+        print("- 机器人状态未更新", flush=True)
+        print("- move命令未完成", flush=True)
+
+    timer = threading.Timer(RIGHT_ACTION_WARN_AFTER_S, warn_if_still_running)
+    timer.daemon = True
+    timer.start()
+    try:
+        value = fn()
+    except BaseException as exc:
+        timer.cancel()
+        end_time = now_text()
+        elapsed_s = time.monotonic() - start_monotonic
+        timed_out = timed_out_event.is_set() or elapsed_s >= RIGHT_ACTION_WARN_AFTER_S
+        done_extra = dict(extra or {})
+        if "move_joints" in method:
+            done_extra.setdefault("move_joints调用前时间", start_time)
+            done_extra["move_joints返回时间"] = end_time
+        append_right_debug_trace(
+            result,
+            action_cn=action_cn,
+            action_en=action_en,
+            status="失败",
+            start_time=start_time,
+            end_time=end_time,
+            elapsed_s=round(elapsed_s, 3),
+            target=target,
+            error=repr(exc),
+            call_label=call_label,
+            method=method,
+            timed_out=timed_out,
+            extra=done_extra,
+        )
+        print_right_action_failed(
+            action_cn=action_cn,
+            action_en=action_en,
+            elapsed_s=elapsed_s,
+            start_time=start_time,
+            end_time=end_time,
+            timed_out=timed_out,
+            error=exc,
+            call_label=call_label,
+            method=method,
+            extra=done_extra,
+        )
+        raise
+    else:
+        timer.cancel()
+        end_time = now_text()
+        elapsed_s = time.monotonic() - start_monotonic
+        timed_out = timed_out_event.is_set() or elapsed_s >= RIGHT_ACTION_WARN_AFTER_S
+        done_extra = dict(extra or {})
+        if "move_joints" in method:
+            done_extra.setdefault("move_joints调用前时间", start_time)
+            done_extra["move_joints返回时间"] = end_time
+        append_right_debug_trace(
+            result,
+            action_cn=action_cn,
+            action_en=action_en,
+            status="完成",
+            start_time=start_time,
+            end_time=end_time,
+            elapsed_s=round(elapsed_s, 3),
+            target=target,
+            call_label=call_label,
+            method=method,
+            timed_out=timed_out,
+            extra=done_extra,
+        )
+        result["last_success_right_action"] = call_label
+        result["current_right_action"] = previous_action
+        print_right_action_done(
+            action_cn=action_cn,
+            action_en=action_en,
+            elapsed_s=elapsed_s,
+            start_time=start_time,
+            end_time=end_time,
+            timed_out=timed_out,
+            call_label=call_label,
+            method=method,
+            extra=done_extra,
+        )
+        return value
+
+
+def move_right_checked_debug(
+    result: dict[str, Any],
+    *,
+    action_cn: str,
+    action_en: str,
+    label: str,
+    right_arm: Any,
+    pose: Pose6,
+) -> Any:
+    return run_right_action(
+        result,
+        action_cn=action_cn,
+        action_en=action_en,
+        target=pose_to_list(pose),
+        call_label=label,
+        method="move_checked",
+        fn=lambda: move_checked(label, right_arm, pose),
+    )
+
+
+def execute_right_checked_debug(
+    result: dict[str, Any],
+    action_cn: str,
+    action_en: str,
+    label: str,
+    target: Any,
+    device: Any,
+    method: str,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    return run_right_action(
+        result,
+        action_cn=action_cn,
+        action_en=action_en,
+        target=target,
+        call_label=label,
+        method=f"execute_checked.{method}",
+        fn=lambda: execute_checked(label, device, method, *args, **kwargs),
+    )
 
 
 def validate_static_contract() -> None:
@@ -145,8 +472,12 @@ def new_nut_result(key: str) -> dict[str, Any]:
         "failed_phase": None,
         "failure_code": None,
         "failure_reason": None,
+        "failure_detail": None,
         "interrupted": False,
         "phases": [],
+        "debug_trace": [],
+        "current_right_action": None,
+        "last_success_right_action": None,
     }
 
 
@@ -187,11 +518,31 @@ def detect_nut(target_xyz: tuple[float, float, float], radius: float) -> dict[st
     return detect_released_nut(target_xyz, radius)
 
 
-def move_right_to_observation(right_bundle: Any, label: str) -> list[list[float]]:
+def move_right_to_observation(result: dict[str, Any], right_bundle: Any, label: str) -> list[list[float]]:
     executed: list[list[float]] = []
     for index, joints in enumerate(RIGHT_OBSERVATION_JOINTS, start=1):
         values = list(joints)
-        execute_checked(f"{label}_{index}", right_bundle.right_arm, "move_joints", values)
+        call_label = f"{label}_{index}"
+        extra = {
+            "第几个关节目标点": index,
+            "目标joint数值": values,
+            "move_joints调用前时间": now_text(),
+        }
+        run_right_action(
+            result,
+            action_cn="右手返回观察位置",
+            action_en=label,
+            target=values,
+            call_label=call_label,
+            method="execute_checked.move_joints",
+            fn=lambda values=values, call_label=call_label: execute_checked(
+                call_label,
+                right_bundle.right_arm,
+                "move_joints",
+                values,
+            ),
+            extra=extra,
+        )
         executed.append(values)
     return executed
 
@@ -231,8 +582,17 @@ def execute_one_nut(
 
         current_phase = "RIGHT_OBSERVATION_BEFORE_GRASP"
         phase_recorded = False
-        execute_checked("RIGHT_HAND_OPEN_INITIAL", right_bundle.right_hand, "clench", *list(HAND_OPEN))
-        observation_path = move_right_to_observation(right_bundle, "RIGHT_OBSERVATION_BEFORE_GRASP")
+        execute_right_checked_debug(
+            result,
+            "右手初始张开",
+            current_phase,
+            "RIGHT_HAND_OPEN_INITIAL",
+            list(HAND_OPEN),
+            right_bundle.right_hand,
+            "clench",
+            *list(HAND_OPEN),
+        )
+        observation_path = move_right_to_observation(result, right_bundle, "RIGHT_OBSERVATION_BEFORE_GRASP")
         time.sleep(RIGHT_OBSERVATION_STABLE_WAIT_S)
         result["right_observation_before_grasp"] = True
         add_phase(result, current_phase, True, joints=observation_path)
@@ -260,9 +620,34 @@ def execute_one_nut(
         current_phase = "RIGHT_GRASP"
         phase_recorded = False
         grasp_pose = RIGHT_GRASP_POSES[key]
-        move_checked(f"RIGHT_NUT_{key}_GRASP_POSE", right_bundle.right_arm, grasp_pose)
-        execute_checked("RIGHT_THUMB_TUCK", right_bundle.right_hand, "clench", thumb_rotation=1.0)
-        execute_checked("RIGHT_GRASP_FORCE", right_bundle.right_hand, "grasp_force", **RIGHT_GRASP_FORCE)
+        move_right_checked_debug(
+            result,
+            action_cn=f"右手移动到 Nut {key} 抓取位",
+            action_en=current_phase,
+            label=f"RIGHT_NUT_{key}_GRASP_POSE",
+            right_arm=right_bundle.right_arm,
+            pose=grasp_pose,
+        )
+        execute_right_checked_debug(
+            result,
+            "右手拇指预收",
+            current_phase,
+            "RIGHT_THUMB_TUCK",
+            {"thumb_rotation": 1.0},
+            right_bundle.right_hand,
+            "clench",
+            thumb_rotation=1.0,
+        )
+        execute_right_checked_debug(
+            result,
+            "右手抓取施力",
+            current_phase,
+            "RIGHT_GRASP_FORCE",
+            RIGHT_GRASP_FORCE,
+            right_bundle.right_hand,
+            "grasp_force",
+            **RIGHT_GRASP_FORCE,
+        )
         if DEFAULT_HOLD_AFTER_GRASP_S > 0:
             time.sleep(DEFAULT_HOLD_AFTER_GRASP_S)
         result["right_grasp"] = True
@@ -278,15 +663,38 @@ def execute_one_nut(
         current_phase = "RIGHT_LIFT"
         phase_recorded = False
         for index, lift_pose in enumerate(RIGHT_LIFT_POSES, start=1):
-            move_checked(f"RIGHT_LIFT_{index}", right_bundle.right_arm, lift_pose)
+            move_right_checked_debug(
+                result,
+                action_cn=f"右手抬升第 {index} 段",
+                action_en=current_phase,
+                label=f"RIGHT_LIFT_{index}",
+                right_arm=right_bundle.right_arm,
+                pose=lift_pose,
+            )
         result["lift_success"] = True
         add_phase(result, current_phase, True, lift_poses=[pose_to_list(pose) for pose in RIGHT_LIFT_POSES])
         phase_recorded = True
 
         current_phase = "RIGHT_RELEASE"
         phase_recorded = False
-        move_checked("RIGHT_RELEASE_POSE", right_bundle.right_arm, RIGHT_RELEASE_POSE)
-        execute_checked("RIGHT_RELEASE_OPEN", right_bundle.right_hand, "clench", *list(HAND_OPEN))
+        move_right_checked_debug(
+            result,
+            action_cn="右手移动到释放位",
+            action_en=current_phase,
+            label="RIGHT_RELEASE_POSE",
+            right_arm=right_bundle.right_arm,
+            pose=RIGHT_RELEASE_POSE,
+        )
+        execute_right_checked_debug(
+            result,
+            "右手释放张开",
+            current_phase,
+            "RIGHT_RELEASE_OPEN",
+            list(HAND_OPEN),
+            right_bundle.right_hand,
+            "clench",
+            *list(HAND_OPEN),
+        )
         release_timestamp = now_text()
         release_monotonic = time.monotonic()
         result["right_release"] = True
@@ -304,7 +712,14 @@ def execute_one_nut(
         phase_recorded = False
         time.sleep(RIGHT_RELEASE_OPEN_WAIT_S)
         safe_height_pose = build_right_release_safe_height_pose()
-        move_checked("RIGHT_RELEASE_SAFE_HEIGHT", right_bundle.right_arm, safe_height_pose)
+        move_right_checked_debug(
+            result,
+            action_cn="右手释放后移动到安全高度",
+            action_en=current_phase,
+            label="RIGHT_RELEASE_SAFE_HEIGHT",
+            right_arm=right_bundle.right_arm,
+            pose=safe_height_pose,
+        )
         result["right_safe_retreat"] = True
         add_phase(
             result,
@@ -317,7 +732,7 @@ def execute_one_nut(
 
         current_phase = "RIGHT_OBSERVATION_AFTER_RELEASE"
         phase_recorded = False
-        observation_path = move_right_to_observation(right_bundle, "RIGHT_OBSERVATION_AFTER_RELEASE")
+        observation_path = move_right_to_observation(result, right_bundle, "RIGHT_OBSERVATION_AFTER_RELEASE")
         time.sleep(RIGHT_OBSERVATION_STABLE_WAIT_S)
         result["right_observation_after_release"] = True
         add_phase(result, current_phase, True, joints=observation_path)
@@ -434,6 +849,7 @@ def execute_one_nut(
         reason = repr(exc) or "KeyboardInterrupt()"
         if not phase_recorded:
             add_phase(result, current_phase, False, failure_reason=reason)
+        record_failure_detail(result, phase=current_phase, exc=exc)
         result["failed_phase"] = current_phase
         result["failure_code"] = "USER_INTERRUPTED"
         result["failure_reason"] = reason
@@ -442,6 +858,7 @@ def execute_one_nut(
         reason = repr(exc)
         if not phase_recorded:
             add_phase(result, current_phase, False, failure_reason=reason)
+        record_failure_detail(result, phase=current_phase, exc=exc)
         result["failed_phase"] = current_phase
         if current_phase == "VISION_AFTER_RELEASE":
             result["failure_code"] = "VISION_AFTER_RELEASE_FAILED"
@@ -463,7 +880,9 @@ def run_trial(
         "failed_nut": None,
         "failed_phase": None,
         "failure_code": None,
+        "failure_detail": None,
         "interrupted": False,
+        "debug_trace": [],
     }
     for key in NUT_SEQUENCE:
         result = execute_one_nut(
@@ -474,10 +893,12 @@ def run_trial(
             vision_radius_m=float(args.vision_target_radius_m),
         )
         trial["nut_results"].append(result)
+        trial["debug_trace"].extend(result.get("debug_trace", []))
         if not result["success"]:
             trial["failed_nut"] = key
             trial["failed_phase"] = result["failed_phase"]
             trial["failure_code"] = result["failure_code"]
+            trial["failure_detail"] = result.get("failure_detail")
             trial["interrupted"] = result["interrupted"]
             return trial
     trial["success"] = True
@@ -511,11 +932,13 @@ def run(args: argparse.Namespace) -> int:
             "configuration_warning": "A/C right grasps and place slots are existing staged values, not field-verified.",
         },
         "trials": [],
+        "debug_trace": [],
         "overall_success": False,
         "failed_trial": None,
         "failed_nut": None,
         "failed_phase": None,
         "failure_code": None,
+        "failure_detail": None,
         "failure_reason": None,
         "interrupted": False,
         "report_path": str(report_path.relative_to(PROJECT_ROOT)),
@@ -535,12 +958,14 @@ def run(args: argparse.Namespace) -> int:
             print(f"\n######## Trial {trial_id}/{args.trials} ########")
             trial = run_trial(trial_id, pose_setter, devices, args)
             report["trials"].append(trial)
+            report["debug_trace"].extend(trial.get("debug_trace", []))
             write_report(report, report_path)
             if not trial["success"]:
                 report["failed_trial"] = trial_id
                 report["failed_nut"] = trial["failed_nut"]
                 report["failed_phase"] = trial["failed_phase"]
                 report["failure_code"] = trial["failure_code"]
+                report["failure_detail"] = trial.get("failure_detail")
                 report["interrupted"] = trial["interrupted"]
                 failed_result = trial["nut_results"][-1]
                 report["failure_reason"] = failed_result["failure_reason"]
@@ -563,11 +988,29 @@ def run(args: argparse.Namespace) -> int:
         report["failure_code"] = "USER_INTERRUPTED"
         report["failed_phase"] = report["failed_phase"] or "INITIALIZE"
         report["failure_reason"] = repr(exc) or "KeyboardInterrupt()"
+        report["failure_detail"] = {
+            "失败阶段": report["failed_phase"],
+            "中文说明": "初始化或 trial 外层执行被用户中断",
+            "当前动作": report["failed_phase"],
+            "最后成功动作": "",
+            "异常时间": now_text(),
+            "异常类型": type(exc).__name__,
+            "异常信息": report["failure_reason"],
+        }
         return_code = 130
     except Exception as exc:
         report["status"] = "FAILED"
         report["failed_phase"] = report["failed_phase"] or "INITIALIZE"
         report["failure_reason"] = repr(exc)
+        report["failure_detail"] = {
+            "失败阶段": report["failed_phase"],
+            "中文说明": "初始化或 trial 外层执行异常",
+            "当前动作": report["failed_phase"],
+            "最后成功动作": "",
+            "异常时间": now_text(),
+            "异常类型": type(exc).__name__,
+            "异常信息": report["failure_reason"],
+        }
     finally:
         shutdown_bundle(devices["right"])
         shutdown_left_bundle(devices["left"])
