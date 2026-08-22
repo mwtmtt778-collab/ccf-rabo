@@ -53,6 +53,7 @@ from tools.test_dual_closed_loop_v2_2 import (  # noqa: E402
 from tools.test_left_grasp_v1 import RIGHT_NUT_B_GRASP_POSE  # noqa: E402
 from tools.test_nut_camera_calibration import set_pose_with_retry  # noqa: E402
 from tools.motion_monitor import MotionMonitor, extract_joint_target  # noqa: E402
+from tools.probe_act_recording_sources import IntegratedRecordingProbe  # noqa: E402
 from tools.test_right_release_stability import (  # noqa: E402
     DEFAULT_HOLD_AFTER_GRASP_S,
     DEFAULT_SETTLE_AFTER_RELEASE_S,
@@ -1065,11 +1066,27 @@ def run(args: argparse.Namespace) -> int:
     pose_setter = None
     devices = {"right": None, "left": None}
     monitor = MotionMonitor(enabled=bool(args.monitor)) if args.monitor else None
+    recording_probe: IntegratedRecordingProbe | None = None
+    recording_probe_started = False
     if args.monitor:
         report["motion_monitor"] = {
             "enabled": True,
             "output_root": "reports/motion_monitor",
             "config_path": "tools/motion_monitor_config.json",
+        }
+    if args.recording_probe:
+        probe_output_dir = (
+            PROJECT_ROOT / "reports" / "act_recording_probe" / started.strftime("%Y%m%d_%H%M%S")
+        )
+        recording_probe = IntegratedRecordingProbe(
+            output_dir=probe_output_dir,
+            target_fps=float(args.recording_probe_fps),
+        )
+        report["recording_probe"] = {
+            "enabled": True,
+            "target_fps": float(args.recording_probe_fps),
+            "output_dir": str(probe_output_dir.relative_to(PROJECT_ROOT)),
+            "status": "WAITING_FOR_DEVICE_INITIALIZATION",
         }
     return_code = 1
     try:
@@ -1079,6 +1096,27 @@ def run(args: argparse.Namespace) -> int:
         print("================================")
         pose_setter = make_pose_setter()
         devices["right"] = make_right_bundle()
+        if recording_probe is not None:
+            # The normal task initializes the left bundle lazily.  The optional
+            # read-only probe needs all 26 state dimensions from its first frame,
+            # so initialize the same existing bundle before starting the trial.
+            devices["left"] = make_left_bundle()
+            probe_start = recording_probe.start(
+                left_arm=devices["left"].left_arm,
+                right_arm=devices["right"].right_arm,
+                left_hand=devices["left"].left_hand,
+                right_hand=devices["right"].right_hand,
+            )
+            recording_probe_started = True
+            report["recording_probe"].update(
+                {
+                    "status": "RUNNING",
+                    "start_result": probe_start,
+                }
+            )
+            print("\n【ACT录制源探针】已启动", flush=True)
+            print(f"目标状态采样频率：{args.recording_probe_fps:g} Hz", flush=True)
+            print(f"发现RGB相机：{probe_start.get('camera_count', 0)}/3", flush=True)
         for trial_id in range(1, args.trials + 1):
             print(f"\n######## Trial {trial_id}/{args.trials} ########")
             trial = run_trial(trial_id, sequence, pose_setter, devices, args, monitor)
@@ -1137,6 +1175,35 @@ def run(args: argparse.Namespace) -> int:
             "异常信息": report["failure_reason"],
         }
     finally:
+        if recording_probe is not None:
+            if not recording_probe_started:
+                report["recording_probe"].update(
+                    {
+                        "status": "NOT_STARTED",
+                        "reason": "V1 device initialization failed before the probe could start",
+                    }
+                )
+            else:
+                try:
+                    probe_summary = recording_probe.stop(task_status=report["status"])
+                    report["recording_probe"].update(
+                        {
+                            "status": "COMPLETED",
+                            "summary": probe_summary,
+                        }
+                    )
+                    print("\n【ACT录制源探针】采样完成", flush=True)
+                    print(f"结论：{probe_summary.get('result')}", flush=True)
+                    print(f"报告：{probe_summary.get('report_json')}", flush=True)
+                except Exception as exc:
+                    report["recording_probe"].update(
+                        {
+                            "status": "FAILED",
+                            "error": repr(exc),
+                            "failed_at": now_text(),
+                        }
+                    )
+                    print(f"\n【ACT录制源探针】停止/保存失败：{exc!r}", flush=True)
         shutdown_bundle(devices["right"])
         shutdown_left_bundle(devices["left"])
         shutdown_pose_setter(pose_setter)
@@ -1185,6 +1252,19 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="enable motion diagnostic monitor",
     )
+    parser.add_argument(
+        "--recording-probe",
+        "--probe",
+        dest="recording_probe",
+        action="store_true",
+        help="enable the read-only ACT recording-source probe during the original task",
+    )
+    parser.add_argument(
+        "--recording-probe-fps",
+        type=float,
+        default=30.0,
+        help="target state sampling frequency for --recording-probe (default: 30Hz)",
+    )
     args = parser.parse_args()
     try:
         parse_sequence_arg(args.sequence)
@@ -1197,6 +1277,8 @@ def parse_args() -> argparse.Namespace:
         parser.error(f"--settle-after-release-s must be at least {minimum_wait:g}s")
     if args.vision_target_radius_m <= 0:
         parser.error("--vision-target-radius-m must be > 0")
+    if args.recording_probe_fps <= 0:
+        parser.error("--recording-probe-fps must be > 0")
     return args
 
 
