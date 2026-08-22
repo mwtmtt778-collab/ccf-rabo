@@ -45,6 +45,7 @@ agent_system_backup.tar.gz
 # ==========================================================
 logs/
 outputs/
+reports/
 
 # Python runtime
 __pycache__/
