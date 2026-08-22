@@ -261,6 +261,7 @@ class CameraSampler:
         self._node: Any = None
         self._rclpy: Any = None
         self._executor: Any = None
+        self._callback_groups: list[Any] = []
         self._owns_rclpy_context = False
         self._subscriptions: list[Any] = []
         self._image_queue: Queue[tuple[CameraRecord, Any]] = Queue(maxsize=max(1, len(self.records)))
@@ -272,7 +273,8 @@ class CameraSampler:
             return
         try:
             import rclpy
-            from rclpy.executors import SingleThreadedExecutor
+            from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+            from rclpy.executors import MultiThreadedExecutor
             from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 
             self._rclpy = rclpy
@@ -282,7 +284,11 @@ class CameraSampler:
             self._node = rclpy.create_node("rabo_act_recording_readonly_probe")
             # Do not use rclpy's global executor: V1's point-cloud detector
             # spins another node in the main thread during this probe.
-            self._executor = SingleThreadedExecutor()
+            # Each raw RGB subscription gets its own callback group and worker
+            # capacity.  A single-thread executor serializes three large-image
+            # subscriptions and was shown to drop additional frames compared
+            # with three independent ``ros2 topic echo`` processes.
+            self._executor = MultiThreadedExecutor(num_threads=max(2, len(self.records)))
             self._executor.add_node(self._node)
             qos = QoSProfile(
                 history=HistoryPolicy.KEEP_LAST,
@@ -297,12 +303,15 @@ class CameraSampler:
             for record in self.records.values():
                 try:
                     message_class = load_message_class(record.type_name)
+                    callback_group = MutuallyExclusiveCallbackGroup()
                     subscription = self._node.create_subscription(
                         message_class,
                         record.topic,
                         self._make_callback(record),
                         qos,
+                        callback_group=callback_group,
                     )
+                    self._callback_groups.append(callback_group)
                     self._subscriptions.append(subscription)
                 except Exception as exc:
                     record.subscribe_error = repr(exc)
@@ -384,6 +393,9 @@ class CameraSampler:
             self._thread.join(timeout=2.0)
         if self._writer_thread is not None:
             self._writer_thread.join(timeout=2.0)
+        if self._executor is not None:
+            with contextlib.suppress(Exception):
+                self._executor.shutdown(timeout_sec=1.0)
         if self._node is not None:
             for subscription in self._subscriptions:
                 with contextlib.suppress(Exception):
@@ -393,9 +405,6 @@ class CameraSampler:
                     self._executor.remove_node(self._node)
             with contextlib.suppress(Exception):
                 self._node.destroy_node()
-        if self._executor is not None:
-            with contextlib.suppress(Exception):
-                self._executor.shutdown(timeout_sec=1.0)
         if self._rclpy is not None and self._owns_rclpy_context and self._rclpy.ok():
             with contextlib.suppress(Exception):
                 self._rclpy.shutdown()

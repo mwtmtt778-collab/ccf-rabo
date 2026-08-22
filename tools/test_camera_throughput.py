@@ -428,9 +428,10 @@ def sample_mode(
     depth=1 (the same policy used by ``probe_act_recording_sources.py``, which
     the platform confirmed receives frames; BEST_EFFORT receives nothing).
 
-    ``spin_once`` is called on the calling thread, so callbacks run inline and
-    no lock is required.  The settle phase spins without recording to drain
-    warm-up frames; the measurement window enforces explicit start/end bounds.
+    A multi-thread executor and one mutually-exclusive callback group per
+    camera keep the three raw-image subscriptions from blocking one another.
+    The settle phase spins without recording to drain warm-up frames; the
+    measurement window enforces explicit start/end bounds.
 
     The caller (``main``) is responsible for ``rclpy.init``/``shutdown``
     ownership; this function assumes rclpy is already initialised.
@@ -445,6 +446,7 @@ def sample_mode(
         "psutil_available": psutil is not None,
         "subscription_count": 0,
         "sampling_error": None,
+        "executor_model": "multi_threaded_per_camera_callback_group",
         "window_start_s": None,
         "window_end_s": None,
         "window_duration_s": None,
@@ -457,14 +459,16 @@ def sample_mode(
     node = None
     executor = None
     subscriptions: list[Any] = []
+    callback_groups: list[Any] = []
     proc: Any = None
     try:
         import rclpy
-        from rclpy.executors import SingleThreadedExecutor
+        from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+        from rclpy.executors import MultiThreadedExecutor
         from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 
         node = rclpy.create_node(node_name)
-        executor = SingleThreadedExecutor()
+        executor = MultiThreadedExecutor(num_threads=max(2, len(camera_topics)))
         executor.add_node(node)
 
         qos = QoSProfile(
@@ -504,12 +508,15 @@ def sample_mode(
         for record in metrics.values():
             try:
                 message_class = load_message_class(record.type_name)
+                callback_group = MutuallyExclusiveCallbackGroup()
                 subscription = node.create_subscription(
                     message_class,
                     record.topic,
                     make_callback(record),
                     qos,
+                    callback_group=callback_group,
                 )
+                callback_groups.append(callback_group)
                 subscriptions.append(subscription)
                 record.subscribe_monotonic = time.monotonic()
             except Exception as exc:
@@ -582,6 +589,9 @@ def sample_mode(
         # sampling error rather than an uncaught traceback.
         stats["sampling_error"] = repr(exc)
     finally:
+        if executor is not None:
+            with contextlib.suppress(Exception):
+                executor.shutdown(timeout_sec=1.0)
         for subscription in subscriptions:
             if node is not None:
                 with contextlib.suppress(Exception):
@@ -592,9 +602,6 @@ def sample_mode(
         if node is not None:
             with contextlib.suppress(Exception):
                 node.destroy_node()
-        if executor is not None:
-            with contextlib.suppress(Exception):
-                executor.shutdown(timeout_sec=1.0)
 
     return metrics, stats
 
