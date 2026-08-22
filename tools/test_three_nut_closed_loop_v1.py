@@ -52,6 +52,7 @@ from tools.test_dual_closed_loop_v2_2 import (  # noqa: E402
 )
 from tools.test_left_grasp_v1 import RIGHT_NUT_B_GRASP_POSE  # noqa: E402
 from tools.test_nut_camera_calibration import set_pose_with_retry  # noqa: E402
+from tools.motion_monitor import MotionMonitor  # noqa: E402
 from tools.test_right_release_stability import (  # noqa: E402
     DEFAULT_HOLD_AFTER_GRASP_S,
     DEFAULT_SETTLE_AFTER_RELEASE_S,
@@ -258,6 +259,11 @@ def run_right_action(
     method: str,
     fn: Any,
     extra: dict[str, Any] | None = None,
+    monitor: MotionMonitor | None = None,
+    monitor_arm: Any | None = None,
+    monitor_phase_name: str | None = None,
+    monitor_target_joint: list[float] | None = None,
+    monitor_target_ee_pose: list[float] | None = None,
 ) -> Any:
     start_time = now_text()
     start_monotonic = time.monotonic()
@@ -300,6 +306,19 @@ def run_right_action(
     timer = threading.Timer(RIGHT_ACTION_WARN_AFTER_S, warn_if_still_running)
     timer.daemon = True
     timer.start()
+    monitor_started = False
+    if monitor is not None and monitor.enabled and monitor_arm is not None:
+        try:
+            monitor.start_motion_monitor(
+                monitor_phase_name or call_label,
+                monitor_arm,
+                target_joint=monitor_target_joint,
+                target_ee_pose=monitor_target_ee_pose,
+                command_method=method,
+            )
+            monitor_started = True
+        except Exception as monitor_exc:
+            print(f"【MotionMonitor警告】启动失败：{monitor_exc!r}", flush=True)
     try:
         value = fn()
     except BaseException as exc:
@@ -308,6 +327,15 @@ def run_right_action(
         elapsed_s = time.monotonic() - start_monotonic
         timed_out = timed_out_event.is_set() or elapsed_s >= RIGHT_ACTION_WARN_AFTER_S
         done_extra = dict(extra or {})
+        monitor_result = None
+        if monitor_started and monitor is not None and monitor.enabled:
+            try:
+                monitor_result = monitor.stop_motion_monitor(status="FAILED", error_info=repr(exc))
+            except Exception as monitor_exc:
+                done_extra["motion_monitor_error"] = repr(monitor_exc)
+                print(f"【MotionMonitor警告】停止失败：{monitor_exc!r}", flush=True)
+        if monitor_result:
+            done_extra["motion_monitor"] = monitor_result
         if "move_joints" in method:
             done_extra.setdefault("move_joints调用前时间", start_time)
             done_extra["move_joints返回时间"] = end_time
@@ -345,6 +373,15 @@ def run_right_action(
         elapsed_s = time.monotonic() - start_monotonic
         timed_out = timed_out_event.is_set() or elapsed_s >= RIGHT_ACTION_WARN_AFTER_S
         done_extra = dict(extra or {})
+        monitor_result = None
+        if monitor_started and monitor is not None and monitor.enabled:
+            try:
+                monitor_result = monitor.stop_motion_monitor(status="COMPLETED")
+            except Exception as monitor_exc:
+                done_extra["motion_monitor_error"] = repr(monitor_exc)
+                print(f"【MotionMonitor警告】停止失败：{monitor_exc!r}", flush=True)
+        if monitor_result:
+            done_extra["motion_monitor"] = monitor_result
         if "move_joints" in method:
             done_extra.setdefault("move_joints调用前时间", start_time)
             done_extra["move_joints返回时间"] = end_time
@@ -386,15 +423,21 @@ def move_right_checked_debug(
     label: str,
     right_arm: Any,
     pose: Pose6,
+    monitor: MotionMonitor | None = None,
 ) -> Any:
+    pose_values = pose_to_list(pose)
     return run_right_action(
         result,
         action_cn=action_cn,
         action_en=action_en,
-        target=pose_to_list(pose),
+        target=pose_values,
         call_label=label,
         method="move_checked",
         fn=lambda: move_checked(label, right_arm, pose),
+        monitor=monitor,
+        monitor_arm=right_arm,
+        monitor_phase_name=label,
+        monitor_target_ee_pose=pose_values,
     )
 
 
@@ -518,7 +561,13 @@ def detect_nut(target_xyz: tuple[float, float, float], radius: float) -> dict[st
     return detect_released_nut(target_xyz, radius)
 
 
-def move_right_to_observation(result: dict[str, Any], right_bundle: Any, label: str) -> list[list[float]]:
+def move_right_to_observation(
+    result: dict[str, Any],
+    right_bundle: Any,
+    label: str,
+    *,
+    monitor: MotionMonitor | None = None,
+) -> list[list[float]]:
     executed: list[list[float]] = []
     for index, joints in enumerate(RIGHT_OBSERVATION_JOINTS, start=1):
         values = list(joints)
@@ -542,6 +591,10 @@ def move_right_to_observation(result: dict[str, Any], right_bundle: Any, label: 
                 values,
             ),
             extra=extra,
+            monitor=monitor,
+            monitor_arm=right_bundle.right_arm,
+            monitor_phase_name=call_label,
+            monitor_target_joint=values,
         )
         executed.append(values)
     return executed
@@ -554,6 +607,7 @@ def execute_one_nut(
     *,
     settle_after_release_s: float,
     vision_radius_m: float,
+    monitor: MotionMonitor | None = None,
 ) -> dict[str, Any]:
     result = new_nut_result(key)
     right_bundle = devices["right"]
@@ -592,7 +646,12 @@ def execute_one_nut(
             "clench",
             *list(HAND_OPEN),
         )
-        observation_path = move_right_to_observation(result, right_bundle, "RIGHT_OBSERVATION_BEFORE_GRASP")
+        observation_path = move_right_to_observation(
+            result,
+            right_bundle,
+            "RIGHT_OBSERVATION_BEFORE_GRASP",
+            monitor=monitor,
+        )
         time.sleep(RIGHT_OBSERVATION_STABLE_WAIT_S)
         result["right_observation_before_grasp"] = True
         add_phase(result, current_phase, True, joints=observation_path)
@@ -627,6 +686,7 @@ def execute_one_nut(
             label=f"RIGHT_NUT_{key}_GRASP_POSE",
             right_arm=right_bundle.right_arm,
             pose=grasp_pose,
+            monitor=monitor,
         )
         execute_right_checked_debug(
             result,
@@ -670,6 +730,7 @@ def execute_one_nut(
                 label=f"RIGHT_LIFT_{index}",
                 right_arm=right_bundle.right_arm,
                 pose=lift_pose,
+                monitor=monitor,
             )
         result["lift_success"] = True
         add_phase(result, current_phase, True, lift_poses=[pose_to_list(pose) for pose in RIGHT_LIFT_POSES])
@@ -684,6 +745,7 @@ def execute_one_nut(
             label="RIGHT_RELEASE_POSE",
             right_arm=right_bundle.right_arm,
             pose=RIGHT_RELEASE_POSE,
+            monitor=monitor,
         )
         execute_right_checked_debug(
             result,
@@ -719,6 +781,7 @@ def execute_one_nut(
             label="RIGHT_RELEASE_SAFE_HEIGHT",
             right_arm=right_bundle.right_arm,
             pose=safe_height_pose,
+            monitor=monitor,
         )
         result["right_safe_retreat"] = True
         add_phase(
@@ -732,7 +795,12 @@ def execute_one_nut(
 
         current_phase = "RIGHT_OBSERVATION_AFTER_RELEASE"
         phase_recorded = False
-        observation_path = move_right_to_observation(result, right_bundle, "RIGHT_OBSERVATION_AFTER_RELEASE")
+        observation_path = move_right_to_observation(
+            result,
+            right_bundle,
+            "RIGHT_OBSERVATION_AFTER_RELEASE",
+            monitor=monitor,
+        )
         time.sleep(RIGHT_OBSERVATION_STABLE_WAIT_S)
         result["right_observation_after_release"] = True
         add_phase(result, current_phase, True, joints=observation_path)
@@ -871,6 +939,7 @@ def run_trial(
     pose_setter: Any,
     devices: dict[str, Any],
     args: argparse.Namespace,
+    monitor: MotionMonitor | None,
 ) -> dict[str, Any]:
     trial = {
         "trial_id": trial_id,
@@ -891,6 +960,7 @@ def run_trial(
             devices,
             settle_after_release_s=float(args.settle_after_release_s),
             vision_radius_m=float(args.vision_target_radius_m),
+            monitor=monitor,
         )
         trial["nut_results"].append(result)
         trial["debug_trace"].extend(result.get("debug_trace", []))
@@ -946,6 +1016,13 @@ def run(args: argparse.Namespace) -> int:
 
     pose_setter = None
     devices = {"right": None, "left": None}
+    monitor = MotionMonitor(enabled=bool(args.monitor)) if args.monitor else None
+    if args.monitor:
+        report["motion_monitor"] = {
+            "enabled": True,
+            "output_root": "reports/motion_monitor",
+            "config_path": "tools/motion_monitor_config.json",
+        }
     return_code = 1
     try:
         print("================================")
@@ -956,7 +1033,7 @@ def run(args: argparse.Namespace) -> int:
         devices["right"] = make_right_bundle()
         for trial_id in range(1, args.trials + 1):
             print(f"\n######## Trial {trial_id}/{args.trials} ########")
-            trial = run_trial(trial_id, pose_setter, devices, args)
+            trial = run_trial(trial_id, pose_setter, devices, args, monitor)
             report["trials"].append(trial)
             report["debug_trace"].extend(trial.get("debug_trace", []))
             write_report(report, report_path)
@@ -1049,6 +1126,11 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=DEFAULT_VISION_TARGET_RADIUS_M,
         help=f"Existing detector candidate-selection radius (default: {DEFAULT_VISION_TARGET_RADIUS_M:g}m).",
+    )
+    parser.add_argument(
+        "--monitor",
+        action="store_true",
+        help="enable motion diagnostic monitor",
     )
     args = parser.parse_args()
     if args.trials < 1:
