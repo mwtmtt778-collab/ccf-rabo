@@ -221,8 +221,18 @@ class LiveCameraSnapshot:
 
     def close(self) -> None:
         self._stop.set()
+        if self._executor is not None:
+            with contextlib.suppress(Exception):
+                self._executor.wake()
         if self._thread is not None:
-            self._thread.join(timeout=2.0)
+            self._thread.join(timeout=5.0)
+        if self._executor is not None:
+            with contextlib.suppress(Exception):
+                self._executor.shutdown(timeout_sec=5.0)
+        if self._node is not None:
+            for subscription in self._subscriptions:
+                with contextlib.suppress(Exception):
+                    self._node.destroy_subscription(subscription)
         if self._executor is not None and self._node is not None:
             with contextlib.suppress(Exception):
                 self._executor.remove_node(self._node)
@@ -324,9 +334,9 @@ def run_one_shot(
             "note": "diagnostic inference only; no SDK write method exists in this program",
         }
     finally:
+        camera_reader.close()
         if devices:
             shutdown_devices(devices)
-        camera_reader.close()
 
 
 def main() -> int:
