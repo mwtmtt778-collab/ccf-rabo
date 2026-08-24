@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import io
 import json
 import math
 import os
@@ -29,7 +28,6 @@ from queue import Empty, Full, Queue
 from typing import Any, Callable
 
 import numpy as np
-from PIL import Image
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -132,10 +130,8 @@ class RawCameraRecorder:
         episode_dir: Path,
         *,
         queue_size: int,
-        jpeg_quality: int,
     ) -> None:
         self.episode_dir = episode_dir
-        self.jpeg_quality = jpeg_quality
         self.records = {
             source_label: CameraStats(
                 source_label=source_label,
@@ -264,39 +260,44 @@ class RawCameraRecorder:
         return callback
 
     @staticmethod
-    def _packet_to_image(packet: FramePacket) -> Image.Image:
+    def _packet_to_image_bytes(packet: FramePacket) -> tuple[bytes, str]:
         if packet.type_name == "sensor_msgs/msg/CompressedImage":
-            with Image.open(io.BytesIO(packet.data)) as decoded:
-                return decoded.convert("RGB")
+            image_format = (packet.compressed_format or "").lower()
+            if "jpeg" in image_format or "jpg" in image_format:
+                return packet.data, ".jpg"
+            if "png" in image_format:
+                return packet.data, ".png"
+            raise ValueError(f"unsupported compressed image format: {packet.compressed_format}")
 
         if packet.width is None or packet.height is None or packet.encoding is None:
             raise ValueError("raw Image is missing width/height/encoding")
         encoding = packet.encoding.lower()
-        modes = {
-            "rgb8": ("RGB", "RGB", 3),
-            "bgr8": ("RGB", "BGR", 3),
-            "rgba8": ("RGBA", "RGBA", 4),
-            "bgra8": ("RGBA", "BGRA", 4),
-            "mono8": ("L", "L", 1),
-            "8uc1": ("L", "L", 1),
+        channels_by_encoding = {
+            "rgb8": 3,
+            "bgr8": 3,
+            "rgba8": 4,
+            "bgra8": 4,
+            "mono8": 1,
+            "8uc1": 1,
         }
-        if encoding not in modes:
+        if encoding not in channels_by_encoding:
             raise ValueError(f"unsupported image encoding: {packet.encoding}")
-        mode, raw_mode, channels = modes[encoding]
+        channels = channels_by_encoding[encoding]
         stride = packet.step or packet.width * channels
         expected = stride * packet.height
         if len(packet.data) < expected:
             raise ValueError(f"short image buffer: {len(packet.data)} < {expected}")
-        image = Image.frombytes(
-            mode,
-            (packet.width, packet.height),
-            packet.data[:expected],
-            "raw",
-            raw_mode,
-            stride,
-            1,
-        )
-        return image.convert("RGB")
+        rows = np.frombuffer(packet.data, dtype=np.uint8, count=expected).reshape(packet.height, stride)
+        pixels = rows[:, : packet.width * channels].reshape(packet.height, packet.width, channels)
+        if encoding in {"mono8", "8uc1"}:
+            payload = np.ascontiguousarray(pixels[:, :, 0]).tobytes()
+            return f"P5\n{packet.width} {packet.height}\n255\n".encode("ascii") + payload, ".pgm"
+        if encoding in {"bgr8", "bgra8"}:
+            pixels = pixels[:, :, [2, 1, 0, 3] if channels == 4 else [2, 1, 0]]
+        if channels == 4:
+            pixels = pixels[:, :, :3]
+        payload = np.ascontiguousarray(pixels).tobytes()
+        return f"P6\n{packet.width} {packet.height}\n255\n".encode("ascii") + payload, ".ppm"
 
     def _writer_loop(self) -> None:
         while not self._stop.is_set() or not self._queue.empty():
@@ -306,12 +307,12 @@ class RawCameraRecorder:
                 continue
             record = self.records[packet.source_label]
             try:
-                image = self._packet_to_image(packet)
+                image_bytes, suffix = self._packet_to_image_bytes(packet)
                 with self._lock:
                     saved_index = len(record.saved)
-                relative_path = Path("cameras") / record.dataset_name / f"frame_{saved_index:06d}.jpg"
+                relative_path = Path("cameras") / record.dataset_name / f"frame_{saved_index:06d}{suffix}"
                 output_path = self.episode_dir / relative_path
-                image.save(output_path, format="JPEG", quality=self.jpeg_quality, subsampling=0)
+                output_path.write_bytes(image_bytes)
                 with self._lock:
                     record.saved.append(
                         {
@@ -508,8 +509,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--episode-id", help="Unique episode directory name; default timestamp-based.")
     parser.add_argument("--task", default="rabo_act_pipeline_smoke_test", help="Task label stored in metadata.")
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
-    parser.add_argument("--queue-size", type=int, default=96, help="Bounded JPEG writer queue size.")
-    parser.add_argument("--jpeg-quality", type=int, default=90)
+    parser.add_argument("--queue-size", type=int, default=96, help="Bounded image writer queue size.")
     parser.add_argument("--no-archive", action="store_true", help="Keep the folder but do not make tar.gz.")
     return parser
 
@@ -518,8 +518,8 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.duration <= 0 or args.fps <= 0 or args.start_delay < 0:
         raise SystemExit("duration/fps must be > 0 and start-delay must be >= 0")
-    if args.queue_size <= 0 or not 1 <= args.jpeg_quality <= 100:
-        raise SystemExit("queue-size must be > 0 and jpeg-quality must be in [1,100]")
+    if args.queue_size <= 0:
+        raise SystemExit("queue-size must be > 0")
 
     episode_id = args.episode_id or f"episode_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     output_root = args.output_root if args.output_root.is_absolute() else PROJECT_ROOT / args.output_root
@@ -540,7 +540,6 @@ def main(argv: list[str] | None = None) -> int:
         camera_topics,
         episode_dir,
         queue_size=args.queue_size,
-        jpeg_quality=args.jpeg_quality,
     )
     devices: dict[str, Any] = {}
     state_samples: list[dict[str, Any]] = []

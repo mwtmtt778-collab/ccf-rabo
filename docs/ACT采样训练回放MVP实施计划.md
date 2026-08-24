@@ -24,7 +24,7 @@ Rabo 端只生成便于可靠打包下载的“原始 Episode 包”，不直接
 
 ```text
 Rabo /home/.../agent_system/outputs/act_samples/
-  原始 Episode（状态 NPZ + JPEG + 时间戳 + metadata）
+  原始 Episode（状态 NPZ + PPM/PGM 或原始压缩图 + 时间戳 + metadata）
                     ↓ 打包下载
 本机 /home/liyi/ccf_act_baseline/data/rabo_raw/
   原始包解压与完整性检查
@@ -79,7 +79,7 @@ outputs/act_samples/<episode_id>.tar.gz
 ├── quality_report.json
 └── cameras/
     ├── cam_top/
-    │   ├── frame_000000.jpg
+    │   ├── frame_000000.ppm
     │   ├── ros_timestamps.npy
     │   └── arrival_times_s.npy
     ├── cam_left_wrist/
@@ -163,7 +163,7 @@ outputs/act_samples/<episode_id>.tar.gz
 /home/liyi/ccf_act_baseline/data/rabo_raw/<episode_id>/
 ```
 
-本地验证必须先检查 archive、metadata、NPZ shape、数值有限性、三路图片解码和时间戳单调，再允许转换。
+本地验证必须先检查 archive、metadata、NPZ shape、数值有限性、三路图片解码和时间戳单调，再允许转换。Rabo 原始 `rgb8/bgr8` 图像使用无需额外依赖的 PPM 保存；若 ROS 话题本身提供 JPEG/PNG 压缩图则保留原格式。
 
 ## 6. 阶段 C：转换为 LeRobotDataset v3
 
