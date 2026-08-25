@@ -5,5 +5,13 @@
   "orientation_error_threshold_deg": 15.0,
   "target_joint_jump_threshold_rad": 1.0,
   "target_position_jump_threshold_m": 0.25,
-  "target_orientation_jump_threshold_deg": 45.0
+  "target_orientation_jump_threshold_deg": 45.0,
+  "actual_joint_jump_threshold_rad": 0.35,
+  "divergence_growth_threshold_rad": 0.10,
+  "recent_history_s": 2.0,
+  "action_timeout_s": 10.0,
+  "ready_joint_error_threshold_rad": 0.10,
+  "ready_stability_delta_threshold_rad": 0.02,
+  "ready_sample_count": 3,
+  "ready_sample_interval_s": 0.2
 }

@@ -31,6 +31,14 @@ DEFAULT_CONFIG: dict[str, float] = {
     "target_joint_jump_threshold_rad": 1.0,
     "target_position_jump_threshold_m": 0.25,
     "target_orientation_jump_threshold_deg": 45.0,
+    "actual_joint_jump_threshold_rad": 0.35,
+    "divergence_growth_threshold_rad": 0.10,
+    "recent_history_s": 2.0,
+    "action_timeout_s": 10.0,
+    "ready_joint_error_threshold_rad": 0.10,
+    "ready_stability_delta_threshold_rad": 0.02,
+    "ready_sample_count": 3.0,
+    "ready_sample_interval_s": 0.2,
 }
 
 
@@ -341,7 +349,8 @@ class MotionMonitor:
 
     def _ring_buffer_size(self) -> int:
         sample_hz = max(float(self.config.get("sample_hz", 10.0)), 0.1)
-        return max(1, int(round(sample_hz * 5.0)))
+        history_s = max(float(self.config.get("recent_history_s", 2.0)), 0.1)
+        return max(1, int(round(sample_hz * history_s)))
 
     def start_motion_monitor(
         self,
@@ -468,6 +477,9 @@ class MotionMonitor:
             "diagnosis_path": display_path(diagnosis_path),
             "failure_snapshot_path": display_path(failure_snapshot_path) if status != "COMPLETED" else "",
             "diagnosis": diagnosis["diagnosis"],
+            "diagnosis_detail": diagnosis,
+            "metrics": diagnosis["metrics"],
+            "recent_joint_history": list(self._failure_buffer),
         }
 
     def _sample_loop(self, arm: Any) -> None:
@@ -563,6 +575,14 @@ class MotionMonitor:
             (float(sample["orientation_error"]) for sample in samples if sample.get("orientation_error") is not None),
             default=None,
         )
+        final_position_error = next(
+            (float(sample["position_error"]) for sample in reversed(samples) if sample.get("position_error") is not None),
+            None,
+        )
+        final_orientation_error = next(
+            (float(sample["orientation_error"]) for sample in reversed(samples) if sample.get("orientation_error") is not None),
+            None,
+        )
         initial_joint = active.get("initial_joint")
         target_joint = active.get("target_joint")
         initial_ee_pose = active.get("initial_ee_pose")
@@ -571,6 +591,26 @@ class MotionMonitor:
         target_position_delta = euclidean_error(target_ee_pose, initial_ee_pose, 0, 3)
         target_orientation_delta = orientation_error_deg(target_ee_pose, initial_ee_pose)
         max_target_step = max_target_joint_step(samples)
+        actual_joint_samples = [
+            sample["actual_joint"] for sample in samples if isinstance(sample.get("actual_joint"), list)
+        ]
+        actual_joint_steps = [
+            max_abs_error(previous, current)
+            for previous, current in zip(actual_joint_samples, actual_joint_samples[1:])
+        ]
+        max_actual_joint_jump = max((value for value in actual_joint_steps if value is not None), default=None)
+        final_actual_joint = actual_joint_samples[-1] if actual_joint_samples else None
+        final_joint_error = max_abs_error(target_joint, final_actual_joint)
+        joint_error_series = [
+            float(sample["max_joint_error"])
+            for sample in samples
+            if sample.get("max_joint_error") is not None
+        ]
+        divergence_growth = (
+            joint_error_series[-1] - min(joint_error_series)
+            if len(joint_error_series) >= 3
+            else None
+        )
 
         joint_threshold = float(self.config["joint_error_threshold_rad"])
         position_threshold = float(self.config["position_error_threshold_m"])
@@ -578,6 +618,8 @@ class MotionMonitor:
         joint_jump_threshold = float(self.config["target_joint_jump_threshold_rad"])
         position_jump_threshold = float(self.config["target_position_jump_threshold_m"])
         orientation_jump_threshold = float(self.config["target_orientation_jump_threshold_deg"])
+        actual_joint_jump_threshold = float(self.config["actual_joint_jump_threshold_rad"])
+        divergence_growth_threshold = float(self.config["divergence_growth_threshold_rad"])
 
         sample_count = len(samples)
         samples_with_target_joint = sum(1 for sample in samples if isinstance(sample.get("target_joint"), list))
@@ -588,8 +630,15 @@ class MotionMonitor:
         suspect = ""
         diagnosis = "NORMAL"
 
-        target_joint_required = active.get("command_method") in {"move_checked", "execute_checked.move_joints"}
-        ee_required = active.get("target_ee_pose") is not None
+        target_joint_required = active.get("command_method") in {
+            "move_checked",
+            "execute_checked.move_joints",
+            "move_joints",
+            "move_to",
+        }
+        # V2's mandatory gate is joint-state based.  EE pose remains an
+        # additional diagnostic when the SDK exposes a parseable get_pose().
+        ee_required = False
         if (
             sample_count == 0
             or (target_joint_required and samples_with_target_joint == 0)
@@ -606,22 +655,41 @@ class MotionMonitor:
                 reasons.append("actual_joint missing; get_joint_angles was unavailable or unreadable")
             if ee_required and samples_with_actual_ee == 0:
                 reasons.append("actual_ee_pose missing; get_pose was unavailable or unparseable")
+        elif max_actual_joint_jump is not None and max_actual_joint_jump > actual_joint_jump_threshold:
+            diagnosis = "ACTUAL_JOINT_JUMP"
+            suspect = "controller_or_state"
+            reasons.append(
+                f"max_actual_joint_jump {max_actual_joint_jump:.4f} rad > "
+                f"{actual_joint_jump_threshold:.4f} rad"
+            )
         elif max_target_step is not None and max_target_step > joint_jump_threshold:
             diagnosis = "POSSIBLE_IK_OR_PATH_JUMP"
             suspect = "path"
             reasons.append(f"target_joint adjacent step {max_target_step:.4f} rad > {joint_jump_threshold:.4f} rad")
-        elif max_joint_error is not None and max_joint_error > joint_threshold:
+        elif (
+            divergence_growth is not None
+            and divergence_growth > divergence_growth_threshold
+            and final_joint_error is not None
+            and final_joint_error > joint_threshold
+        ):
+            diagnosis = "JOINT_DIVERGENCE"
+            suspect = "controller"
+            reasons.append(
+                f"joint error grew {divergence_growth:.4f} rad and final error "
+                f"{final_joint_error:.4f} rad exceeds {joint_threshold:.4f} rad"
+            )
+        elif final_joint_error is not None and final_joint_error > joint_threshold:
             diagnosis = "JOINT_TRACKING_ERROR"
             suspect = "controller"
-            reasons.append(f"max_joint_error {max_joint_error:.4f} rad > {joint_threshold:.4f} rad")
-        elif max_position_error is not None and max_position_error > position_threshold:
+            reasons.append(f"final_joint_error {final_joint_error:.4f} rad > {joint_threshold:.4f} rad")
+        elif final_position_error is not None and final_position_error > position_threshold:
             diagnosis = "EE_POSITION_ERROR"
             suspect = "controller_or_kinematics"
-            reasons.append(f"max_position_error {max_position_error:.4f} m > {position_threshold:.4f} m")
-        elif max_orientation_error is not None and max_orientation_error > orientation_threshold:
+            reasons.append(f"final_position_error {final_position_error:.4f} m > {position_threshold:.4f} m")
+        elif final_orientation_error is not None and final_orientation_error > orientation_threshold:
             diagnosis = "EE_ORIENTATION_ERROR"
             suspect = "controller_or_kinematics"
-            reasons.append(f"max_orientation_error {max_orientation_error:.4f} deg > {orientation_threshold:.4f} deg")
+            reasons.append(f"final_orientation_error {final_orientation_error:.4f} deg > {orientation_threshold:.4f} deg")
 
         return {
             "phase": active["phase_name"],
@@ -640,7 +708,13 @@ class MotionMonitor:
                 "max_joint_error": max_joint_error,
                 "max_position_error": max_position_error,
                 "max_orientation_error": max_orientation_error,
+                "final_position_error": final_position_error,
+                "final_orientation_error": final_orientation_error,
                 "max_target_joint_step": max_target_step,
+                "max_actual_joint_jump": max_actual_joint_jump,
+                "final_joint_error": final_joint_error,
+                "divergence_growth": divergence_growth,
+                "diverged": diagnosis == "JOINT_DIVERGENCE",
                 "target_joint_delta_from_start": target_joint_delta,
                 "target_position_delta_from_start": target_position_delta,
                 "target_orientation_delta_from_start": target_orientation_delta,
@@ -652,5 +726,50 @@ class MotionMonitor:
                 "target_joint_jump_rad": joint_jump_threshold,
                 "target_position_jump_m": position_jump_threshold,
                 "target_orientation_jump_deg": orientation_jump_threshold,
+                "actual_joint_jump_rad": actual_joint_jump_threshold,
+                "divergence_growth_rad": divergence_growth_threshold,
             },
         }
+
+
+def evaluate_motion_result(
+    monitor_result: dict[str, Any] | None,
+    *,
+    timeout: bool = False,
+    sdk_return_ok: bool = True,
+) -> dict[str, Any]:
+    """Convert the existing monitor diagnosis into a fail-closed motion gate."""
+    if monitor_result is None:
+        return {
+            "pass": False,
+            "reason": "motion_monitor_result_missing",
+            "sdk_return_ok": bool(sdk_return_ok),
+            "timeout": bool(timeout),
+            "diverged": False,
+            "max_joint_error": None,
+            "final_joint_error": None,
+            "max_joint_jump": None,
+            "diagnosis": "MONITOR_DATA_INCOMPLETE",
+        }
+    metrics = monitor_result.get("metrics") or {}
+    diagnosis = str(monitor_result.get("diagnosis") or "MONITOR_DATA_INCOMPLETE")
+    passed = bool(sdk_return_ok) and not timeout and diagnosis == "NORMAL"
+    reasons = []
+    if not sdk_return_ok:
+        reasons.append("sdk_return_failed")
+    if timeout:
+        reasons.append("action_timeout")
+    if diagnosis != "NORMAL":
+        reasons.append(diagnosis)
+    return {
+        "pass": passed,
+        "reason": "; ".join(reasons) if reasons else "normal",
+        "sdk_return_ok": bool(sdk_return_ok),
+        "timeout": bool(timeout),
+        "diverged": bool(metrics.get("diverged", diagnosis == "JOINT_DIVERGENCE")),
+        "max_joint_error": metrics.get("max_joint_error"),
+        "final_joint_error": metrics.get("final_joint_error"),
+        "max_joint_jump": metrics.get("max_actual_joint_jump"),
+        "diagnosis": diagnosis,
+        "metrics": metrics,
+    }
