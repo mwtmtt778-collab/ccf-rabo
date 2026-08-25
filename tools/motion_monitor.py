@@ -650,10 +650,6 @@ class MotionMonitor:
                 reasons.append("target_joint missing; SDK did not expose a joint target for this command")
             if samples_with_actual_joint == 0:
                 reasons.append("actual_joint missing; get_joint_angles was unavailable or unreadable")
-        elif ee_required and samples_with_actual_ee == 0:
-            diagnosis = "CARTESIAN_ENDPOINT_FEEDBACK_UNAVAILABLE"
-            suspect = "endpoint_feedback"
-            reasons.append("get_pose was unavailable or unparseable")
         elif max_actual_joint_jump is not None and max_actual_joint_jump > actual_joint_jump_threshold:
             diagnosis = "ACTUAL_JOINT_JUMP"
             suspect = "controller_or_state"
@@ -681,6 +677,10 @@ class MotionMonitor:
             diagnosis = "JOINT_TRACKING_ERROR"
             suspect = "controller"
             reasons.append(f"final_joint_error {final_joint_error:.4f} rad > {joint_threshold:.4f} rad")
+        elif ee_required and samples_with_actual_ee == 0:
+            diagnosis = "CARTESIAN_ENDPOINT_FEEDBACK_UNAVAILABLE"
+            suspect = "endpoint_feedback"
+            reasons.append("get_pose was unavailable or unparseable")
         elif final_position_error is not None and final_position_error > position_threshold:
             diagnosis = "EE_POSITION_ERROR"
             suspect = "controller_or_kinematics"
@@ -745,6 +745,7 @@ def evaluate_motion_result(
     if monitor_result is None:
         return {
             "pass": False,
+            "status": "FAULT",
             "reason": "motion_monitor_result_missing",
             "sdk_return_ok": bool(sdk_return_ok),
             "timeout": bool(timeout),
@@ -753,20 +754,48 @@ def evaluate_motion_result(
             "final_joint_error": None,
             "max_joint_jump": None,
             "diagnosis": "MONITOR_DATA_INCOMPLETE",
+            "cartesian_endpoint_feedback_available": None,
+            "endpoint_verification_status": "UNKNOWN",
         }
     metrics = monitor_result.get("metrics") or {}
     diagnosis = str(monitor_result.get("diagnosis") or "MONITOR_DATA_INCOMPLETE")
-    passed = bool(sdk_return_ok) and not timeout and diagnosis == "NORMAL"
+    endpoint_unavailable = diagnosis == "CARTESIAN_ENDPOINT_FEEDBACK_UNAVAILABLE"
+    passed = bool(sdk_return_ok) and not timeout and (diagnosis == "NORMAL" or endpoint_unavailable)
+    if passed and endpoint_unavailable:
+        status = "PASS_WITHOUT_CARTESIAN_ENDPOINT_FEEDBACK"
+    elif passed:
+        status = "PASS"
+    else:
+        status = "FAULT"
+
+    endpoint_available = metrics.get("cartesian_endpoint_feedback_available")
+    if endpoint_unavailable:
+        endpoint_verification_status = "UNAVAILABLE_NOT_FATAL"
+    elif endpoint_available is True:
+        endpoint_verification_status = "VERIFIED"
+    elif endpoint_available is False:
+        endpoint_verification_status = "NOT_APPLICABLE"
+    else:
+        endpoint_verification_status = "UNKNOWN"
     reasons = []
     if not sdk_return_ok:
         reasons.append("sdk_return_failed")
     if timeout:
         reasons.append("action_timeout")
-    if diagnosis != "NORMAL":
+    if diagnosis != "NORMAL" and not endpoint_unavailable:
         reasons.append(diagnosis)
     return {
         "pass": passed,
-        "reason": "; ".join(reasons) if reasons else "normal",
+        "status": status,
+        "reason": (
+            "; ".join(reasons)
+            if reasons
+            else (
+                "cartesian_endpoint_feedback_unavailable_not_fatal"
+                if endpoint_unavailable
+                else "normal"
+            )
+        ),
         "sdk_return_ok": bool(sdk_return_ok),
         "timeout": bool(timeout),
         "diverged": bool(metrics.get("diverged", diagnosis == "JOINT_DIVERGENCE")),
@@ -774,5 +803,7 @@ def evaluate_motion_result(
         "final_joint_error": metrics.get("final_joint_error"),
         "max_joint_jump": metrics.get("max_actual_joint_jump"),
         "diagnosis": diagnosis,
+        "cartesian_endpoint_feedback_available": endpoint_available,
+        "endpoint_verification_status": endpoint_verification_status,
         "metrics": metrics,
     }

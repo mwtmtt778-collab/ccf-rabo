@@ -9,6 +9,7 @@ import unittest
 from contextlib import redirect_stderr
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 
 import tools.test_three_nut_closed_loop_v2 as expert_v2
 from tools.motion_monitor import MotionMonitor
@@ -24,10 +25,12 @@ class MockArm:
         endpoint_offset_x: float = 0.0,
         joint_after: float = 0.10,
         move_delay_s: float = 0.0,
+        move_result: bool = True,
     ) -> None:
         self.endpoint_offset_x = endpoint_offset_x
         self.joint_after = joint_after
         self.move_delay_s = move_delay_s
+        self.move_result = move_result
         self.joints = [0.0] * 7
         self.pose = [0.0] * 6
         self.move_to_calls = 0
@@ -50,7 +53,7 @@ class MockArm:
             time.sleep(self.move_delay_s)
         self.pose = [x + self.endpoint_offset_x, y, z, roll, pitch, yaw]
         self.joints = [self.joint_after] * 7
-        return True
+        return self.move_result
 
     def move_joints(self, target: list[float]) -> bool:
         self.joints = list(target)
@@ -64,8 +67,21 @@ class MockArm:
 
 
 class MockArmWithoutPoseFeedback(MockArm):
-    def get_pose(self) -> list[float]:
-        raise RuntimeError("get_pose unavailable")
+    def get_pose(self) -> None:
+        return None
+
+
+class MockHand:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, object]]] = []
+
+    def clench(self, *_args: object, **kwargs: object) -> bool:
+        self.calls.append(("clench", dict(kwargs)))
+        return True
+
+    def grasp_force(self, **kwargs: object) -> bool:
+        self.calls.append(("grasp_force", dict(kwargs)))
+        return True
 
 
 class CartesianGateTests(unittest.TestCase):
@@ -109,26 +125,74 @@ class CartesianGateTests(unittest.TestCase):
             expert_v2.move_pose(self.runner(), arm, TARGET_POSE, "MOCK_CARTESIAN_BAD_ENDPOINT")
         self.assertEqual(caught.exception.context["motion_monitor"]["diagnosis"], "EE_POSITION_ERROR")
 
-    def test_cartesian_actual_joint_jump_faults(self) -> None:
-        arm = MockArm(joint_after=0.80)
+    def test_cartesian_actual_joint_jump_faults_even_without_endpoint_feedback(self) -> None:
+        arm = MockArmWithoutPoseFeedback(joint_after=0.80)
         with self.assertRaises(expert_v2.StateFault) as caught:
             expert_v2.move_pose(self.runner(), arm, TARGET_POSE, "MOCK_CARTESIAN_JUMP")
         self.assertEqual(caught.exception.context["motion_monitor"]["diagnosis"], "ACTUAL_JOINT_JUMP")
 
     def test_cartesian_timeout_faults_after_sdk_returns(self) -> None:
-        arm = MockArm(move_delay_s=0.03)
+        arm = MockArmWithoutPoseFeedback(move_delay_s=0.03)
         with self.assertRaises(expert_v2.StateFault) as caught:
             expert_v2.move_pose(self.runner(timeout_s=0.01), arm, TARGET_POSE, "MOCK_CARTESIAN_TIMEOUT")
         self.assertTrue(caught.exception.context["timeout"])
         self.assertTrue(caught.exception.context["sdk_returned_after_timeout"])
 
-    def test_cartesian_endpoint_feedback_unavailable_faults(self) -> None:
+    def test_cartesian_endpoint_feedback_unavailable_is_nonfatal(self) -> None:
         arm = MockArmWithoutPoseFeedback()
-        with self.assertRaises(expert_v2.StateFault) as caught:
-            expert_v2.move_pose(self.runner(), arm, TARGET_POSE, "MOCK_CARTESIAN_NO_GET_POSE")
+        result = expert_v2.move_pose(self.runner(), arm, TARGET_POSE, "MOCK_CARTESIAN_NO_GET_POSE")
+        self.assertTrue(result["gate"]["pass"])
         self.assertEqual(
-            caught.exception.context["motion_monitor"]["diagnosis"],
-            "CARTESIAN_ENDPOINT_FEEDBACK_UNAVAILABLE",
+            result["motion_gate_status"],
+            "PASS_WITHOUT_CARTESIAN_ENDPOINT_FEEDBACK",
+        )
+        self.assertFalse(result["cartesian_endpoint_feedback_available"])
+        self.assertEqual(result["endpoint_verification_status"], "UNAVAILABLE_NOT_FATAL")
+        self.assertIsNone(result["position_error_m"])
+        self.assertIsNone(result["orientation_error_deg"])
+
+    def test_cartesian_sdk_false_faults_without_endpoint_feedback(self) -> None:
+        arm = MockArmWithoutPoseFeedback(move_result=False)
+        with self.assertRaises(expert_v2.StateFault) as caught:
+            expert_v2.move_pose(self.runner(), arm, TARGET_POSE, "MOCK_CARTESIAN_SDK_FALSE")
+        self.assertIn("SDK return failed", str(caught.exception))
+
+    def test_right_pick_continues_to_thumb_tuck_without_endpoint_feedback(self) -> None:
+        arm = MockArmWithoutPoseFeedback()
+        hand = MockHand()
+        bundle = SimpleNamespace(right_arm=arm, right_hand=hand)
+        runner = self.runner()
+        original_go_right_ready = expert_v2.go_right_ready
+        original_detect = expert_v2.detect_released_nut
+        original_hold = expert_v2.DEFAULT_HOLD_AFTER_GRASP_S
+        original_release_wait = expert_v2.RIGHT_RELEASE_OPEN_WAIT_S
+        expert_v2.go_right_ready = lambda _runner, _arm: None
+        expert_v2.detect_released_nut = lambda *_args, **_kwargs: {
+            "detected": True,
+            "nut_world_xyz": [0.1, 0.2, 0.3],
+        }
+        expert_v2.DEFAULT_HOLD_AFTER_GRASP_S = 0.0
+        expert_v2.RIGHT_RELEASE_OPEN_WAIT_S = 0.0
+        try:
+            expert_v2.execute_right_transfer(
+                runner,
+                "B",
+                bundle,
+                vision_radius_m=0.1,
+                settle_after_release_s=0.0,
+            )
+        finally:
+            expert_v2.go_right_ready = original_go_right_ready
+            expert_v2.detect_released_nut = original_detect
+            expert_v2.DEFAULT_HOLD_AFTER_GRASP_S = original_hold
+            expert_v2.RIGHT_RELEASE_OPEN_WAIT_S = original_release_wait
+        self.assertGreaterEqual(len(hand.calls), 2)
+        self.assertEqual(hand.calls[0], ("clench", {"thumb_rotation": 1.0}))
+        self.assertEqual(hand.calls[1][0], "grasp_force")
+        right_grasp = next(row for row in runner.states if row["state"] == "RIGHT_GRASP")
+        self.assertEqual(
+            right_grasp["details"]["move"]["motion_gate_status"],
+            "PASS_WITHOUT_CARTESIAN_ENDPOINT_FEEDBACK",
         )
 
     def test_move_joints_gate_regression_passes(self) -> None:

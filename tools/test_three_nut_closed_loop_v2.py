@@ -220,6 +220,9 @@ class ExpertStateRunner:
             "pose_check_reachable": context.get("pose_check_reachable"),
             "pose_check_target_joint_available": context.get("pose_check_target_joint_available"),
             "joint_target_based_divergence_available": context.get("joint_target_based_divergence_available"),
+            "cartesian_endpoint_feedback_available": context.get("cartesian_endpoint_feedback_available"),
+            "endpoint_verification_status": context.get("endpoint_verification_status"),
+            "motion_gate_status": context.get("motion_gate_status"),
             "actual_ee_pose": context.get("actual_ee_pose"),
             "position_error_m": context.get("position_error_m"),
             "orientation_error_deg": context.get("orientation_error_deg"),
@@ -335,6 +338,11 @@ class ExpertStateRunner:
                 "joint_target_based_divergence_available",
                 target_joint is not None,
             ),
+            "cartesian_endpoint_feedback_available": gate.get(
+                "cartesian_endpoint_feedback_available"
+            ),
+            "endpoint_verification_status": gate.get("endpoint_verification_status"),
+            "motion_gate_status": gate.get("status"),
             "actual_ee_pose": metrics.get("final_actual_ee_pose"),
             "position_error_m": metrics.get("final_position_error"),
             "orientation_error_deg": metrics.get("final_orientation_error"),
@@ -343,6 +351,12 @@ class ExpertStateRunner:
             raise self.fault(command_exc, context)
         if not gate["pass"]:
             raise self.fault(ThreeNutClosedLoopError(f"{label}: motion gate failed: {gate['reason']}"), context)
+        if gate.get("status") == "PASS_WITHOUT_CARTESIAN_ENDPOINT_FEEDBACK":
+            print(
+                f"[MOTION_GATE] {label}: PASS_WITHOUT_CARTESIAN_ENDPOINT_FEEDBACK "
+                "(get_pose unavailable/unparseable; diagnostic only)",
+                flush=True,
+            )
         return context
 
     def hand_action(self, *, label: str, fn: Callable[[], Any], command_method: str) -> Any:
@@ -506,12 +520,16 @@ def execute_right_transfer(
 
     runner.enter("RIGHT_GRASP", nut=key)
     grasp_pose = RIGHT_GRASP_POSES[key]
-    move_pose(runner, right_bundle.right_arm, grasp_pose, f"RIGHT_PICK_{key}")
+    pick_move = move_pose(runner, right_bundle.right_arm, grasp_pose, f"RIGHT_PICK_{key}")
     runner.hand_action(label="RIGHT_THUMB_TUCK", command_method="right_hand.clench", fn=lambda: right_bundle.right_hand.clench(thumb_rotation=1.0))
     runner.hand_action(label="RIGHT_GRASP_FORCE", command_method="right_hand.grasp_force", fn=lambda: right_bundle.right_hand.grasp_force(**RIGHT_GRASP_FORCE))
     if DEFAULT_HOLD_AFTER_GRASP_S > 0:
         time.sleep(DEFAULT_HOLD_AFTER_GRASP_S)
-    runner.pass_state({"grasp_pose": pose_to_list(grasp_pose), "source": RIGHT_GRASP_POSE_SOURCES[key]})
+    runner.pass_state({
+        "grasp_pose": pose_to_list(grasp_pose),
+        "source": RIGHT_GRASP_POSE_SOURCES[key],
+        "move": pick_move,
+    })
 
     runner.enter("RIGHT_LIFT")
     lifts = [move_pose(runner, right_bundle.right_arm, pose, f"RIGHT_LIFT_{index}") for index, pose in enumerate(RIGHT_LIFT_POSES, 1)]
