@@ -639,17 +639,52 @@ def execute_left_pick_place(
             "target_pose": preflight.get("failed_pose"),
         })
 
-    runner.enter("LEFT_GRASP")
+    runner.enter("LEFT_APPROACH")
     runner.hand_action(label="LEFT_OPEN", command_method="left_hand.open/clench", fn=lambda: left_bundle.left_hand.open() if hasattr(left_bundle.left_hand, "open") else left_bundle.left_hand.clench(list(HAND_OPEN)))
     approach_rows = []
     for item in plan["path"]:
-        if item["stage"].startswith("LIFT_"):
+        if item["stage"] not in {"SAFE_HIGH", "PREGRASP"}:
             continue
         approach_rows.append(move_pose(runner, left_bundle.left_arm, item["pose"], f"LEFT_{item['stage']}"))
-    runner.hand_action(label="LEFT_THUMB_TUCK", command_method="left_hand.clench", fn=lambda: left_bundle.left_hand.clench(thumb_rotation=1.0))
+    runner.pass_state({"pregrasp_pose": plan["pregrasp_pose"], "moves": approach_rows})
+
+    runner.enter("LEFT_THUMB_TUCK", nut=key)
+    thumb_tuck_result = runner.hand_action(
+        label="LEFT_THUMB_TUCK",
+        command_method="left_hand.clench",
+        fn=lambda: left_bundle.left_hand.clench(thumb_rotation=1.0),
+    )
     time.sleep(0.7)
-    runner.hand_action(label="LEFT_GRASP_FORCE", command_method="left_hand.grasp_force", fn=lambda: left_bundle.left_hand.grasp_force(**planner.config.grasp_force))
-    runner.pass_state({"grasp_pose": plan["grasp_pose"], "moves": approach_rows})
+    runner.pass_state({
+        "command": "left_hand.clench",
+        "thumb_rotation": 1.0,
+        "sdk_return": jsonable(thumb_tuck_result),
+    })
+
+    runner.enter("LEFT_DESCENT", nut=key)
+    descent_rows = [
+        move_pose(runner, left_bundle.left_arm, item["pose"], f"LEFT_{item['stage']}")
+        for item in plan["path"]
+        if item["stage"].startswith("DESCENT_")
+    ]
+    runner.pass_state({"moves": descent_rows})
+
+    runner.enter("LEFT_GRASP", nut=key)
+    grasp_item = next(item for item in plan["path"] if item["stage"] == "GRASP")
+    grasp_move = move_pose(runner, left_bundle.left_arm, grasp_item["pose"], "LEFT_GRASP")
+    runner.pass_state({"grasp_pose": plan["grasp_pose"], "move": grasp_move})
+
+    runner.enter("LEFT_GRASP_FORCE", nut=key)
+    grasp_force_result = runner.hand_action(
+        label="LEFT_GRASP_FORCE",
+        command_method="left_hand.grasp_force",
+        fn=lambda: left_bundle.left_hand.grasp_force(**planner.config.grasp_force),
+    )
+    runner.pass_state({
+        "command": "left_hand.grasp_force",
+        "target": dict(planner.config.grasp_force),
+        "sdk_return": jsonable(grasp_force_result),
+    })
 
     runner.enter("LEFT_SAFE_LIFT")
     time.sleep(0.5)
@@ -755,7 +790,8 @@ def plan_summary(sequence: tuple[str, ...], reset_to_nominal: bool) -> dict[str,
     per_nut = [
         "RIGHT_APPROACH", "RIGHT_THUMB_TUCK", "RIGHT_GRASP", "RIGHT_GRASP_FORCE", "RIGHT_LIFT",
         "RIGHT_RELEASE", "RIGHT_SAFE_RETREAT", "RIGHT_READY", "RIGHT_READY_CHECK",
-        "LEFT_VISION", "LEFT_GRASP", "LEFT_SAFE_LIFT",
+        "LEFT_VISION", "LEFT_APPROACH", "LEFT_THUMB_TUCK", "LEFT_DESCENT",
+        "LEFT_GRASP", "LEFT_GRASP_FORCE", "LEFT_SAFE_LIFT",
         "LEFT_PLACE", "LEFT_SAFE_RETREAT", "LEFT_READY", "LEFT_READY_CHECK",
     ]
     return {

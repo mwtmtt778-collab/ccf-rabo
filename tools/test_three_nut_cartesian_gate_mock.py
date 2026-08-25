@@ -12,6 +12,7 @@ from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 
+import expert.left_nut_grasp_planner as left_planner_module
 import tools.test_three_nut_closed_loop_v2 as expert_v2
 from agents.three_nut_expert.config import (
     KNOWN_FIXED_NUT_WORLD_POSE,
@@ -25,6 +26,7 @@ from agents.three_nut_expert.expert import (
     compute_right_grasp_pose,
     pose_to_list,
 )
+from expert.left_nut_grasp_planner import LeftNutGraspPlanner
 from tools.test_left_grasp_v1 import RIGHT_NUT_B_GRASP_POSE
 from tools.motion_monitor import MotionMonitor
 
@@ -157,6 +159,23 @@ class MockHand:
     def grasp_force(self, **kwargs: object) -> bool:
         self.calls.append(("grasp_force", dict(kwargs)))
         return True
+
+
+class TrackingLeftHand(MockHand):
+    def __init__(self, arm: MockArm) -> None:
+        super().__init__()
+        self.arm = arm
+        self.thumb_tuck_move_count: int | None = None
+        self.grasp_force_move_count: int | None = None
+
+    def clench(self, *_args: object, **kwargs: object) -> bool:
+        if kwargs.get("thumb_rotation") == 1.0:
+            self.thumb_tuck_move_count = self.arm.move_to_calls
+        return super().clench(*_args, **kwargs)
+
+    def grasp_force(self, **kwargs: object) -> bool:
+        self.grasp_force_move_count = self.arm.move_to_calls
+        return super().grasp_force(**kwargs)
 
 
 class CartesianGateTests(unittest.TestCase):
@@ -304,6 +323,44 @@ class CartesianGateTests(unittest.TestCase):
         source = inspect.getsource(expert_v2.execute_left_pick_place)
         self.assertEqual(source.count("go_left_ready("), 1)
         self.assertGreater(source.index("go_left_ready("), source.index('runner.enter("LEFT_SAFE_RETREAT")'))
+
+    def test_left_planner_tucks_after_pregrasp_before_descent(self) -> None:
+        arm = MockArm()
+        hand = TrackingLeftHand(arm)
+        planner = LeftNutGraspPlanner(left_arm=arm, left_hand=hand)
+        plan = planner.build_plan([0.1, 0.2, 0.3])
+        original_sleep = left_planner_module.time.sleep
+        left_planner_module.time.sleep = lambda _seconds: None
+        try:
+            result = planner.execute(plan)
+        finally:
+            left_planner_module.time.sleep = original_sleep
+        self.assertTrue(result["success"])
+        self.assertEqual(hand.thumb_tuck_move_count, 2)
+        self.assertEqual(hand.grasp_force_move_count, 7)
+
+    def test_left_v2_reports_safe_thumb_tuck_sequence(self) -> None:
+        arm = MockArm()
+        hand = MockHand()
+        bundle = SimpleNamespace(left_arm=arm, left_hand=hand)
+        runner = self.runner()
+        original_go_left_ready = expert_v2.go_left_ready
+        original_sleep = expert_v2.time.sleep
+        ready_calls = []
+        expert_v2.go_left_ready = lambda _runner, _arm: ready_calls.append("LEFT_READY")
+        expert_v2.time.sleep = lambda _seconds: None
+        try:
+            expert_v2.execute_left_pick_place(runner, "C", bundle, [0.1, 0.2, 0.3])
+        finally:
+            expert_v2.go_left_ready = original_go_left_ready
+            expert_v2.time.sleep = original_sleep
+        state_names = [row["state"] for row in runner.states]
+        approach_index = state_names.index("LEFT_APPROACH")
+        self.assertEqual(
+            state_names[approach_index:approach_index + 6],
+            ["LEFT_APPROACH", "LEFT_THUMB_TUCK", "LEFT_DESCENT", "LEFT_GRASP", "LEFT_GRASP_FORCE", "LEFT_SAFE_LIFT"],
+        )
+        self.assertEqual(ready_calls, ["LEFT_READY"])
 
     def test_move_joints_gate_regression_passes(self) -> None:
         arm = MockArm()

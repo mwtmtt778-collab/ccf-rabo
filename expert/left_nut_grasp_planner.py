@@ -310,23 +310,30 @@ class LeftNutGraspPlanner:
         failed, reason = result_failed(result)
         return {"method": method, "return_value": jsonable(result), "success": not failed, "reason": reason}
 
-    def execute_grasp_action(self) -> dict[str, Any]:
+    def execute_thumb_tuck(self) -> dict[str, Any]:
         clench_result = self.left_hand.clench(thumb_rotation=1.0)
         clench_failed, clench_reason = result_failed(clench_result)
         time.sleep(0.7)
-        force_result = None
-        force_failed = False
-        force_reason = ""
-        if not clench_failed:
-            force_result = self.left_hand.grasp_force(
-                strength=self.config.grasp_force["strength"],
-                fingers=self.config.grasp_force["fingers"],
-            )
-            force_failed, force_reason = result_failed(force_result)
         return {
-            "thumb_tuck": {"method": "clench", "kwargs": {"thumb_rotation": 1.0}, "return_value": jsonable(clench_result), "success": not clench_failed, "reason": clench_reason},
-            "grasp_force": {"method": "grasp_force", "kwargs": dict(self.config.grasp_force), "return_value": jsonable(force_result), "success": not force_failed, "reason": force_reason},
-            "success": (not clench_failed) and (not force_failed),
+            "method": "clench",
+            "kwargs": {"thumb_rotation": 1.0},
+            "return_value": jsonable(clench_result),
+            "success": not clench_failed,
+            "reason": clench_reason,
+        }
+
+    def execute_grasp_force(self) -> dict[str, Any]:
+        force_result = self.left_hand.grasp_force(
+            strength=self.config.grasp_force["strength"],
+            fingers=self.config.grasp_force["fingers"],
+        )
+        force_failed, force_reason = result_failed(force_result)
+        return {
+            "method": "grasp_force",
+            "kwargs": dict(self.config.grasp_force),
+            "return_value": jsonable(force_result),
+            "success": not force_failed,
+            "reason": force_reason,
         }
 
     def execute(self, plan: dict[str, Any]) -> dict[str, Any]:
@@ -365,12 +372,20 @@ class LeftNutGraspPlanner:
                 result["failed_stage"] = item["stage"]
                 result["reason"] = row["reason"]
                 return result
+            if item["stage"] == "PREGRASP":
+                thumb_tuck = self.execute_thumb_tuck()
+                result["grasp_action"]["thumb_tuck"] = thumb_tuck
+                if not thumb_tuck["success"]:
+                    result["failed_stage"] = "LEFT_THUMB_TUCK"
+                    result["reason"] = thumb_tuck
+                    return result
 
-        grasp_action = self.execute_grasp_action()
-        result["grasp_action"] = grasp_action
-        if not grasp_action["success"]:
-            result["failed_stage"] = "GRASP_ACTION"
-            result["reason"] = grasp_action
+        grasp_force = self.execute_grasp_force()
+        result["grasp_action"]["grasp_force"] = grasp_force
+        result["grasp_action"]["success"] = grasp_force["success"]
+        if not grasp_force["success"]:
+            result["failed_stage"] = "LEFT_GRASP_FORCE"
+            result["reason"] = grasp_force
             return result
 
         time.sleep(0.5)
