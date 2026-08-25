@@ -3,17 +3,18 @@
 
 from __future__ import annotations
 
+import inspect
 import tempfile
 import time
 import unittest
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 
 import tools.test_three_nut_closed_loop_v2 as expert_v2
 from agents.three_nut_expert.config import (
-    NUT_SPECS,
+    KNOWN_FIXED_NUT_WORLD_POSE,
     RIGHT_APPROACH_HEIGHT,
     RIGHT_ARM_BASE_WORLD_Z,
     RIGHT_ARM_BASE_XY,
@@ -37,11 +38,11 @@ def grasp_base_to_ideal_world_xyz(pose: object) -> list[float]:
 
 class RightGraspTemplateTests(unittest.TestCase):
     def setUp(self) -> None:
-        b = NUT_SPECS["B"].nominal_pose
+        b = KNOWN_FIXED_NUT_WORLD_POSE["B"]
         self.b_xyz = [b.x, b.y, b.z]
         self.b_grasp = compute_right_grasp_pose(self.b_xyz)
 
-    def test_b_nominal_reproduces_verified_pose(self) -> None:
+    def test_b_fixed_scene_pose_reproduces_verified_grasp(self) -> None:
         for actual, expected in zip(pose_to_list(self.b_grasp), pose_to_list(RIGHT_NUT_B_GRASP_POSE)):
             self.assertAlmostEqual(actual, expected, places=9)
 
@@ -67,6 +68,20 @@ class RightGraspTemplateTests(unittest.TestCase):
             [self.b_grasp.x, self.b_grasp.y, self.b_grasp.roll, self.b_grasp.pitch, self.b_grasp.yaw],
         )
         self.assertAlmostEqual(approach.z - self.b_grasp.z, RIGHT_APPROACH_HEIGHT, places=9)
+
+    def test_all_verified_fixed_scene_targets(self) -> None:
+        expected = {
+            "A": [-0.3930, 0.0859, -0.3291, 0.0, 0.8, 0.0],
+            "B": [-0.2803, 0.1570, -0.3300, 0.0, 0.8, 0.0],
+            "C": [-0.3241, 0.0387, -0.3238, 0.0, 0.8, 0.0],
+        }
+        for key, fixed_pose in KNOWN_FIXED_NUT_WORLD_POSE.items():
+            xyz = [fixed_pose.x, fixed_pose.y, fixed_pose.z]
+            grasp = compute_right_grasp_pose(xyz)
+            approach = compute_right_approach_pose(grasp)
+            for actual, wanted in zip(pose_to_list(grasp), expected[key]):
+                self.assertAlmostEqual(actual, wanted, places=9)
+            self.assertAlmostEqual(approach.z - grasp.z, 0.10, places=9)
 
 
 class MockArm:
@@ -212,12 +227,17 @@ class CartesianGateTests(unittest.TestCase):
         arm = MockArmWithoutPoseFeedback()
         hand = MockHand()
         bundle = SimpleNamespace(right_arm=arm, right_hand=hand)
-        runner = self.runner()
+        monitor = MotionMonitor(enabled=True, output_root=self.root / "motion")
+        runner = expert_v2.ExpertStateRunner(1, monitor, self.root / "report.json")
+        for state in ("EPISODE_INIT", "RIGHT_READY", "LEFT_READY", "READY_CHECK"):
+            runner.enter(state, nut="C" if state == "READY_CHECK" else None)
+            runner.pass_state({"mock": True})
         original_go_right_ready = expert_v2.go_right_ready
         original_detect = expert_v2.detect_released_nut
         original_hold = expert_v2.DEFAULT_HOLD_AFTER_GRASP_S
         original_release_wait = expert_v2.RIGHT_RELEASE_OPEN_WAIT_S
-        expert_v2.go_right_ready = lambda _runner, _arm: None
+        ready_calls = []
+        expert_v2.go_right_ready = lambda _runner, _arm: ready_calls.append("RIGHT_READY")
         expert_v2.detect_released_nut = lambda *_args, **_kwargs: {
             "detected": True,
             "nut_world_xyz": [0.1, 0.2, 0.3],
@@ -225,30 +245,45 @@ class CartesianGateTests(unittest.TestCase):
         expert_v2.DEFAULT_HOLD_AFTER_GRASP_S = 0.0
         expert_v2.RIGHT_RELEASE_OPEN_WAIT_S = 0.0
         try:
-            expert_v2.execute_right_transfer(
-                runner,
-                "B",
-                bundle,
-                actual_nut_world_xyz=[-0.3413, -0.1710, 0.2806],
-                nut_xyz_source="unit test",
-                vision_radius_m=0.1,
-                settle_after_release_s=0.0,
-            )
+            output = StringIO()
+            with redirect_stdout(output):
+                expert_v2.execute_right_transfer(
+                    runner,
+                    "C",
+                    bundle,
+                    runtime_nut_world_xyz=[-0.2975, -0.0527, 0.2868],
+                    nut_xyz_source="VERIFIED_SCENE_FIXED_POSE",
+                    vision_radius_m=0.1,
+                    settle_after_release_s=0.0,
+                )
         finally:
             expert_v2.go_right_ready = original_go_right_ready
             expert_v2.detect_released_nut = original_detect
             expert_v2.DEFAULT_HOLD_AFTER_GRASP_S = original_hold
             expert_v2.RIGHT_RELEASE_OPEN_WAIT_S = original_release_wait
         self.assertGreaterEqual(len(hand.calls), 2)
+        self.assertEqual(ready_calls, ["RIGHT_READY"])
+        trace = output.getvalue()
+        self.assertIn("[NUT_RUNTIME_TARGET]", trace)
+        self.assertIn("RIGHT_APPROACH_C =", trace)
+        self.assertIn("RIGHT_PICK_C =", trace)
         self.assertEqual(hand.calls[0], ("clench", {"thumb_rotation": 1.0}))
         self.assertEqual(hand.calls[1][0], "grasp_force")
         right_grasp = next(row for row in runner.states if row["state"] == "RIGHT_GRASP")
         right_approach = next(row for row in runner.states if row["state"] == "RIGHT_APPROACH")
         self.assertEqual(right_approach["status"], "STATE_PASS")
+        state_names = [row["state"] for row in runner.states]
+        ready_check_index = state_names.index("READY_CHECK")
+        self.assertEqual(state_names[ready_check_index + 1], "RIGHT_APPROACH")
         self.assertEqual(
             right_grasp["details"]["move"]["motion_gate_status"],
             "PASS_WITHOUT_CARTESIAN_ENDPOINT_FEEDBACK",
         )
+
+    def test_left_pick_has_no_entry_ready_repeat(self) -> None:
+        source = inspect.getsource(expert_v2.execute_left_pick_place)
+        self.assertEqual(source.count("go_left_ready("), 1)
+        self.assertGreater(source.index("go_left_ready("), source.index('runner.enter("LEFT_SAFE_RETREAT")'))
 
     def test_move_joints_gate_regression_passes(self) -> None:
         arm = MockArm()

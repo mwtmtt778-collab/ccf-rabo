@@ -48,12 +48,24 @@ class NutSpec:
     jitter_xy: float = 0.02
 
 
-# B is copied from the successful legacy demo. A/C are nearby staged poses for
-# isolated validation, not yet competition-proven.
+# Current Rabo scene object poses, manually verified in the UI property panel.
+KNOWN_FIXED_NUT_WORLD_POSE_STATUS = "VERIFIED_SCENE_FIXED_POSE"
+KNOWN_FIXED_NUT_WORLD_POSE = {
+    "A": Pose6(-0.2286, -0.0999, 0.2815, 0.0, 0.0, 0.5233),
+    "B": Pose6(-0.3413, -0.1710, 0.2806, 0.0, 0.0, 0.5233),
+    "C": Pose6(-0.2975, -0.0527, 0.2868, 0.0, 0.0, 0.5233),
+}
+
+# Historical staged A/C coordinates. Never use these as current-scene targets.
+OBSOLETE_STAGED_NUT_WORLD_POSE_STATUS = "OBSOLETE_STAGED_INCORRECT_FOR_CURRENT_SCENE"
+OBSOLETE_STAGED_NUT_WORLD_POSE = {
+    "A": Pose6(-0.3413, -0.2310, 0.2806, 0.0, 0.0, 0.5233),
+    "C": Pose6(-0.3413, -0.1110, 0.2806, 0.0, 0.0, 0.5233),
+}
+
 NUT_SPECS = {
-    "A": NutSpec("A", NUT_IDS["A"], Pose6(-0.3413, -0.2310, 0.2806, 0.0, 0.0, 0.5233)),
-    "B": NutSpec("B", NUT_IDS["B"], Pose6(-0.3413, -0.1710, 0.2806, 0.0, 0.0, 0.5233)),
-    "C": NutSpec("C", NUT_IDS["C"], Pose6(-0.3413, -0.1110, 0.2806, 0.0, 0.0, 0.5233)),
+    key: NutSpec(key, NUT_IDS[key], pose)
+    for key, pose in KNOWN_FIXED_NUT_WORLD_POSE.items()
 }
 
 # Legacy right arm base in table/world x-y convention.
