@@ -40,6 +40,7 @@ from expert.left_nut_grasp_planner import (  # noqa: E402
     SAFE_HIGH_POSE,
     LeftNutGraspPlanner,
     jsonable,
+    normalize_pose_check,
     result_failed,
 )
 from tools.motion_monitor import (  # noqa: E402
@@ -131,15 +132,30 @@ def validate_static_contract(sequence: tuple[str, ...]) -> None:
             raise ThreeNutClosedLoopError(f"incomplete static contract for Nut {key}")
 
 
-def pose_check_joint(arm: Any, pose: list[float]) -> tuple[list[float] | None, dict[str, Any]]:
+def pose_check_cartesian(arm: Any, pose: list[float]) -> tuple[list[float] | None, dict[str, Any]]:
     if not hasattr(arm, "pose_check"):
-        return None, {"ok": False, "reason": "pose_check unavailable"}
+        return None, {
+            "pose_check_reachable": False,
+            "pose_check_target_joint_available": False,
+            "reason": "pose_check unavailable",
+        }
     try:
         raw = arm.pose_check(*pose[:3], roll=pose[3], pitch=pose[4], yaw=pose[5])
     except Exception as exc:
-        return None, {"ok": False, "reason": repr(exc)}
+        return None, {
+            "pose_check_reachable": False,
+            "pose_check_target_joint_available": False,
+            "reason": repr(exc),
+        }
+    status, reason, normalized = normalize_pose_check(raw)
     target = extract_joint_target(raw)
-    return target, {"ok": target is not None, "raw": jsonable(raw)}
+    return target, {
+        "pose_check_reachable": status == "PASS",
+        "pose_check_status": status,
+        "pose_check_reason": reason,
+        "pose_check_target_joint_available": target is not None,
+        "raw": normalized,
+    }
 
 
 def sdk_failed(value: Any) -> tuple[bool, str]:
@@ -201,6 +217,12 @@ class ExpertStateRunner:
             "timeout": bool(context.get("timeout", False)),
             "sdk_returned_after_timeout": context.get("sdk_returned_after_timeout", False),
             "motion_monitor": context.get("motion_monitor", {}),
+            "pose_check_reachable": context.get("pose_check_reachable"),
+            "pose_check_target_joint_available": context.get("pose_check_target_joint_available"),
+            "joint_target_based_divergence_available": context.get("joint_target_based_divergence_available"),
+            "actual_ee_pose": context.get("actual_ee_pose"),
+            "position_error_m": context.get("position_error_m"),
+            "orientation_error_deg": context.get("orientation_error_deg"),
             "exception": repr(exc),
             "last_success_state": self.last_success_state,
             "status": "FAULT",
@@ -231,6 +253,7 @@ class ExpertStateRunner:
         fn: Callable[[], Any],
         target_joint: list[float] | None = None,
         target_pose: list[float] | None = None,
+        pose_check: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         before, before_error = read_joint_method(arm, ("get_joint_angles", "get_joints", "get_qpos"))
         start_text = now_text(True)
@@ -283,6 +306,7 @@ class ExpertStateRunner:
             timeout=timed_out,
             sdk_return_ok=command_exc is None,
         )
+        metrics = gate.get("metrics") or {}
         context = {
             "command_method": command_method,
             "command_label": label,
@@ -304,6 +328,16 @@ class ExpertStateRunner:
             "motion_monitor": monitor_result or {},
             "gate": gate,
             "sdk_return": jsonable(value),
+            "pose_check": pose_check or {},
+            "pose_check_reachable": (pose_check or {}).get("pose_check_reachable"),
+            "pose_check_target_joint_available": (pose_check or {}).get("pose_check_target_joint_available"),
+            "joint_target_based_divergence_available": metrics.get(
+                "joint_target_based_divergence_available",
+                target_joint is not None,
+            ),
+            "actual_ee_pose": metrics.get("final_actual_ee_pose"),
+            "position_error_m": metrics.get("final_position_error"),
+            "orientation_error_deg": metrics.get("final_orientation_error"),
         }
         if command_exc is not None:
             raise self.fault(command_exc, context)
@@ -418,11 +452,14 @@ def move_pose(
     label: str,
 ) -> dict[str, Any]:
     values = pose_to_list(pose) if isinstance(pose, Pose6) else [float(v) for v in pose]
-    target_joint, pose_check = pose_check_joint(arm, values)
-    if target_joint is None:
-        raise runner.fault(ThreeNutClosedLoopError(f"{label}: pose_check did not expose target joints"), {
+    target_joint, pose_check = pose_check_cartesian(arm, values)
+    if not pose_check["pose_check_reachable"]:
+        raise runner.fault(ThreeNutClosedLoopError(f"{label}: Cartesian pose_check failed: {pose_check['pose_check_reason']}"), {
             "command_method": "pose_check",
             "target_pose": values,
+            "target_joint": target_joint,
+            "pose_check_reachable": False,
+            "pose_check_target_joint_available": target_joint is not None,
             "motion_monitor": {"pose_check": pose_check},
         })
     return runner.arm_action(
@@ -431,6 +468,7 @@ def move_pose(
         command_method="move_to",
         target_joint=target_joint,
         target_pose=values,
+        pose_check=pose_check,
         fn=lambda: arm.move_to(*values[:3], roll=values[3], pitch=values[4], yaw=values[5]),
     )
 
@@ -562,9 +600,10 @@ def execute_left_pick_place(
     go_left_ready(runner, left_bundle.left_arm)
 
 
-def reset_episode_nuts(pose_setter: Any) -> list[dict[str, Any]]:
+def reset_nuts_to_nominal(pose_setter: Any) -> list[dict[str, Any]]:
+    """Deterministically place A/B/C at config nominal poses; never jitter."""
     rows = []
-    for key in NUT_SEQUENCE:
+    for key in ("A", "B", "C"):
         pose = pose_to_list(NUT_SPECS[key].nominal_pose)
         result = set_pose_with_retry(pose_setter, NUT_IDS[key], pose)
         if not result.get("ok"):
@@ -641,7 +680,7 @@ def run_left_ready_test(args: argparse.Namespace) -> int:
     return return_code
 
 
-def plan_summary(sequence: tuple[str, ...], reset_each_nut: bool) -> dict[str, Any]:
+def plan_summary(sequence: tuple[str, ...], reset_to_nominal: bool) -> dict[str, Any]:
     per_nut = [
         "RIGHT_READY", "RIGHT_READY_CHECK", "RIGHT_VISION", "RIGHT_GRASP", "RIGHT_LIFT",
         "RIGHT_RELEASE", "RIGHT_SAFE_RETREAT", "RIGHT_READY", "RIGHT_READY_CHECK",
@@ -651,7 +690,14 @@ def plan_summary(sequence: tuple[str, ...], reset_each_nut: bool) -> dict[str, A
     return {
         "status": "PLAN_ONLY_NO_RABO_SDK",
         "sequence": list(sequence),
-        "episode_init": "SetEntityPose Nut A/B/C before recording" if not reset_each_nut else "testing option: SetEntityPose immediately before each Nut",
+        "use_scene_initial_pose": not reset_to_nominal,
+        "randomize_nuts": False,
+        "set_entity_pose_on_episode_init": reset_to_nominal,
+        "episode_init": (
+            "deterministic SetEntityPose A/B/C to CURRENT_CONFIG_NOMINAL_POSES"
+            if reset_to_nominal
+            else "use Rabo scene initial state; no SetEntityPose"
+        ),
         "initial_ready": ["RIGHT_READY", "RIGHT_READY_CHECK", "LEFT_READY", "LEFT_READY_CHECK"],
         "per_nut_template": per_nut,
         "final": ["RIGHT_READY", "RIGHT_READY_CHECK", "LEFT_READY", "LEFT_READY_CHECK", "DONE"],
@@ -663,7 +709,7 @@ def run(args: argparse.Namespace) -> int:
     sequence = parse_sequence_arg(args.sequence)
     validate_static_contract(sequence)
     if args.plan_only:
-        print(json.dumps(plan_summary(sequence, bool(args.reset_each_nut)), ensure_ascii=False, indent=2))
+        print(json.dumps(plan_summary(sequence, bool(args.reset_to_nominal)), ensure_ascii=False, indent=2))
         return 0
     if args.test_left_ready:
         return run_left_ready_test(args)
@@ -675,7 +721,12 @@ def run(args: argparse.Namespace) -> int:
         "timestamp": started.isoformat(timespec="seconds"),
         "status": "RUNNING",
         "sequence": list(sequence),
-        "reset_each_nut": bool(args.reset_each_nut),
+        "use_scene_initial_pose": not bool(args.reset_to_nominal),
+        "randomize_nuts": False,
+        "set_entity_pose_on_episode_init": bool(args.reset_to_nominal),
+        "reset_to_nominal": bool(args.reset_to_nominal),
+        "nominal_pose_status": "CURRENT_CONFIG_NOMINAL_POSES",
+        "nominal_poses": {key: pose_to_list(NUT_SPECS[key].nominal_pose) for key in ("A", "B", "C")},
         "geometry_policy": "V1 geometry preserved; V2 adds Ready/Gate/fault flow only",
         "threshold_status": "PROVISIONAL_THRESHOLD_REQUIRES_RABO_TUNING",
         "trials": [],
@@ -683,7 +734,8 @@ def run(args: argparse.Namespace) -> int:
     pose_setter = right_bundle = left_bundle = None
     probe: IntegratedRecordingProbe | None = None
     try:
-        pose_setter = make_pose_setter()
+        if args.reset_to_nominal:
+            pose_setter = make_pose_setter()
         right_bundle = make_right_bundle()
         left_bundle = make_left_bundle()
         for trial_id in range(1, args.trials + 1):
@@ -694,8 +746,14 @@ def run(args: argparse.Namespace) -> int:
             report["trials"].append(trial)
             try:
                 runner.enter("EPISODE_INIT")
-                resets = reset_episode_nuts(pose_setter) if not args.reset_each_nut else []
-                runner.pass_state({"nut_initialization": resets, "world_reset_used": False})
+                resets = reset_nuts_to_nominal(pose_setter) if args.reset_to_nominal else []
+                runner.pass_state({
+                    "use_scene_initial_pose": not bool(args.reset_to_nominal),
+                    "randomize_nuts": False,
+                    "set_entity_pose_on_episode_init": bool(args.reset_to_nominal),
+                    "nut_initialization": resets,
+                    "world_reset_used": False,
+                })
                 go_right_ready(runner, right_bundle.right_arm)
                 go_left_ready(runner, left_bundle.left_arm)
                 runner.enter("READY_CHECK")
@@ -713,10 +771,6 @@ def run(args: argparse.Namespace) -> int:
                     probe.mark_phase("START_RECORDING", event="ENTER", trial_id=trial_id)
 
                 for key in sequence:
-                    if args.reset_each_nut:
-                        reset = set_pose_with_retry(pose_setter, NUT_IDS[key], pose_to_list(NUT_SPECS[key].nominal_pose))
-                        if not reset.get("ok"):
-                            raise runner.fault(ThreeNutClosedLoopError(f"Nut {key} test reset failed"))
                     if probe is not None:
                         probe.mark_phase("NUT", event="ENTER", nut=key)
                     released_xyz = execute_right_transfer(
@@ -781,7 +835,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--sequence", default="C,B,A", help="Nut sequence, e.g. C, C,B, or C,B,A (default: C,B,A).")
     parser.add_argument("--monitor", action="store_true", help="Explicitly request monitoring (V2 arm motion gates always enable it).")
     parser.add_argument("--test-left-ready", action="store_true", help="Run only the no-Nut LEFT_READY candidate motion-chain test.")
-    parser.add_argument("--reset-each-nut", action="store_true", help="Testing compatibility: SetEntityPose immediately before each Nut.")
+    parser.add_argument(
+        "--reset-to-nominal",
+        action="store_true",
+        help="Debug only: deterministically SetEntityPose A/B/C to fixed config nominal poses at EPISODE_INIT.",
+    )
     parser.add_argument("--plan-only", action="store_true", help="Print the state plan without importing or driving the Rabo SDK.")
     parser.add_argument("--settle-after-release-s", type=float, default=DEFAULT_SETTLE_AFTER_RELEASE_S)
     parser.add_argument("--vision-target-radius-m", type=float, default=DEFAULT_VISION_TARGET_RADIUS_M)
@@ -794,6 +852,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error(str(exc))
     if args.trials < 1:
         parser.error("--trials must be >= 1")
+    if args.trials > 1 and not args.reset_to_nominal:
+        parser.error(
+            "--trials > 1 requires --reset-to-nominal; without an explicit reset only the first "
+            "episode can use the Rabo scene initial state"
+        )
     minimum_wait = RIGHT_RELEASE_OPEN_WAIT_S + RIGHT_OBSERVATION_STABLE_WAIT_S
     if args.settle_after_release_s < minimum_wait:
         parser.error(f"--settle-after-release-s must be at least {minimum_wait:g}s")

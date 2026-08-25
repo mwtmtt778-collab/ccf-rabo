@@ -583,6 +583,10 @@ class MotionMonitor:
             (float(sample["orientation_error"]) for sample in reversed(samples) if sample.get("orientation_error") is not None),
             None,
         )
+        final_actual_ee_pose = next(
+            (list(sample["actual_ee_pose"]) for sample in reversed(samples) if isinstance(sample.get("actual_ee_pose"), list)),
+            None,
+        )
         initial_joint = active.get("initial_joint")
         target_joint = active.get("target_joint")
         initial_ee_pose = active.get("initial_ee_pose")
@@ -630,20 +634,13 @@ class MotionMonitor:
         suspect = ""
         diagnosis = "NORMAL"
 
-        target_joint_required = active.get("command_method") in {
-            "move_checked",
-            "execute_checked.move_joints",
-            "move_joints",
-            "move_to",
-        }
-        # V2's mandatory gate is joint-state based.  EE pose remains an
-        # additional diagnostic when the SDK exposes a parseable get_pose().
-        ee_required = False
+        command_method = active.get("command_method")
+        target_joint_required = command_method in {"execute_checked.move_joints", "move_joints"}
+        ee_required = command_method in {"move_checked", "move_to"}
         if (
             sample_count == 0
             or (target_joint_required and samples_with_target_joint == 0)
             or samples_with_actual_joint == 0
-            or (ee_required and samples_with_actual_ee == 0)
         ):
             diagnosis = "MONITOR_DATA_INCOMPLETE"
             suspect = "monitor"
@@ -653,8 +650,10 @@ class MotionMonitor:
                 reasons.append("target_joint missing; SDK did not expose a joint target for this command")
             if samples_with_actual_joint == 0:
                 reasons.append("actual_joint missing; get_joint_angles was unavailable or unreadable")
-            if ee_required and samples_with_actual_ee == 0:
-                reasons.append("actual_ee_pose missing; get_pose was unavailable or unparseable")
+        elif ee_required and samples_with_actual_ee == 0:
+            diagnosis = "CARTESIAN_ENDPOINT_FEEDBACK_UNAVAILABLE"
+            suspect = "endpoint_feedback"
+            reasons.append("get_pose was unavailable or unparseable")
         elif max_actual_joint_jump is not None and max_actual_joint_jump > actual_joint_jump_threshold:
             diagnosis = "ACTUAL_JOINT_JUMP"
             suspect = "controller_or_state"
@@ -710,11 +709,15 @@ class MotionMonitor:
                 "max_orientation_error": max_orientation_error,
                 "final_position_error": final_position_error,
                 "final_orientation_error": final_orientation_error,
+                "final_actual_ee_pose": final_actual_ee_pose,
                 "max_target_joint_step": max_target_step,
                 "max_actual_joint_jump": max_actual_joint_jump,
                 "final_joint_error": final_joint_error,
                 "divergence_growth": divergence_growth,
                 "diverged": diagnosis == "JOINT_DIVERGENCE",
+                "joint_target_available": target_joint is not None,
+                "joint_target_based_divergence_available": target_joint is not None,
+                "cartesian_endpoint_feedback_available": final_actual_ee_pose is not None,
                 "target_joint_delta_from_start": target_joint_delta,
                 "target_position_delta_from_start": target_position_delta,
                 "target_orientation_delta_from_start": target_orientation_delta,
