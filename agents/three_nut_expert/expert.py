@@ -27,7 +27,6 @@ from .config import (
     RIGHT_CLEAR_POSE,
     RIGHT_GRASP_FORCE,
     RIGHT_GRASP_OFFSET_WORLD_Z,
-    RIGHT_LIFT_POSES,
     RIGHT_PRE_JOINTS,
     WORLD_ID,
     NutSpec,
@@ -108,6 +107,11 @@ def compute_right_approach_pose(grasp_pose: Pose6) -> Pose6:
     )
 
 
+def build_right_safe_lift_pose(grasp_pose: Pose6) -> Pose6:
+    """Lift vertically from a right grasp using the existing 0.10m clearance."""
+    return compute_right_approach_pose(grasp_pose)
+
+
 def build_demo_contract() -> dict[str, Any]:
     return {
         "world_id": WORLD_ID,
@@ -178,8 +182,17 @@ def build_single_nut_plan(nut_key: str, seed: int | None = None, enable_jitter: 
             ActionStep("grasp", "right_hand", "grasp_force", [], RIGHT_GRASP_FORCE, True),
         ]
     )
-    for pose in RIGHT_LIFT_POSES:
-        steps.append(ActionStep("handoff", "right_arm", "move_to", [], asdict(pose), True))
+    steps.append(
+        ActionStep(
+            "handoff",
+            "right_arm",
+            "move_to",
+            [],
+            asdict(build_right_safe_lift_pose(grasp_pose)),
+            True,
+            "vertical safe lift derived from current grasp",
+        )
+    )
     steps.extend(
         [
             ActionStep("handoff", "left_arm", "move_to", [], asdict(LEFT_COARSE_POSE), True),

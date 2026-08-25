@@ -101,6 +101,8 @@ LEFT_PRE_JOINTS = [
     [-1.57, -0.7, 0.0, 0.0, 0.0, 0.0, 0.0],
 ]
 
+# Legacy Nut B absolute transfer poses. Do not use these as the first lift
+# after a dynamic A/B/C grasp; that lift must be derived from the grasp pose.
 RIGHT_LIFT_POSES = [
     Pose6(-0.4, 0.12, -0.03, 0.0, 0.8, 0.0),
     Pose6(-0.4, 0.0, -0.03, 0.0, 0.8, 0.0),

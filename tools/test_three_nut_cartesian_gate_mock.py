@@ -19,7 +19,12 @@ from agents.three_nut_expert.config import (
     RIGHT_ARM_BASE_WORLD_Z,
     RIGHT_ARM_BASE_XY,
 )
-from agents.three_nut_expert.expert import compute_right_approach_pose, compute_right_grasp_pose, pose_to_list
+from agents.three_nut_expert.expert import (
+    build_right_safe_lift_pose,
+    compute_right_approach_pose,
+    compute_right_grasp_pose,
+    pose_to_list,
+)
 from tools.test_left_grasp_v1 import RIGHT_NUT_B_GRASP_POSE
 from tools.motion_monitor import MotionMonitor
 
@@ -79,9 +84,11 @@ class RightGraspTemplateTests(unittest.TestCase):
             xyz = [fixed_pose.x, fixed_pose.y, fixed_pose.z]
             grasp = compute_right_grasp_pose(xyz)
             approach = compute_right_approach_pose(grasp)
+            safe_lift = build_right_safe_lift_pose(grasp)
             for actual, wanted in zip(pose_to_list(grasp), expected[key]):
                 self.assertAlmostEqual(actual, wanted, places=9)
             self.assertAlmostEqual(approach.z - grasp.z, 0.10, places=9)
+            self.assertEqual(pose_to_list(safe_lift), pose_to_list(approach))
 
 
 class MockArm:
@@ -100,6 +107,7 @@ class MockArm:
         self.joints = [0.0] * 7
         self.pose = [0.0] * 6
         self.move_to_calls = 0
+        self.move_to_history: list[list[float]] = []
 
     def pose_check(self, *_args: object, **_kwargs: object) -> list[object]:
         return [True, "reachable"]
@@ -115,6 +123,7 @@ class MockArm:
         yaw: float,
     ) -> bool:
         self.move_to_calls += 1
+        self.move_to_history.append([x, y, z, roll, pitch, yaw])
         if self.move_delay_s:
             time.sleep(self.move_delay_s)
         self.pose = [x + self.endpoint_offset_x, y, z, roll, pitch, yaw]
@@ -267,6 +276,7 @@ class CartesianGateTests(unittest.TestCase):
         self.assertIn("[NUT_RUNTIME_TARGET]", trace)
         self.assertIn("RIGHT_APPROACH_C =", trace)
         self.assertIn("RIGHT_PICK_C =", trace)
+        self.assertIn("RIGHT_SAFE_LIFT_C =", trace)
         self.assertEqual(hand.calls[0], ("clench", {"thumb_rotation": 1.0}))
         self.assertEqual(hand.calls[1][0], "grasp_force")
         right_grasp = next(row for row in runner.states if row["state"] == "RIGHT_GRASP")
@@ -279,6 +289,11 @@ class CartesianGateTests(unittest.TestCase):
             right_grasp["details"]["move"]["motion_gate_status"],
             "PASS_WITHOUT_CARTESIAN_ENDPOINT_FEEDBACK",
         )
+        expected_c_safe_lift = [-0.3241, 0.0387, -0.2238, 0.0, 0.8, 0.0]
+        for actual, expected in zip(arm.move_to_history[2], expected_c_safe_lift):
+            self.assertAlmostEqual(actual, expected, places=9)
+        self.assertNotIn([-0.4, 0.12, -0.03, 0.0, 0.8, 0.0], arm.move_to_history)
+        self.assertNotIn([-0.4, 0.0, -0.03, 0.0, 0.8, 0.0], arm.move_to_history)
 
     def test_left_pick_has_no_entry_ready_repeat(self) -> None:
         source = inspect.getsource(expert_v2.execute_left_pick_place)

@@ -34,11 +34,11 @@ from agents.three_nut_expert.config import (  # noqa: E402
     NUT_IDS,
     NUT_SPECS,
     RIGHT_GRASP_FORCE,
-    RIGHT_LIFT_POSES,
     WORLD_ID,
     Pose6,
 )
 from agents.three_nut_expert.expert import (  # noqa: E402
+    build_right_safe_lift_pose,
     compute_right_approach_pose,
     compute_right_grasp_pose,
     pose_to_list,
@@ -478,7 +478,7 @@ def move_pose(
         })
 
     def send_move_command() -> Any:
-        if label.startswith(("RIGHT_APPROACH_", "RIGHT_PICK_")):
+        if label.startswith(("RIGHT_APPROACH_", "RIGHT_PICK_", "RIGHT_SAFE_LIFT_")):
             print("[RIGHT_MOVE_COMMAND]")
             print(f"{label} = {json.dumps(values)}")
         return arm.move_to(*values[:3], roll=values[3], pitch=values[4], yaw=values[5])
@@ -561,8 +561,20 @@ def execute_right_transfer(
     })
 
     runner.enter("RIGHT_LIFT")
-    lifts = [move_pose(runner, right_bundle.right_arm, pose, f"RIGHT_LIFT_{index}") for index, pose in enumerate(RIGHT_LIFT_POSES, 1)]
-    runner.pass_state({"moves": lifts})
+    safe_lift_pose = build_right_safe_lift_pose(grasp_pose)
+    print("[RIGHT_SAFE_LIFT_COMPUTE]")
+    print(f"safe_lift_pose={json.dumps(pose_to_list(safe_lift_pose))}")
+    safe_lift_move = move_pose(
+        runner,
+        right_bundle.right_arm,
+        safe_lift_pose,
+        f"RIGHT_SAFE_LIFT_{key}",
+    )
+    runner.pass_state({
+        "safe_lift_pose": pose_to_list(safe_lift_pose),
+        "source_grasp_pose": pose_to_list(grasp_pose),
+        "move": safe_lift_move,
+    })
 
     runner.enter("RIGHT_RELEASE")
     move_pose(runner, right_bundle.right_arm, RIGHT_RELEASE_POSE, "RIGHT_RELEASE_POSE")
