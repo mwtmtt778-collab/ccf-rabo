@@ -546,18 +546,40 @@ def execute_right_transfer(
         "move": approach_move,
     })
 
+    runner.enter("RIGHT_THUMB_TUCK", nut=key)
+    thumb_tuck_result = runner.hand_action(
+        label="RIGHT_THUMB_TUCK",
+        command_method="right_hand.clench",
+        fn=lambda: right_bundle.right_hand.clench(thumb_rotation=1.0),
+    )
+    runner.pass_state({
+        "command": "right_hand.clench",
+        "thumb_rotation": 1.0,
+        "sdk_return": jsonable(thumb_tuck_result),
+    })
+
     runner.enter("RIGHT_GRASP", nut=key)
     pick_move = move_pose(runner, right_bundle.right_arm, grasp_pose, f"RIGHT_PICK_{key}")
-    runner.hand_action(label="RIGHT_THUMB_TUCK", command_method="right_hand.clench", fn=lambda: right_bundle.right_hand.clench(thumb_rotation=1.0))
-    runner.hand_action(label="RIGHT_GRASP_FORCE", command_method="right_hand.grasp_force", fn=lambda: right_bundle.right_hand.grasp_force(**RIGHT_GRASP_FORCE))
-    if DEFAULT_HOLD_AFTER_GRASP_S > 0:
-        time.sleep(DEFAULT_HOLD_AFTER_GRASP_S)
     runner.pass_state({
         "grasp_pose": pose_to_list(grasp_pose),
         "source": "KNOWN_FIXED_NUT_WORLD_POSE -> compute_right_grasp_pose using VERIFIED Nut B template",
         "nut_world_xyz": runtime_xyz,
         "nut_xyz_source": nut_xyz_source,
         "move": pick_move,
+    })
+
+    runner.enter("RIGHT_GRASP_FORCE", nut=key)
+    grasp_force_result = runner.hand_action(
+        label="RIGHT_GRASP_FORCE",
+        command_method="right_hand.grasp_force",
+        fn=lambda: right_bundle.right_hand.grasp_force(**RIGHT_GRASP_FORCE),
+    )
+    if DEFAULT_HOLD_AFTER_GRASP_S > 0:
+        time.sleep(DEFAULT_HOLD_AFTER_GRASP_S)
+    runner.pass_state({
+        "command": "right_hand.grasp_force",
+        "target": dict(RIGHT_GRASP_FORCE),
+        "sdk_return": jsonable(grasp_force_result),
     })
 
     runner.enter("RIGHT_LIFT")
@@ -731,7 +753,7 @@ def run_left_ready_test(args: argparse.Namespace) -> int:
 
 def plan_summary(sequence: tuple[str, ...], reset_to_nominal: bool) -> dict[str, Any]:
     per_nut = [
-        "RIGHT_APPROACH", "RIGHT_GRASP", "RIGHT_LIFT",
+        "RIGHT_APPROACH", "RIGHT_THUMB_TUCK", "RIGHT_GRASP", "RIGHT_GRASP_FORCE", "RIGHT_LIFT",
         "RIGHT_RELEASE", "RIGHT_SAFE_RETREAT", "RIGHT_READY", "RIGHT_READY_CHECK",
         "LEFT_VISION", "LEFT_GRASP", "LEFT_SAFE_LIFT",
         "LEFT_PLACE", "LEFT_SAFE_RETREAT", "LEFT_READY", "LEFT_READY_CHECK",

@@ -285,6 +285,11 @@ class CartesianGateTests(unittest.TestCase):
         state_names = [row["state"] for row in runner.states]
         ready_check_index = state_names.index("READY_CHECK")
         self.assertEqual(state_names[ready_check_index + 1], "RIGHT_APPROACH")
+        approach_index = state_names.index("RIGHT_APPROACH")
+        self.assertEqual(
+            state_names[approach_index:approach_index + 5],
+            ["RIGHT_APPROACH", "RIGHT_THUMB_TUCK", "RIGHT_GRASP", "RIGHT_GRASP_FORCE", "RIGHT_LIFT"],
+        )
         self.assertEqual(
             right_grasp["details"]["move"]["motion_gate_status"],
             "PASS_WITHOUT_CARTESIAN_ENDPOINT_FEEDBACK",

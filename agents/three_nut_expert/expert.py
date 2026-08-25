@@ -177,9 +177,9 @@ def build_single_nut_plan(nut_key: str, seed: int | None = None, enable_jitter: 
                 True,
                 "vertical approach 0.10m above grasp",
             ),
+            ActionStep("thumb_tuck", "right_hand", "clench", [], {"thumb_rotation": 1.0}, True),
             ActionStep("approach", "right_arm", "move_to", [], asdict(grasp_pose), True, "legacy world-to-arm transform"),
-            ActionStep("grasp", "right_hand", "clench", [], {"thumb_rotation": 1.0}, True),
-            ActionStep("grasp", "right_hand", "grasp_force", [], RIGHT_GRASP_FORCE, True),
+            ActionStep("grasp_force", "right_hand", "grasp_force", [], RIGHT_GRASP_FORCE, True),
         ]
     )
     steps.append(
