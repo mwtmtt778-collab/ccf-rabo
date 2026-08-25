@@ -14,7 +14,7 @@ from typing import Any
 
 
 LEFT_BASE_WORLD = [-0.6816, 0.0040, 0.7520, 0.0, 0.0, 0.0]
-LEFT_GRASP_OFFSET_BASE = [0.06025, -0.00955, 0.14140]
+LEFT_GRASP_OFFSET_BASE = [-0.05829, -0.00924, 0.13681]
 LEFT_SLANTED_GRASP_RPY = [0.0, -0.8544, 0.0]
 
 SAFE_PRE_JOINTS_1 = [0.0, -1.57, 0.0, 0.0, 0.0, 0.0, 0.0]
@@ -162,7 +162,7 @@ class LeftNutGraspPlanner:
             "grasp_template": {
                 "position_offset_left_base": list(self.config.grasp_offset_base),
                 "orientation_rpy": [self.config.grasp_rpy[0], self.config.grasp_rpy[1], yaw_offset],
-                "position_source": "RIGHT_SUCCESSFUL_GRASP_TEMPLATE",
+                "position_source": "VERIFIED_LEFT_NUT_B_GRASP_TEMPLATE",
                 "orientation_source": "LEFT_VISUAL_SLANTED_CALIBRATION",
             },
             "safe_pre_joints": [list(j) for j in self.config.safe_pre_joints],

@@ -93,6 +93,43 @@ class RightGraspTemplateTests(unittest.TestCase):
             self.assertEqual(pose_to_list(safe_lift), pose_to_list(approach))
 
 
+class LeftGraspTemplateTests(unittest.TestCase):
+    def test_verified_nut_b_grasp_geometry(self) -> None:
+        planner = LeftNutGraspPlanner(left_arm=None, left_hand=None)
+        nut_b_world_xyz = [-0.2966, 0.0420, 0.2806]
+
+        nut_b_left_base_xyz = planner.world_to_left_base(nut_b_world_xyz)
+        expected_left_base_xyz = [0.3850, 0.0380, -0.4714]
+        for actual, expected in zip(nut_b_left_base_xyz, expected_left_base_xyz):
+            self.assertAlmostEqual(actual, expected, places=9)
+
+        grasp_pose = planner.build_grasp_pose(nut_b_world_xyz)
+        expected_grasp_pose = [
+            0.32671,
+            0.02876,
+            -0.33459,
+            0.0,
+            -0.8544,
+            0.0,
+        ]
+        for actual, expected in zip(grasp_pose, expected_grasp_pose):
+            self.assertAlmostEqual(actual, expected, places=9)
+
+        for axis in range(3):
+            self.assertAlmostEqual(
+                grasp_pose[axis],
+                nut_b_left_base_xyz[axis]
+                + planner.config.grasp_offset_base[axis],
+                places=9,
+            )
+
+        plan = planner.build_plan(nut_b_world_xyz)
+        self.assertEqual(
+            plan["grasp_template"]["position_source"],
+            "VERIFIED_LEFT_NUT_B_GRASP_TEMPLATE",
+        )
+
+
 class MockArm:
     def __init__(
         self,
