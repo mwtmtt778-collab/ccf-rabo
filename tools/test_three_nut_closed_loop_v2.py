@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
 """Ready-gated, fail-stop three-Nut Expert V2.
 
-V2 preserves the V1 motion geometry and vision implementation.  It changes
-only episode/reset semantics, state gating, timeout handling, and diagnostics.
-No world reset is used for RIGHT_READY or LEFT_READY.
+V2 reuses the verified Nut B grasp template for every Nut and preserves the
+existing release, retreat, left-flow, episode/reset, gate, and diagnostic
+behavior. No world reset is used for RIGHT_READY or LEFT_READY.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -35,7 +36,11 @@ from agents.three_nut_expert.config import (  # noqa: E402
     WORLD_ID,
     Pose6,
 )
-from agents.three_nut_expert.expert import compute_right_grasp_pose, pose_to_list  # noqa: E402
+from agents.three_nut_expert.expert import (  # noqa: E402
+    compute_right_approach_pose,
+    compute_right_grasp_pose,
+    pose_to_list,
+)
 from expert.left_nut_grasp_planner import (  # noqa: E402
     SAFE_HIGH_POSE,
     LeftNutGraspPlanner,
@@ -80,18 +85,6 @@ from tools.test_right_release_stability import (  # noqa: E402
 NUT_SEQUENCE = ("C", "B", "A")
 LEFT_READY_JOINTS = tuple(tuple(float(v) for v in joints) for joints in LEFT_PRE_JOINTS)
 RELEASE_TARGET_WORLD_XYZ = tuple(float(value) for value in TARGET_NUT_B_WORLD_POSE[:3])
-RIGHT_GRASP_POSES: dict[str, Pose6] = {
-    "B": RIGHT_NUT_B_GRASP_POSE,
-    "A": compute_right_grasp_pose(NUT_SPECS["A"].nominal_pose),
-    "C": compute_right_grasp_pose(NUT_SPECS["C"].nominal_pose),
-}
-RIGHT_GRASP_POSE_SOURCES = {
-    "B": "tools.test_left_grasp_v1.RIGHT_NUT_B_GRASP_POSE (VERIFIED_FROZEN)",
-    "A": "existing compute_right_grasp_pose(NUT_SPECS[A].nominal_pose)",
-    "C": "existing compute_right_grasp_pose(NUT_SPECS[C].nominal_pose)",
-}
-
-
 class ThreeNutClosedLoopError(RuntimeError):
     pass
 
@@ -125,10 +118,15 @@ def parse_sequence_arg(value: str) -> tuple[str, ...]:
 def validate_static_contract(sequence: tuple[str, ...]) -> None:
     if NUT_SEQUENCE != ("C", "B", "A"):
         raise ThreeNutClosedLoopError("V2 default sequence must remain C,B,A")
-    if pose_to_list(RIGHT_GRASP_POSES["B"]) != pose_to_list(RIGHT_NUT_B_GRASP_POSE):
-        raise ThreeNutClosedLoopError("Nut B frozen right grasp pose was changed")
+    b = NUT_SPECS["B"].nominal_pose
+    computed_b = compute_right_grasp_pose((b.x, b.y, b.z))
+    if not all(
+        math.isclose(actual, expected, rel_tol=0.0, abs_tol=1e-9)
+        for actual, expected in zip(pose_to_list(computed_b), pose_to_list(RIGHT_NUT_B_GRASP_POSE))
+    ):
+        raise ThreeNutClosedLoopError("Nut B verified right grasp regression failed")
     for key in sequence:
-        if key not in NUT_IDS or key not in RIGHT_GRASP_POSES or key not in LEFT_PLACE_POSES:
+        if key not in NUT_IDS or key not in NUT_SPECS or key not in LEFT_PLACE_POSES:
             raise ThreeNutClosedLoopError(f"incomplete static contract for Nut {key}")
 
 
@@ -513,13 +511,26 @@ def execute_right_transfer(
     key: str,
     right_bundle: Any,
     *,
+    actual_nut_world_xyz: Sequence[float],
+    nut_xyz_source: str,
     vision_radius_m: float,
     settle_after_release_s: float,
 ) -> list[float]:
     go_right_ready(runner, right_bundle.right_arm)
 
+    grasp_pose = compute_right_grasp_pose(actual_nut_world_xyz)
+    approach_pose = compute_right_approach_pose(grasp_pose)
+    runner.enter("RIGHT_APPROACH", nut=key)
+    approach_move = move_pose(runner, right_bundle.right_arm, approach_pose, f"RIGHT_APPROACH_{key}")
+    runner.pass_state({
+        "approach_pose": pose_to_list(approach_pose),
+        "grasp_pose": pose_to_list(grasp_pose),
+        "nut_world_xyz": list(actual_nut_world_xyz),
+        "nut_xyz_source": nut_xyz_source,
+        "move": approach_move,
+    })
+
     runner.enter("RIGHT_GRASP", nut=key)
-    grasp_pose = RIGHT_GRASP_POSES[key]
     pick_move = move_pose(runner, right_bundle.right_arm, grasp_pose, f"RIGHT_PICK_{key}")
     runner.hand_action(label="RIGHT_THUMB_TUCK", command_method="right_hand.clench", fn=lambda: right_bundle.right_hand.clench(thumb_rotation=1.0))
     runner.hand_action(label="RIGHT_GRASP_FORCE", command_method="right_hand.grasp_force", fn=lambda: right_bundle.right_hand.grasp_force(**RIGHT_GRASP_FORCE))
@@ -527,7 +538,9 @@ def execute_right_transfer(
         time.sleep(DEFAULT_HOLD_AFTER_GRASP_S)
     runner.pass_state({
         "grasp_pose": pose_to_list(grasp_pose),
-        "source": RIGHT_GRASP_POSE_SOURCES[key],
+        "source": "compute_right_grasp_pose(actual_nut_world_xyz) using VERIFIED Nut B template",
+        "nut_world_xyz": list(actual_nut_world_xyz),
+        "nut_xyz_source": nut_xyz_source,
         "move": pick_move,
     })
 
@@ -691,7 +704,7 @@ def run_left_ready_test(args: argparse.Namespace) -> int:
 
 def plan_summary(sequence: tuple[str, ...], reset_to_nominal: bool) -> dict[str, Any]:
     per_nut = [
-        "RIGHT_READY", "RIGHT_READY_CHECK", "RIGHT_GRASP", "RIGHT_LIFT",
+        "RIGHT_READY", "RIGHT_READY_CHECK", "RIGHT_APPROACH", "RIGHT_GRASP", "RIGHT_LIFT",
         "RIGHT_RELEASE", "RIGHT_SAFE_RETREAT", "RIGHT_READY", "RIGHT_READY_CHECK",
         "LEFT_VISION", "LEFT_READY", "LEFT_READY_CHECK", "LEFT_GRASP", "LEFT_SAFE_LIFT",
         "LEFT_PLACE", "LEFT_SAFE_RETREAT", "LEFT_READY", "LEFT_READY_CHECK",
@@ -703,7 +716,7 @@ def plan_summary(sequence: tuple[str, ...], reset_to_nominal: bool) -> dict[str,
         "randomize_nuts": False,
         "set_entity_pose_on_episode_init": reset_to_nominal,
         "right_pick_uses_vision": False,
-        "right_pick_target_source": "fixed RIGHT_GRASP_POSES[A/B/C]",
+        "right_pick_target_source": "compute_right_grasp_pose(actual_nut_world_xyz) with VERIFIED Nut B template",
         "left_pick_uses_post_release_vision": True,
         "episode_init": (
             "deterministic SetEntityPose A/B/C to CURRENT_CONFIG_NOMINAL_POSES"
@@ -740,9 +753,9 @@ def run(args: argparse.Namespace) -> int:
         "nominal_pose_status": "CURRENT_CONFIG_NOMINAL_POSES",
         "nominal_poses": {key: pose_to_list(NUT_SPECS[key].nominal_pose) for key in ("A", "B", "C")},
         "right_pick_uses_vision": False,
-        "right_pick_target_source": "fixed RIGHT_GRASP_POSES[A/B/C]",
+        "right_pick_target_source": "compute_right_grasp_pose(actual_nut_world_xyz) with VERIFIED Nut B template",
         "left_pick_uses_post_release_vision": True,
-        "geometry_policy": "V1 geometry preserved; V2 adds Ready/Gate/fault flow only",
+        "geometry_policy": "VERIFIED Nut B grasp template for A/B/C; vertical RIGHT_APPROACH added",
         "threshold_status": "PROVISIONAL_THRESHOLD_REQUIRES_RABO_TUNING",
         "trials": [],
     }
@@ -792,6 +805,12 @@ def run(args: argparse.Namespace) -> int:
                         runner,
                         key,
                         right_bundle,
+                        actual_nut_world_xyz=pose_to_list(NUT_SPECS[key].nominal_pose)[:3],
+                        nut_xyz_source=(
+                            "EPISODE_INIT deterministic SetEntityPose result"
+                            if args.reset_to_nominal
+                            else "NUT_SPECS configured scene initial XYZ (caller supplied; not runtime observed)"
+                        ),
                         vision_radius_m=float(args.vision_target_radius_m),
                         settle_after_release_s=float(args.settle_after_release_s),
                     )

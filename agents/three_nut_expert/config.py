@@ -58,6 +58,12 @@ NUT_SPECS = {
 
 # Legacy right arm base in table/world x-y convention.
 RIGHT_ARM_BASE_XY = (-0.6816, -0.004)
+RIGHT_ARM_BASE_WORLD_Z = 0.752
+
+# Verified Nut B grasp relation, expressed in world Z.  X/Y retain the
+# legacy right-base conversion below so the frozen B command stays exact.
+RIGHT_GRASP_OFFSET_WORLD_Z = 0.14140
+RIGHT_APPROACH_HEIGHT = 0.10
 
 # Legacy-proven right-arm grasp target transform:
 # target_x = right_arm_base_x - nut_world_x + 0.06
@@ -65,6 +71,8 @@ RIGHT_ARM_BASE_XY = (-0.6816, -0.004)
 GRASP_TARGET_OFFSETS = {
     "x": 0.06,
     "y": -0.01,
+    # Compatibility/reference value for the verified B pose only.
+    # compute_right_grasp_pose derives Z from Nut world Z instead of this key.
     "z": -0.33,
     "roll": 0.0,
     "pitch": 0.8,

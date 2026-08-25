@@ -7,7 +7,7 @@ import random
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 from .config import (
     DEVICE_IDS,
@@ -21,9 +21,12 @@ from .config import (
     LEFT_PRE_JOINTS,
     LEFT_PRE_OPEN,
     NUT_SPECS,
+    RIGHT_APPROACH_HEIGHT,
     RIGHT_ARM_BASE_XY,
+    RIGHT_ARM_BASE_WORLD_Z,
     RIGHT_CLEAR_POSE,
     RIGHT_GRASP_FORCE,
+    RIGHT_GRASP_OFFSET_WORLD_Z,
     RIGHT_LIFT_POSES,
     RIGHT_PRE_JOINTS,
     WORLD_ID,
@@ -73,15 +76,35 @@ def jittered_nut_pose(spec: NutSpec, rng: random.Random, enable_jitter: bool = T
     return Pose6(p.x + dx, p.y + dy, p.z, p.roll, p.pitch, p.yaw)
 
 
-def compute_right_grasp_pose(nut_pose: Pose6) -> Pose6:
+def compute_right_grasp_pose(nut_world_xyz: Sequence[float] | Pose6) -> Pose6:
+    """Apply the verified Nut B grasp template to a supplied Nut world XYZ."""
+    if isinstance(nut_world_xyz, Pose6):
+        nut_x, nut_y, nut_z = nut_world_xyz.x, nut_world_xyz.y, nut_world_xyz.z
+    else:
+        values = [float(value) for value in nut_world_xyz]
+        if len(values) != 3:
+            raise ValueError(f"nut_world_xyz must contain exactly 3 values, got {len(values)}")
+        nut_x, nut_y, nut_z = values
     base_x, base_y = RIGHT_ARM_BASE_XY
     return Pose6(
-        base_x - nut_pose.x + GRASP_TARGET_OFFSETS["x"],
-        base_y - nut_pose.y + GRASP_TARGET_OFFSETS["y"],
-        GRASP_TARGET_OFFSETS["z"],
+        base_x - nut_x + GRASP_TARGET_OFFSETS["x"],
+        base_y - nut_y + GRASP_TARGET_OFFSETS["y"],
+        nut_z + RIGHT_GRASP_OFFSET_WORLD_Z - RIGHT_ARM_BASE_WORLD_Z,
         GRASP_TARGET_OFFSETS["roll"],
         GRASP_TARGET_OFFSETS["pitch"],
         GRASP_TARGET_OFFSETS["yaw"],
+    )
+
+
+def compute_right_approach_pose(grasp_pose: Pose6) -> Pose6:
+    """Generate the vertical right approach directly above a grasp pose."""
+    return Pose6(
+        grasp_pose.x,
+        grasp_pose.y,
+        grasp_pose.z + RIGHT_APPROACH_HEIGHT,
+        grasp_pose.roll,
+        grasp_pose.pitch,
+        grasp_pose.yaw,
     )
 
 
@@ -94,7 +117,11 @@ def build_demo_contract() -> dict[str, Any]:
         "single_nut_contract": {
             "proven_nut": "B",
             "right_arm_base_xy": list(RIGHT_ARM_BASE_XY),
-            "grasp_transform": "target_x = base_x - nut_x + 0.06; target_y = base_y - nut_y - 0.01; z=-0.33; rpy=(0,0.8,0)",
+            "grasp_transform": (
+                "target_x = base_x - nut_x + 0.06; "
+                "target_y = base_y - nut_y - 0.01; "
+                "target_z = nut_z + 0.14140 - 0.752; rpy=(0,0.8,0)"
+            ),
             "right_grasp_force": RIGHT_GRASP_FORCE,
             "left_grasp_force": LEFT_GRASP_FORCE,
         },
@@ -124,7 +151,7 @@ def build_single_nut_plan(nut_key: str, seed: int | None = None, enable_jitter: 
 
     rng = random.Random(seed)
     nut_pose = jittered_nut_pose(NUT_SPECS[key], rng, enable_jitter=enable_jitter)
-    grasp_pose = compute_right_grasp_pose(nut_pose)
+    grasp_pose = compute_right_grasp_pose((nut_pose.x, nut_pose.y, nut_pose.z))
     place_pose = LEFT_PLACE_POSES[key]
 
     steps: list[ActionStep] = [
@@ -137,6 +164,15 @@ def build_single_nut_plan(nut_key: str, seed: int | None = None, enable_jitter: 
 
     steps.extend(
         [
+            ActionStep(
+                "approach",
+                "right_arm",
+                "move_to",
+                [],
+                asdict(compute_right_approach_pose(grasp_pose)),
+                True,
+                "vertical approach 0.10m above grasp",
+            ),
             ActionStep("approach", "right_arm", "move_to", [], asdict(grasp_pose), True, "legacy world-to-arm transform"),
             ActionStep("grasp", "right_hand", "clench", [], {"thumb_rotation": 1.0}, True),
             ActionStep("grasp", "right_hand", "grasp_force", [], RIGHT_GRASP_FORCE, True),

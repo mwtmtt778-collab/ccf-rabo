@@ -12,10 +12,61 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import tools.test_three_nut_closed_loop_v2 as expert_v2
+from agents.three_nut_expert.config import (
+    NUT_SPECS,
+    RIGHT_APPROACH_HEIGHT,
+    RIGHT_ARM_BASE_WORLD_Z,
+    RIGHT_ARM_BASE_XY,
+)
+from agents.three_nut_expert.expert import compute_right_approach_pose, compute_right_grasp_pose, pose_to_list
+from tools.test_left_grasp_v1 import RIGHT_NUT_B_GRASP_POSE
 from tools.motion_monitor import MotionMonitor
 
 
 TARGET_POSE = [0.10, 0.20, -0.10, 0.0, 0.8, 0.0]
+
+
+def grasp_base_to_ideal_world_xyz(pose: object) -> list[float]:
+    """Use the verified right-base axis convention (world yaw = pi)."""
+    return [
+        RIGHT_ARM_BASE_XY[0] - pose.x,
+        RIGHT_ARM_BASE_XY[1] - pose.y,
+        RIGHT_ARM_BASE_WORLD_Z + pose.z,
+    ]
+
+
+class RightGraspTemplateTests(unittest.TestCase):
+    def setUp(self) -> None:
+        b = NUT_SPECS["B"].nominal_pose
+        self.b_xyz = [b.x, b.y, b.z]
+        self.b_grasp = compute_right_grasp_pose(self.b_xyz)
+
+    def test_b_nominal_reproduces_verified_pose(self) -> None:
+        for actual, expected in zip(pose_to_list(self.b_grasp), pose_to_list(RIGHT_NUT_B_GRASP_POSE)):
+            self.assertAlmostEqual(actual, expected, places=9)
+
+    def test_nut_xyz_translation_is_one_to_one_in_hand_world(self) -> None:
+        base_hand_world = grasp_base_to_ideal_world_xyz(self.b_grasp)
+        for axis in range(3):
+            for delta in (-0.01, 0.01):
+                shifted_nut = list(self.b_xyz)
+                shifted_nut[axis] += delta
+                shifted_hand_world = grasp_base_to_ideal_world_xyz(compute_right_grasp_pose(shifted_nut))
+                for output_axis in range(3):
+                    expected_delta = delta if output_axis == axis else 0.0
+                    self.assertAlmostEqual(
+                        shifted_hand_world[output_axis] - base_hand_world[output_axis],
+                        expected_delta,
+                        places=9,
+                    )
+
+    def test_right_approach_differs_only_by_positive_z(self) -> None:
+        approach = compute_right_approach_pose(self.b_grasp)
+        self.assertEqual(
+            [approach.x, approach.y, approach.roll, approach.pitch, approach.yaw],
+            [self.b_grasp.x, self.b_grasp.y, self.b_grasp.roll, self.b_grasp.pitch, self.b_grasp.yaw],
+        )
+        self.assertAlmostEqual(approach.z - self.b_grasp.z, RIGHT_APPROACH_HEIGHT, places=9)
 
 
 class MockArm:
@@ -178,6 +229,8 @@ class CartesianGateTests(unittest.TestCase):
                 runner,
                 "B",
                 bundle,
+                actual_nut_world_xyz=[-0.3413, -0.1710, 0.2806],
+                nut_xyz_source="unit test",
                 vision_radius_m=0.1,
                 settle_after_release_s=0.0,
             )
@@ -190,6 +243,8 @@ class CartesianGateTests(unittest.TestCase):
         self.assertEqual(hand.calls[0], ("clench", {"thumb_rotation": 1.0}))
         self.assertEqual(hand.calls[1][0], "grasp_force")
         right_grasp = next(row for row in runner.states if row["state"] == "RIGHT_GRASP")
+        right_approach = next(row for row in runner.states if row["state"] == "RIGHT_APPROACH")
+        self.assertEqual(right_approach["status"], "STATE_PASS")
         self.assertEqual(
             right_grasp["details"]["move"]["motion_gate_status"],
             "PASS_WITHOUT_CARTESIAN_ENDPOINT_FEEDBACK",
