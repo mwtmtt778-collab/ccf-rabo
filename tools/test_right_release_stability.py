@@ -329,8 +329,10 @@ def execute_release_trial(
     trial_id: int,
     total_trials: int,
     config: ReleaseConfig,
-    pose_setter: Any,
+    pose_setter: Any | None,
     vision_radius: float,
+    *,
+    reset_before_trial: bool = True,
 ) -> dict[str, Any]:
     print_trial_header(trial_id, total_trials)
     record: dict[str, Any] = {
@@ -350,7 +352,16 @@ def execute_release_trial(
     bundle = None
     phase = "RESET"
     try:
-        record["reset"] = reset_trial_environment(pose_setter)
+        if reset_before_trial:
+            if pose_setter is None:
+                raise ReleaseStabilityError("pose_setter is required when reset_before_trial=True")
+            record["reset"] = reset_trial_environment(pose_setter)
+        else:
+            record["reset"] = {
+                "success": True,
+                "mode": "PREVALIDATED_BY_CALLER",
+                "note": "The caller completed and recorded the reset gate before this trial.",
+            }
         bundle = make_right_bundle()
 
         phase = "PREPARE"
