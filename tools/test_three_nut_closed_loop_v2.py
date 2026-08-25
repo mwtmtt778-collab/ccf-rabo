@@ -85,7 +85,9 @@ from tools.test_right_release_stability import (  # noqa: E402
 
 
 NUT_SEQUENCE = ("C", "B", "A")
-LEFT_READY_JOINTS = tuple(tuple(float(v) for v in joints) for joints in LEFT_PRE_JOINTS)
+LEFT_INITIAL_READY_PATH = tuple(tuple(float(v) for v in joints) for joints in LEFT_PRE_JOINTS)
+LEFT_READY_GOAL = LEFT_INITIAL_READY_PATH[-1]
+LEFT_RETURN_READY_ALPHAS = (0.2, 0.4, 0.6, 0.8, 1.0)
 RELEASE_TARGET_WORLD_XYZ = tuple(float(value) for value in TARGET_NUT_B_WORLD_POSE[:3])
 class ThreeNutClosedLoopError(RuntimeError):
     pass
@@ -503,12 +505,70 @@ def go_right_ready(runner: ExpertStateRunner, right_arm: Any) -> None:
     runner.pass_state(runner.ready_check(right_arm, list(RIGHT_OBSERVATION_JOINTS[-1]), "RIGHT_READY_CHECK"))
 
 
-def go_left_ready(runner: ExpertStateRunner, left_arm: Any) -> None:
+def go_left_initial_ready(runner: ExpertStateRunner, left_arm: Any) -> None:
+    """Run the verified startup-only LEFT_READY_1 -> LEFT_READY_2 path."""
     runner.enter("LEFT_READY")
-    rows = move_joints_path(runner, left_arm, LEFT_READY_JOINTS, "LEFT_READY")
-    runner.pass_state({"path": rows, "source": "agents.three_nut_expert.config.LEFT_PRE_JOINTS"})
+    rows = move_joints_path(runner, left_arm, LEFT_INITIAL_READY_PATH, "LEFT_READY")
+    runner.pass_state({
+        "path": rows,
+        "path_role": "LEFT_INITIAL_READY_PATH",
+        "source": "agents.three_nut_expert.config.LEFT_PRE_JOINTS",
+    })
     runner.enter("LEFT_READY_CHECK")
-    runner.pass_state(runner.ready_check(left_arm, list(LEFT_READY_JOINTS[-1]), "LEFT_READY_CHECK"))
+    runner.pass_state(runner.ready_check(left_arm, list(LEFT_READY_GOAL), "LEFT_READY_CHECK"))
+
+
+def build_left_return_ready_path(
+    q_start: Sequence[float],
+    q_goal: Sequence[float] = LEFT_READY_GOAL,
+) -> tuple[tuple[float, ...], ...]:
+    """Interpolate the post-task return without reusing LEFT_READY_1."""
+    start = tuple(float(value) for value in q_start)
+    goal = tuple(float(value) for value in q_goal)
+    if len(start) != len(goal):
+        raise ThreeNutClosedLoopError(
+            f"LEFT_RETURN_READY joint dimension mismatch: start={len(start)} goal={len(goal)}"
+        )
+    waypoints = tuple(
+        tuple(start_value + alpha * (goal_value - start_value) for start_value, goal_value in zip(start, goal))
+        for alpha in LEFT_RETURN_READY_ALPHAS[:-1]
+    )
+    return (*waypoints, goal)
+
+
+def go_left_return_ready(runner: ExpertStateRunner, left_arm: Any) -> None:
+    """Return from the actual post-retreat joints through five monitored segments."""
+    runner.enter("LEFT_RETURN_READY")
+    q_start, read_error = read_joint_method(left_arm, ("get_joint_angles", "get_joints", "get_qpos"))
+    if q_start is None:
+        raise runner.fault(ThreeNutClosedLoopError(
+            f"LEFT_RETURN_READY: joint state unavailable after safe retreat: {read_error}"
+        ), {
+            "command_method": "get_joint_angles",
+            "command_label": "LEFT_RETURN_READY_READ_ACTUAL",
+            "target_joint": list(LEFT_READY_GOAL),
+        })
+    if len(q_start) != len(LEFT_READY_GOAL):
+        raise runner.fault(ThreeNutClosedLoopError(
+            f"LEFT_RETURN_READY: expected {len(LEFT_READY_GOAL)} actual joints, got {len(q_start)}"
+        ), {
+            "command_method": "get_joint_angles",
+            "command_label": "LEFT_RETURN_READY_READ_ACTUAL",
+            "target_joint": list(LEFT_READY_GOAL),
+            "joint_before": q_start,
+        })
+    path = build_left_return_ready_path(q_start)
+    rows = move_joints_path(runner, left_arm, path, "LEFT_RETURN_READY")
+    runner.pass_state({
+        "q_start": q_start,
+        "q_goal": list(LEFT_READY_GOAL),
+        "alphas": list(LEFT_RETURN_READY_ALPHAS),
+        "path": rows,
+        "path_role": "LEFT_RETURN_READY_PATH",
+        "excluded_waypoint": list(LEFT_INITIAL_READY_PATH[0]),
+    })
+    runner.enter("LEFT_READY_CHECK")
+    runner.pass_state(runner.ready_check(left_arm, list(LEFT_READY_GOAL), "LEFT_READY_CHECK"))
 
 
 def vertical_retreat_from_place(place: Pose6) -> list[float]:
@@ -703,7 +763,7 @@ def execute_left_pick_place(
     retreat = vertical_retreat_from_place(place)
     retreat_row = move_pose(runner, left_bundle.left_arm, retreat, f"LEFT_SAFE_RETREAT_{key}")
     runner.pass_state({"move": retreat_row, "safe_retreat_pose": retreat, "geometry": "vertical + existing 0.12m safe-lift delta"})
-    go_left_ready(runner, left_bundle.left_arm)
+    go_left_return_ready(runner, left_bundle.left_arm)
 
 
 def reset_nuts_to_nominal(pose_setter: Any) -> list[dict[str, Any]]:
@@ -747,12 +807,12 @@ def run_left_ready_test(args: argparse.Namespace) -> int:
     }
     try:
         left_bundle = make_left_bundle()
-        go_left_ready(runner, left_bundle.left_arm)
+        go_left_initial_ready(runner, left_bundle.left_arm)
         report["tests"].append({"test": 1, "chain": "current -> LEFT_READY", "status": "PASS"})
 
         runner.enter("LEFT_READY_TEST_2")
         move_pose(runner, left_bundle.left_arm, list(SAFE_HIGH_POSE), "LEFT_READY_TEST_SAFE_HIGH")
-        go_left_ready(runner, left_bundle.left_arm)
+        go_left_return_ready(runner, left_bundle.left_arm)
         report["tests"].append({"test": 2, "chain": "LEFT_READY -> existing SAFE_HIGH -> LEFT_READY", "status": "PASS"})
 
         for key in NUT_SEQUENCE:
@@ -760,7 +820,7 @@ def run_left_ready_test(args: argparse.Namespace) -> int:
             move_pose(runner, left_bundle.left_arm, list(SAFE_HIGH_POSE), f"LEFT_TEST_{key}_SAFE_HIGH")
             move_pose(runner, left_bundle.left_arm, LEFT_PLACE_POSES[key], f"LEFT_TEST_PLACE_{key}")
             move_pose(runner, left_bundle.left_arm, vertical_retreat_from_place(LEFT_PLACE_POSES[key]), f"LEFT_TEST_SAFE_RETREAT_{key}")
-            go_left_ready(runner, left_bundle.left_arm)
+            go_left_return_ready(runner, left_bundle.left_arm)
             report["tests"].append({
                 "test": 3,
                 "nut": key,
@@ -786,13 +846,84 @@ def run_left_ready_test(args: argparse.Namespace) -> int:
     return return_code
 
 
+def run_left_return_ready_c_test(args: argparse.Namespace) -> int:
+    """Exercise only the C safe-retreat-to-Ready return chain."""
+    started = datetime.now().astimezone()
+    report_path = REPORT_DIR / f"left_return_ready_c_test_{started.strftime('%Y%m%d_%H%M%S')}.json"
+    left_bundle = None
+    report: dict[str, Any] = {
+        "experiment": "left_safe_retreat_c_return_ready_test",
+        "status": "RUNNING",
+        "requested_cycles": int(args.return_ready_cycles),
+        "chain_under_test": "LEFT_SAFE_RETREAT_C -> LEFT_RETURN_READY -> LEFT_READY_CHECK",
+        "initialization_path": "LEFT_INITIAL_READY_PATH (setup only)",
+        "return_alphas": list(LEFT_RETURN_READY_ALPHAS),
+        "return_goal": list(LEFT_READY_GOAL),
+        "forbidden_return_waypoint": list(LEFT_INITIAL_READY_PATH[0]),
+        "tests": [],
+    }
+    runner: ExpertStateRunner | None = None
+    try:
+        left_bundle = make_left_bundle()
+        setup_monitor = MotionMonitor(enabled=True)
+        report["motion_gate_config"] = dict(setup_monitor.config)
+        runner = ExpertStateRunner(0, setup_monitor, report_path)
+        go_left_initial_ready(runner, left_bundle.left_arm)
+        report["setup_states"] = list(runner.states)
+
+        retreat = vertical_retreat_from_place(LEFT_PLACE_POSES["C"])
+        for cycle in range(1, int(args.return_ready_cycles) + 1):
+            monitor = MotionMonitor(enabled=True)
+            runner = ExpertStateRunner(cycle, monitor, report_path)
+            test = {
+                "cycle": cycle,
+                "status": "RUNNING",
+                "safe_retreat_pose": retreat,
+                "states": runner.states,
+            }
+            report["tests"].append(test)
+            runner.enter("LEFT_SAFE_RETREAT", nut="C")
+            retreat_row = move_pose(
+                runner,
+                left_bundle.left_arm,
+                retreat,
+                "LEFT_SAFE_RETREAT_C",
+            )
+            runner.pass_state({"move": retreat_row, "safe_retreat_pose": retreat})
+            go_left_return_ready(runner, left_bundle.left_arm)
+            test["status"] = "PASS"
+            test["states"] = runner.states
+
+        report["status"] = "PASS"
+        report["passed_cycles"] = len(report["tests"])
+        return_code = 0
+    except BaseException as exc:
+        interrupted = isinstance(exc, KeyboardInterrupt)
+        if runner is not None and not isinstance(exc, StateFault):
+            exc = runner.fault(exc)
+        report.update({
+            "status": "FAILED",
+            "passed_cycles": sum(test["status"] == "PASS" for test in report["tests"]),
+            "failed_phase": runner.state if runner is not None else "SETUP",
+            "failure_reason": repr(exc),
+            "fault_snapshot": runner.fault_path if runner is not None else None,
+        })
+        return_code = 130 if interrupted else 1
+    finally:
+        shutdown_left_bundle(left_bundle)
+        report["finished_at"] = now_text()
+        write_json(report_path, report)
+        print(f"Result: {report['status']}\nReport: {report_path.relative_to(PROJECT_ROOT)}")
+    return return_code
+
+
 def plan_summary(sequence: tuple[str, ...], reset_to_nominal: bool) -> dict[str, Any]:
     per_nut = [
         "RIGHT_APPROACH", "RIGHT_THUMB_TUCK", "RIGHT_GRASP", "RIGHT_GRASP_FORCE", "RIGHT_LIFT",
         "RIGHT_RELEASE", "RIGHT_SAFE_RETREAT", "RIGHT_READY", "RIGHT_READY_CHECK",
         "LEFT_VISION", "LEFT_APPROACH", "LEFT_THUMB_TUCK", "LEFT_DESCENT",
         "LEFT_GRASP", "LEFT_GRASP_FORCE", "LEFT_SAFE_LIFT",
-        "LEFT_PLACE", "LEFT_SAFE_RETREAT", "LEFT_READY", "LEFT_READY_CHECK",
+        "LEFT_PLACE", "LEFT_SAFE_RETREAT", "LEFT_RETURN_READY", "LEFT_READY_CHECK",
     ]
     return {
         "status": "PLAN_ONLY_NO_RABO_SDK",
@@ -810,8 +941,13 @@ def plan_summary(sequence: tuple[str, ...], reset_to_nominal: bool) -> dict[str,
         ),
         "initial_ready": ["RIGHT_READY", "RIGHT_READY_CHECK", "LEFT_READY", "LEFT_READY_CHECK"],
         "per_nut_template": per_nut,
-        "final": ["RIGHT_READY", "RIGHT_READY_CHECK", "LEFT_READY", "LEFT_READY_CHECK", "DONE"],
-        "left_ready_source": "agents.three_nut_expert.config.LEFT_PRE_JOINTS (candidate; requires Rabo test)",
+        "final": ["RIGHT_READY", "RIGHT_READY_CHECK", "LEFT_RETURN_READY", "LEFT_READY_CHECK", "DONE"],
+        "left_initial_ready_path": [list(joints) for joints in LEFT_INITIAL_READY_PATH],
+        "left_return_ready": {
+            "source": "actual joints read after LEFT_SAFE_RETREAT",
+            "goal": list(LEFT_READY_GOAL),
+            "alphas": list(LEFT_RETURN_READY_ALPHAS),
+        },
     }
 
 
@@ -823,6 +959,8 @@ def run(args: argparse.Namespace) -> int:
         return 0
     if args.test_left_ready:
         return run_left_ready_test(args)
+    if args.test_left_return_ready:
+        return run_left_return_ready_c_test(args)
 
     started = datetime.now().astimezone()
     report_path = REPORT_DIR / f"three_nut_v2_{started.strftime('%Y%m%d_%H%M%S')}.json"
@@ -870,7 +1008,7 @@ def run(args: argparse.Namespace) -> int:
                     "world_reset_used": False,
                 })
                 go_right_ready(runner, right_bundle.right_arm)
-                go_left_ready(runner, left_bundle.left_arm)
+                go_left_initial_ready(runner, left_bundle.left_arm)
                 runner.enter("READY_CHECK")
                 runner.pass_state({"right_ready": True, "left_ready": True})
 
@@ -903,7 +1041,7 @@ def run(args: argparse.Namespace) -> int:
                         probe.mark_phase("NUT", event="EXIT", nut=key, success=True)
 
                 go_right_ready(runner, right_bundle.right_arm)
-                go_left_ready(runner, left_bundle.left_arm)
+                go_left_return_ready(runner, left_bundle.left_arm)
                 runner.enter("DONE")
                 runner.pass_state({"completed_nuts": list(sequence)})
                 trial["status"] = "PASS"
@@ -954,6 +1092,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--monitor", action="store_true", help="Explicitly request monitoring (V2 arm motion gates always enable it).")
     parser.add_argument("--test-left-ready", action="store_true", help="Run only the no-Nut LEFT_READY candidate motion-chain test.")
     parser.add_argument(
+        "--test-left-return-ready",
+        action="store_true",
+        help="Run only LEFT_SAFE_RETREAT_C -> segmented LEFT_RETURN_READY -> LEFT_READY_CHECK.",
+    )
+    parser.add_argument(
+        "--return-ready-cycles",
+        type=int,
+        default=5,
+        help="Cycles for --test-left-return-ready (default: 5).",
+    )
+    parser.add_argument(
         "--reset-to-nominal",
         action="store_true",
         help="Debug only: deterministically SetEntityPose A/B/C to VERIFIED_SCENE_FIXED_POSE at EPISODE_INIT.",
@@ -970,6 +1119,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error(str(exc))
     if args.trials < 1:
         parser.error("--trials must be >= 1")
+    if args.return_ready_cycles < 1:
+        parser.error("--return-ready-cycles must be >= 1")
     if args.trials > 1 and not args.reset_to_nominal:
         parser.error(
             "--trials > 1 requires --reset-to-nominal; without an explicit reset only the first "

@@ -147,6 +147,7 @@ class MockArm:
         self.pose = [0.0] * 6
         self.move_to_calls = 0
         self.move_to_history: list[list[float]] = []
+        self.move_joints_history: list[list[float]] = []
 
     def pose_check(self, *_args: object, **_kwargs: object) -> list[object]:
         return [True, "reachable"]
@@ -170,6 +171,7 @@ class MockArm:
         return self.move_result
 
     def move_joints(self, target: list[float]) -> bool:
+        self.move_joints_history.append(list(target))
         self.joints = list(target)
         return True
 
@@ -358,8 +360,37 @@ class CartesianGateTests(unittest.TestCase):
 
     def test_left_pick_has_no_entry_ready_repeat(self) -> None:
         source = inspect.getsource(expert_v2.execute_left_pick_place)
-        self.assertEqual(source.count("go_left_ready("), 1)
-        self.assertGreater(source.index("go_left_ready("), source.index('runner.enter("LEFT_SAFE_RETREAT")'))
+        self.assertNotIn("go_left_initial_ready(", source)
+        self.assertEqual(source.count("go_left_return_ready("), 1)
+        self.assertGreater(source.index("go_left_return_ready("), source.index('runner.enter("LEFT_SAFE_RETREAT")'))
+
+    def test_left_return_ready_path_uses_five_linear_segments_to_unchanged_goal(self) -> None:
+        q_start = [0.35, -1.40, 0.10, -0.15, 0.05, -0.10, 0.20]
+        path = expert_v2.build_left_return_ready_path(q_start)
+        self.assertEqual(len(path), 5)
+        self.assertEqual(expert_v2.LEFT_RETURN_READY_ALPHAS, (0.2, 0.4, 0.6, 0.8, 1.0))
+        self.assertEqual(path[-1], expert_v2.LEFT_READY_GOAL)
+        self.assertEqual(expert_v2.LEFT_READY_GOAL, (-1.57, -0.7, 0.0, 0.0, 0.0, 0.0, 0.0))
+        expected_first = tuple(
+            start + 0.2 * (goal - start)
+            for start, goal in zip(q_start, expert_v2.LEFT_READY_GOAL)
+        )
+        self.assertEqual(path[0], expected_first)
+        self.assertNotIn(expert_v2.LEFT_INITIAL_READY_PATH[0], path)
+
+    def test_left_return_ready_reads_actual_and_gates_every_segment(self) -> None:
+        arm = MockArm()
+        arm.joints = [0.0, -1.57, 0.0, 0.0, 0.0, 0.0, 0.0]
+        runner = self.runner()
+        runner.monitor.config["ready_sample_interval_s"] = 0.0
+        expert_v2.go_left_return_ready(runner, arm)
+        self.assertEqual(len(arm.move_joints_history), 5)
+        self.assertEqual(arm.move_joints_history[-1], list(expert_v2.LEFT_READY_GOAL))
+        return_state = next(row for row in runner.states if row["state"] == "LEFT_RETURN_READY")
+        self.assertEqual(return_state["details"]["q_start"], [0.0, -1.57, 0.0, 0.0, 0.0, 0.0, 0.0])
+        self.assertEqual(return_state["details"]["alphas"], [0.2, 0.4, 0.6, 0.8, 1.0])
+        self.assertEqual(runner.states[-1]["state"], "LEFT_READY_CHECK")
+        self.assertEqual(runner.states[-1]["status"], "STATE_PASS")
 
     def test_left_planner_tucks_after_pregrasp_before_descent(self) -> None:
         arm = MockArm()
@@ -381,15 +412,15 @@ class CartesianGateTests(unittest.TestCase):
         hand = MockHand()
         bundle = SimpleNamespace(left_arm=arm, left_hand=hand)
         runner = self.runner()
-        original_go_left_ready = expert_v2.go_left_ready
+        original_go_left_return_ready = expert_v2.go_left_return_ready
         original_sleep = expert_v2.time.sleep
         ready_calls = []
-        expert_v2.go_left_ready = lambda _runner, _arm: ready_calls.append("LEFT_READY")
+        expert_v2.go_left_return_ready = lambda _runner, _arm: ready_calls.append("LEFT_RETURN_READY")
         expert_v2.time.sleep = lambda _seconds: None
         try:
             expert_v2.execute_left_pick_place(runner, "C", bundle, [0.1, 0.2, 0.3])
         finally:
-            expert_v2.go_left_ready = original_go_left_ready
+            expert_v2.go_left_return_ready = original_go_left_return_ready
             expert_v2.time.sleep = original_sleep
         state_names = [row["state"] for row in runner.states]
         approach_index = state_names.index("LEFT_APPROACH")
@@ -397,7 +428,7 @@ class CartesianGateTests(unittest.TestCase):
             state_names[approach_index:approach_index + 6],
             ["LEFT_APPROACH", "LEFT_THUMB_TUCK", "LEFT_DESCENT", "LEFT_GRASP", "LEFT_GRASP_FORCE", "LEFT_SAFE_LIFT"],
         )
-        self.assertEqual(ready_calls, ["LEFT_READY"])
+        self.assertEqual(ready_calls, ["LEFT_RETURN_READY"])
 
     def test_move_joints_gate_regression_passes(self) -> None:
         arm = MockArm()
