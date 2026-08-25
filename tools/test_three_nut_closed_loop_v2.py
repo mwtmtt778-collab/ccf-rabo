@@ -504,16 +504,7 @@ def execute_right_transfer(
 ) -> list[float]:
     go_right_ready(runner, right_bundle.right_arm)
 
-    runner.enter("RIGHT_VISION", nut=key)
-    nominal_xyz = tuple(float(v) for v in pose_to_list(NUT_SPECS[key].nominal_pose)[:3])
-    initial = detect_released_nut(nominal_xyz, vision_radius_m)
-    if not initial.get("detected") or not initial.get("nut_world_xyz"):
-        raise runner.fault(ThreeNutClosedLoopError(f"initial vision failed: {initial.get('error')}"), {
-            "command_method": "detect_released_nut",
-        })
-    runner.pass_state({"detected_position": initial["nut_world_xyz"]})
-
-    runner.enter("RIGHT_GRASP")
+    runner.enter("RIGHT_GRASP", nut=key)
     grasp_pose = RIGHT_GRASP_POSES[key]
     move_pose(runner, right_bundle.right_arm, grasp_pose, f"RIGHT_PICK_{key}")
     runner.hand_action(label="RIGHT_THUMB_TUCK", command_method="right_hand.clench", fn=lambda: right_bundle.right_hand.clench(thumb_rotation=1.0))
@@ -682,7 +673,7 @@ def run_left_ready_test(args: argparse.Namespace) -> int:
 
 def plan_summary(sequence: tuple[str, ...], reset_to_nominal: bool) -> dict[str, Any]:
     per_nut = [
-        "RIGHT_READY", "RIGHT_READY_CHECK", "RIGHT_VISION", "RIGHT_GRASP", "RIGHT_LIFT",
+        "RIGHT_READY", "RIGHT_READY_CHECK", "RIGHT_GRASP", "RIGHT_LIFT",
         "RIGHT_RELEASE", "RIGHT_SAFE_RETREAT", "RIGHT_READY", "RIGHT_READY_CHECK",
         "LEFT_VISION", "LEFT_READY", "LEFT_READY_CHECK", "LEFT_GRASP", "LEFT_SAFE_LIFT",
         "LEFT_PLACE", "LEFT_SAFE_RETREAT", "LEFT_READY", "LEFT_READY_CHECK",
@@ -693,6 +684,9 @@ def plan_summary(sequence: tuple[str, ...], reset_to_nominal: bool) -> dict[str,
         "use_scene_initial_pose": not reset_to_nominal,
         "randomize_nuts": False,
         "set_entity_pose_on_episode_init": reset_to_nominal,
+        "right_pick_uses_vision": False,
+        "right_pick_target_source": "fixed RIGHT_GRASP_POSES[A/B/C]",
+        "left_pick_uses_post_release_vision": True,
         "episode_init": (
             "deterministic SetEntityPose A/B/C to CURRENT_CONFIG_NOMINAL_POSES"
             if reset_to_nominal
@@ -727,6 +721,9 @@ def run(args: argparse.Namespace) -> int:
         "reset_to_nominal": bool(args.reset_to_nominal),
         "nominal_pose_status": "CURRENT_CONFIG_NOMINAL_POSES",
         "nominal_poses": {key: pose_to_list(NUT_SPECS[key].nominal_pose) for key in ("A", "B", "C")},
+        "right_pick_uses_vision": False,
+        "right_pick_target_source": "fixed RIGHT_GRASP_POSES[A/B/C]",
+        "left_pick_uses_post_release_vision": True,
         "geometry_policy": "V1 geometry preserved; V2 adds Ready/Gate/fault flow only",
         "threshold_status": "PROVISIONAL_THRESHOLD_REQUIRES_RABO_TUNING",
         "trials": [],

@@ -151,6 +151,10 @@ class CartesianGateTests(unittest.TestCase):
         self.assertTrue(plan["use_scene_initial_pose"])
         self.assertFalse(plan["randomize_nuts"])
         self.assertFalse(plan["set_entity_pose_on_episode_init"])
+        self.assertNotIn("RIGHT_VISION", plan["per_nut_template"])
+        self.assertIn("LEFT_VISION", plan["per_nut_template"])
+        self.assertFalse(plan["right_pick_uses_vision"])
+        self.assertTrue(plan["left_pick_uses_post_release_vision"])
 
     def test_multiple_trials_require_explicit_deterministic_reset(self) -> None:
         with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
