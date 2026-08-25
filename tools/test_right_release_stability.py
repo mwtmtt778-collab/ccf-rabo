@@ -333,6 +333,10 @@ def execute_release_trial(
     vision_radius: float,
     *,
     reset_before_trial: bool = True,
+    execution_bundle: Any | None = None,
+    check_reachability_after_release: bool = True,
+    shutdown_bundle_before_vision: bool = True,
+    shutdown_execution_bundle: bool = True,
 ) -> dict[str, Any]:
     print_trial_header(trial_id, total_trials)
     record: dict[str, Any] = {
@@ -362,7 +366,10 @@ def execute_release_trial(
                 "mode": "PREVALIDATED_BY_CALLER",
                 "note": "The caller completed and recorded the reset gate before this trial.",
             }
-        bundle = make_right_bundle()
+        # A reset-gated caller may pass the same SDK instances that performed
+        # reset verification.  Recreating devices with identical ROS node
+        # names in the same process can leave duplicate publishers/clients.
+        bundle = execution_bundle if execution_bundle is not None else make_right_bundle()
 
         phase = "PREPARE"
         execute_checked("RIGHT_HAND_OPEN_INITIAL", bundle.right_hand, "clench", *list(HAND_OPEN))
@@ -397,9 +404,12 @@ def execute_release_trial(
         record["retreat_success"] = True
         print("\nRetreat:\nPASS")
 
-        # Destroy robot clients before reliable high-bandwidth camera capture.
-        shutdown_bundle(bundle)
-        bundle = None
+        # Standalone runs destroy robot clients before high-bandwidth camera
+        # capture.  A multi-trial caller can keep one persistent SDK bundle to
+        # avoid recreating duplicate ROS node names between trials.
+        if shutdown_bundle_before_vision:
+            shutdown_bundle(bundle)
+            bundle = None
 
         phase = "SETTLE"
         print(f"\nWaiting:\n{config.settle_time:g}s")
@@ -424,9 +434,16 @@ def execute_release_trial(
         print(f"z={xyz[2]:.6f}")
 
         phase = "LEFT_REACHABILITY"
-        reachability = check_left_reachability(xyz)
-        record["left_reachability"] = reachability
-        record["reachable"] = bool(reachability.get("reachable"))
+        if check_reachability_after_release:
+            reachability = check_left_reachability(xyz)
+            record["left_reachability"] = reachability
+            record["reachable"] = bool(reachability.get("reachable"))
+        else:
+            record["left_reachability"] = {
+                "status": "SKIPPED",
+                "reason": "Disabled by caller; not part of grasp success criteria.",
+            }
+            record["reachable"] = None
         record["success"] = True
     except Exception as exc:
         record["success"] = False
@@ -434,7 +451,8 @@ def execute_release_trial(
         record["error"] = repr(exc)
         print(f"\n{phase}:\nFAIL\n{exc!r}")
     finally:
-        shutdown_bundle(bundle)
+        if shutdown_execution_bundle:
+            shutdown_bundle(bundle)
     return record
 
 

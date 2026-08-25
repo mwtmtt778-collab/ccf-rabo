@@ -178,21 +178,19 @@ def main(argv: list[str] | None = None) -> int:
         "trials": [],
     }
 
+    runtime: RaboResetRuntime | None = None
     try:
+        # Keep one SDK bundle for the whole experiment.  Rabo uses fixed ROS
+        # node names per device; destroying and immediately recreating them can
+        # leave duplicate publishers/clients and block the next motion call.
+        runtime = RaboResetRuntime()
         for trial_id in range(1, args.trials + 1):
             print(f"\n[TRIAL {trial_id}/{args.trials}] reset -> verify", flush=True)
-            runtime: RaboResetRuntime | None = None
-            try:
-                runtime = RaboResetRuntime()
-                reset_result = reset_episode(
-                    runtime,
-                    thresholds=thresholds,
-                    max_attempts=args.max_reset_attempts,
-                )
-            finally:
-                if runtime is not None:
-                    runtime.shutdown()
-
+            reset_result = reset_episode(
+                runtime,
+                thresholds=thresholds,
+                max_attempts=args.max_reset_attempts,
+            )
             gate = evaluate_reset_gate(reset_result, args.reset_policy)
             row: dict[str, Any] = {
                 "trial_id": trial_id,
@@ -216,6 +214,10 @@ def main(argv: list[str] | None = None) -> int:
                 None,
                 args.vision_target_radius,
                 reset_before_trial=False,
+                execution_bundle=runtime,
+                check_reachability_after_release=False,
+                shutdown_bundle_before_vision=False,
+                shutdown_execution_bundle=False,
             )
             row["experiment"] = experiment
             row["physical_success_proxy"] = physical_proxy_success(experiment)
@@ -224,6 +226,8 @@ def main(argv: list[str] | None = None) -> int:
         report["stopped_early"] = True
         report["stop_reason"] = repr(exc)
     finally:
+        if runtime is not None:
+            runtime.shutdown()
         experiments = [row["experiment"] for row in report["trials"] if row.get("experiment") is not None]
         report["experiment_statistics"] = compute_statistics(experiments)
         report["summary"] = summarize(report["trials"], args.trials, args.reset_policy)
