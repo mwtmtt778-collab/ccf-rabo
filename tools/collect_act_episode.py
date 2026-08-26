@@ -890,6 +890,7 @@ def execute_episode(args: argparse.Namespace) -> int:
             abort_event=abort_event,
             command_events=command_events,
             timeline_origin=timeline_origin,
+            nonblocking_motion=bool(args.nonblocking_motion),
         )
         expert_status = "RUNNING"
         completed_nuts = run_expert(
@@ -1008,6 +1009,7 @@ def execute_episode(args: argparse.Namespace) -> int:
         "shutdown_errors": shutdown_errors,
         "left_safe_lift_delta_z_m": LEFT_SAFE_LIFT_DELTA_Z_M,
         "deterministic_place_path": bool(args.deterministic_place_path),
+        "nonblocking_motion": bool(args.nonblocking_motion),
         "motion_monitor_enabled": gate_enabled,
         "accepted_for_training": False,
         "rejection_reason": rejection_reason,
@@ -1062,6 +1064,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--deterministic-place-path",
         action="store_true",
         help="Use recorded actual_joint C/B fixed transport/place paths; default keeps Cartesian fallback.",
+    )
+    parser.add_argument(
+        "--nonblocking-motion",
+        action="store_true",
+        help="Send each arm motion with blocking=False and wait for joint settling.",
     )
     parser.add_argument("--episode-id", help="Optional unique episode directory name.")
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)

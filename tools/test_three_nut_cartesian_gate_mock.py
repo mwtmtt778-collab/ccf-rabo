@@ -156,6 +156,7 @@ class MockArm:
         self.move_to_calls = 0
         self.move_to_history: list[list[float]] = []
         self.move_joints_history: list[list[float]] = []
+        self.blocking_history: list[bool] = []
 
     def pose_check(self, *_args: object, **_kwargs: object) -> list[object]:
         return [True, "reachable"]
@@ -169,8 +170,10 @@ class MockArm:
         roll: float,
         pitch: float,
         yaw: float,
+        blocking: bool = True,
     ) -> bool:
         self.move_to_calls += 1
+        self.blocking_history.append(bool(blocking))
         self.move_to_history.append([x, y, z, roll, pitch, yaw])
         if self.move_delay_s:
             time.sleep(self.move_delay_s)
@@ -178,7 +181,8 @@ class MockArm:
         self.joints = [self.joint_after] * 7
         return self.move_result
 
-    def move_joints(self, target: list[float]) -> bool:
+    def move_joints(self, target: list[float], blocking: bool = True) -> bool:
+        self.blocking_history.append(bool(blocking))
         self.move_joints_history.append(list(target))
         self.joints = list(target)
         self.joints[0] += self.move_joints_residual
@@ -194,6 +198,26 @@ class MockArm:
 class MockArmWithoutPoseFeedback(MockArm):
     def get_pose(self) -> None:
         return None
+
+
+class MockNonblockingArm(MockArm):
+    def __init__(self, samples: list[list[float]], *, result: bool = True, raises: BaseException | None = None) -> None:
+        super().__init__()
+        self.samples = [list(v) for v in samples]
+        self.result = result
+        self.raises = raises
+
+    def move_joints(self, target: list[float], blocking: bool = True) -> bool:
+        self.blocking_history.append(bool(blocking))
+        self.move_joints_history.append(list(target))
+        if self.raises:
+            raise self.raises
+        return self.result
+
+    def get_joint_angles(self) -> list[float]:
+        if self.samples:
+            self.joints = list(self.samples.pop(0))
+        return list(self.joints)
 
 
 class MockOutOfWorkspaceArm(MockArm):
@@ -535,6 +559,43 @@ class CartesianGateTests(unittest.TestCase):
         self.assertTrue(result["gate"]["pass"])
         self.assertAlmostEqual(result["final_joint_error"], 0.0)
         self.assertTrue(result["joint_target_based_divergence_available"])
+        self.assertEqual(arm.blocking_history, [True])
+
+    def test_nonblocking_motion_settles_and_passes(self) -> None:
+        samples = [[0.0] * 7, [0.02] * 7, [0.04] * 7, [0.04] * 7, [0.04] * 7, [0.04] * 7]
+        arm = MockNonblockingArm(samples)
+        runner = self.runner()
+        runner.nonblocking_motion = True
+        original_sleep = expert_v2.time.sleep
+        expert_v2.time.sleep = lambda _seconds: None
+        try:
+            result = runner.arm_action(label="NB_TEST", arm=arm, command_method="move_joints", target_joint=[0.1] * 7, fn=lambda: arm.move_joints([0.1] * 7, blocking=False))
+        finally:
+            expert_v2.time.sleep = original_sleep
+        self.assertTrue(result["motion_settle"]["settled"])
+        self.assertEqual(arm.blocking_history, [False])
+
+    def test_nonblocking_false_fails_immediately(self) -> None:
+        arm = MockNonblockingArm([], result=False)
+        runner = self.runner(); runner.nonblocking_motion = True
+        with self.assertRaises(expert_v2.StateFault):
+            runner.arm_action(label="NB_FALSE", arm=arm, command_method="move_joints", target_joint=[0.1] * 7, fn=lambda: arm.move_joints([0.1] * 7, blocking=False))
+
+    def test_nonblocking_timeout_fails(self) -> None:
+        arm = MockNonblockingArm([([0.0] * 7 if i % 2 == 0 else [0.01] * 7) for i in range(100)])
+        runner = self.runner(); runner.nonblocking_motion = True
+        original_sleep = expert_v2.time.sleep
+        original_monotonic = expert_v2.time.monotonic
+        ticks = iter([0.0] + [float(i) for i in range(1, 20)])
+        expert_v2.time.sleep = lambda _seconds: None
+        expert_v2.time.monotonic = lambda: next(ticks)
+        try:
+            with self.assertRaises(expert_v2.StateFault) as caught:
+                runner.arm_action(label="NB_TIMEOUT", arm=arm, command_method="move_joints", target_joint=[0.1] * 7, fn=lambda: arm.move_joints([0.1] * 7, blocking=False))
+        finally:
+            expert_v2.time.sleep = original_sleep
+            expert_v2.time.monotonic = original_monotonic
+        self.assertIn("NONBLOCKING_MOTION_TIMEOUT", str(caught.exception))
 
     def deterministic_entry_runner(self) -> expert_v2.ExpertStateRunner:
         runner = self.runner()
@@ -621,12 +682,13 @@ class CartesianGateTests(unittest.TestCase):
             "--sequence", "C", "--deterministic-place-path", "--no-motion-gate", "--plan-only",
         ])
         collector_args = act_collector.build_parser().parse_args([
-            "--sequence", "C", "--deterministic-place-path", "--no-motion-gate",
+            "--sequence", "C", "--deterministic-place-path", "--no-motion-gate", "--nonblocking-motion",
         ])
         self.assertFalse(expert_v2.motion_gate_enabled(expert_args))
         self.assertFalse(act_collector.motion_gate_enabled(collector_args))
         self.assertFalse(MotionMonitor(enabled=expert_v2.motion_gate_enabled(expert_args)).enabled)
         self.assertFalse(MotionMonitor(enabled=act_collector.motion_gate_enabled(collector_args)).enabled)
+        self.assertTrue(collector_args.nonblocking_motion)
 
     def test_collector_c_only_final_release_is_terminal(self) -> None:
         runner = expert_v2.ExpertStateRunner(
