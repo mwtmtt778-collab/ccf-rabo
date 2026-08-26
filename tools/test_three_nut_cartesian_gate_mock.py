@@ -138,11 +138,13 @@ class MockArm:
         joint_after: float = 0.10,
         move_delay_s: float = 0.0,
         move_result: bool = True,
+        move_joints_residual: float = 0.0,
     ) -> None:
         self.endpoint_offset_x = endpoint_offset_x
         self.joint_after = joint_after
         self.move_delay_s = move_delay_s
         self.move_result = move_result
+        self.move_joints_residual = move_joints_residual
         self.joints = [0.0] * 7
         self.pose = [0.0] * 6
         self.move_to_calls = 0
@@ -173,6 +175,7 @@ class MockArm:
     def move_joints(self, target: list[float]) -> bool:
         self.move_joints_history.append(list(target))
         self.joints = list(target)
+        self.joints[0] += self.move_joints_residual
         return True
 
     def get_joint_angles(self) -> list[float]:
@@ -270,6 +273,19 @@ class CartesianGateTests(unittest.TestCase):
             expert_v2.move_pose(self.runner(timeout_s=0.01), arm, TARGET_POSE, "MOCK_CARTESIAN_TIMEOUT")
         self.assertTrue(caught.exception.context["timeout"])
         self.assertTrue(caught.exception.context["sdk_returned_after_timeout"])
+
+    def test_motion_monitor_disabled_does_not_apply_monitor_timeout(self) -> None:
+        arm = MockArmWithoutPoseFeedback(move_delay_s=0.03)
+        monitor = MotionMonitor(enabled=False, output_root=self.root / "motion_disabled")
+        monitor.config["action_timeout_s"] = 0.01
+        runner = expert_v2.ExpertStateRunner(1, monitor, self.root / "report.json")
+        runner.enter("COLLECTOR_MONITOR_DISABLED", nut="C")
+        result = expert_v2.move_pose(
+            runner, arm, TARGET_POSE, "MOCK_COLLECTOR_MONITOR_DISABLED"
+        )
+        self.assertEqual(result["motion_gate_status"], "PASS_MONITOR_DISABLED")
+        self.assertFalse(result["timeout"])
+        self.assertEqual(result["motion_monitor"], {})
 
     def test_cartesian_endpoint_feedback_unavailable_is_nonfatal(self) -> None:
         arm = MockArmWithoutPoseFeedback()
@@ -456,38 +472,71 @@ class CartesianGateTests(unittest.TestCase):
         self.assertAlmostEqual(result["final_joint_error"], 0.0)
         self.assertTrue(result["joint_target_based_divergence_available"])
 
-    def test_recorded_c_transport_uses_only_frozen_actual_joint_waypoints(self) -> None:
+    def deterministic_entry_runner(self) -> expert_v2.ExpertStateRunner:
+        runner = self.runner()
+        runner.enter("LEFT_SAFE_LIFT", nut="C")
+        runner.pass_state({"mock": True})
+        runner.enter("LEFT_PLACE_ABOVE", nut="C")
+        return runner
+
+    def assert_entry_alignment_passes(self, initial_error: float) -> None:
         arm = MockArm()
         waypoints = expert_v2.LEFT_FIXED_PLACE_JOINT_PATHS["C"]["transport"]
-        arm.joints = list(waypoints[0].joints)
+        anchor = list(waypoints[0].joints)
+        arm.joints = list(anchor)
+        arm.joints[0] += initial_error
         result = expert_v2.execute_recorded_joint_path(
-            self.runner(), arm, "C", "transport"
+            self.deterministic_entry_runner(), arm, "C", "transport"
         )
         self.assertEqual(arm.move_to_calls, 0)
         self.assertEqual(
             arm.move_joints_history,
-            [list(item.joints) for item in waypoints],
+            [anchor, *[list(item.joints) for item in waypoints]],
         )
-        self.assertEqual(result["reference_episode"], expert_v2.LEFT_FIXED_PLACE_REFERENCE_EPISODE)
+        alignment = result["entry_alignment"]
+        self.assertAlmostEqual(alignment["initial_max_abs_error"], initial_error)
+        self.assertAlmostEqual(alignment["final_max_abs_error"], 0.0)
+        self.assertEqual(alignment["motion"]["command_label"], "LEFT_FIXED_ENTRY_ALIGN_C")
         self.assertTrue(all(row["gate"]["pass"] for row in result["path"]))
 
-    def test_recorded_transport_entry_mismatch_faults_before_any_motion(self) -> None:
+    def test_entry_alignment_error_008_passes_before_fixed_transport(self) -> None:
+        self.assert_entry_alignment_passes(0.08)
+
+    def test_entry_alignment_error_015_passes_before_fixed_transport(self) -> None:
+        self.assert_entry_alignment_passes(0.15)
+
+    def test_entry_alignment_error_0214_passes_before_fixed_transport(self) -> None:
+        self.assert_entry_alignment_passes(0.214)
+
+    def test_entry_alignment_error_026_fails_before_motion(self) -> None:
         arm = MockArm()
-        arm.joints = [0.0] * 7
-        runner = self.runner()
+        anchor = list(expert_v2.LEFT_FIXED_PLACE_JOINT_PATHS["C"]["transport"][0].joints)
+        arm.joints = list(anchor)
+        arm.joints[0] += 0.26
         with self.assertRaises(expert_v2.StateFault) as caught:
-            expert_v2.execute_recorded_joint_path(runner, arm, "C", "transport")
-        self.assertIn("DETERMINISTIC_PLACE_ENTRY_MISMATCH", str(caught.exception))
+            expert_v2.execute_recorded_joint_path(
+                self.deterministic_entry_runner(), arm, "C", "transport"
+            )
+        self.assertIn("DETERMINISTIC_PLACE_ENTRY_TOO_FAR", str(caught.exception))
         self.assertEqual(arm.move_joints_history, [])
         self.assertEqual(arm.move_to_history, [])
-        snapshot = caught.exception.context
-        self.assertEqual(snapshot["current_joint"], [0.0] * 7)
-        self.assertEqual(
-            snapshot["anchor_joint"],
-            list(expert_v2.LEFT_FIXED_PLACE_JOINT_PATHS["C"]["transport"][0].joints),
-        )
-        self.assertGreater(snapshot["max_abs_error"], 0.10)
-        self.assertEqual(snapshot["threshold"], 0.10)
+        self.assertAlmostEqual(caught.exception.context["initial_max_abs_error"], 0.26)
+        self.assertEqual(caught.exception.context["threshold"], 0.25)
+
+    def test_entry_alignment_final_error_over_005_fails_before_transport(self) -> None:
+        arm = MockArm(move_joints_residual=0.06)
+        anchor = list(expert_v2.LEFT_FIXED_PLACE_JOINT_PATHS["C"]["transport"][0].joints)
+        arm.joints = list(anchor)
+        arm.joints[0] += 0.15
+        with self.assertRaises(expert_v2.StateFault) as caught:
+            expert_v2.execute_recorded_joint_path(
+                self.deterministic_entry_runner(), arm, "C", "transport"
+            )
+        self.assertIn("DETERMINISTIC_PLACE_ENTRY_ALIGN_FAILED", str(caught.exception))
+        self.assertEqual(arm.move_joints_history, [anchor])
+        self.assertEqual(arm.move_to_history, [])
+        self.assertAlmostEqual(caught.exception.context["final_max_abs_error"], 0.06)
+        self.assertEqual(caught.exception.context["threshold"], 0.05)
 
     def test_deterministic_parser_requires_b_to_be_terminal(self) -> None:
         accepted = expert_v2.parse_args([

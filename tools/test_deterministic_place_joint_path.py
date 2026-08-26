@@ -24,7 +24,6 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from agents.three_nut_expert.config import (  # noqa: E402
-    DETERMINISTIC_PLACE_ENTRY_TOLERANCE_RAD,
     LEFT_FIXED_PLACE_JOINT_PATHS,
     LEFT_FIXED_PLACE_REFERENCE_EPISODE,
 )
@@ -38,7 +37,7 @@ from tools.test_three_nut_closed_loop_v2 import (  # noqa: E402
 )
 
 
-START_ANCHOR_TOLERANCE_RAD = DETERMINISTIC_PLACE_ENTRY_TOLERANCE_RAD
+START_ANCHOR_TOLERANCE_RAD = 0.10
 
 
 def path_contract(reference_root: Path | None = None) -> dict[str, Any]:
@@ -144,6 +143,12 @@ def execute_test(nut: str) -> int:
                 f"exit first; max joint error={anchor_error} rad"
             )
 
+        runner.enter("LEFT_SAFE_LIFT", nut=nut)
+        runner.pass_state({
+            "physical_gate_precondition": "operator pre-positioned at recorded safe-lift anchor",
+            "start_anchor_error_rad": anchor_error,
+            "motion_sent": False,
+        })
         runner.enter("LEFT_PLACE_ABOVE", nut=nut)
         runner.pass_state({"motion": execute_recorded_joint_path(runner, left_bundle.left_arm, nut, "transport")})
         runner.enter("LEFT_PLACE", nut=nut)

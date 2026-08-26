@@ -26,7 +26,8 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from agents.three_nut_expert.config import (  # noqa: E402
-    DETERMINISTIC_PLACE_ENTRY_TOLERANCE_RAD,
+    DETERMINISTIC_PLACE_ENTRY_ELIGIBILITY_RAD,
+    DETERMINISTIC_PLACE_ENTRY_FINAL_TOLERANCE_RAD,
     HAND_OPEN,
     KNOWN_FIXED_NUT_WORLD_POSE,
     KNOWN_FIXED_NUT_WORLD_POSE_STATUS,
@@ -220,6 +221,11 @@ class ExpertStateRunner:
             "anchor_joint": context.get("anchor_joint"),
             "max_abs_error": context.get("max_abs_error"),
             "threshold": context.get("threshold"),
+            "current_joint_before": context.get("current_joint_before"),
+            "initial_max_abs_error": context.get("initial_max_abs_error"),
+            "sdk_return": context.get("sdk_return"),
+            "current_joint_after": context.get("current_joint_after"),
+            "final_max_abs_error": context.get("final_max_abs_error"),
             "command_start_time": context.get("command_start_time"),
             "command_end_time": context.get("command_end_time"),
             "elapsed_s": context.get("elapsed_s"),
@@ -266,33 +272,38 @@ class ExpertStateRunner:
         target_joint: list[float] | None = None,
         target_pose: list[float] | None = None,
         pose_check: dict[str, Any] | None = None,
+        context_extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         before, before_error = read_joint_method(arm, ("get_joint_angles", "get_joints", "get_qpos"))
         start_text = now_text(True)
         started = time.monotonic()
         timeout_s = float(self.monitor.config["action_timeout_s"])
+        monitor_enabled = bool(self.monitor.enabled)
         timeout_event = threading.Event()
 
         def mark_timeout() -> None:
             timeout_event.set()
             print(f"[TIMEOUT_PENDING] {label} exceeded {timeout_s:g}s; no later state will run", flush=True)
 
-        timer = threading.Timer(timeout_s, mark_timeout)
-        timer.daemon = True
+        timer = threading.Timer(timeout_s, mark_timeout) if monitor_enabled else None
+        if timer is not None:
+            timer.daemon = True
         monitor_started = False
         monitor_result = None
         value = None
         command_exc: BaseException | None = None
         try:
-            self.monitor.start_motion_monitor(
-                label,
-                arm,
-                target_joint=target_joint,
-                target_ee_pose=target_pose,
-                command_method=command_method,
-            )
-            monitor_started = True
-            timer.start()
+            if monitor_enabled:
+                self.monitor.start_motion_monitor(
+                    label,
+                    arm,
+                    target_joint=target_joint,
+                    target_ee_pose=target_pose,
+                    command_method=command_method,
+                )
+                monitor_started = True
+                assert timer is not None
+                timer.start()
             value = fn()
             failed, reason = sdk_failed(value)
             if failed:
@@ -300,9 +311,10 @@ class ExpertStateRunner:
         except BaseException as exc:
             command_exc = exc
         finally:
-            timer.cancel()
+            if timer is not None:
+                timer.cancel()
             elapsed = time.monotonic() - started
-            timed_out = timeout_event.is_set() or elapsed >= timeout_s
+            timed_out = monitor_enabled and (timeout_event.is_set() or elapsed >= timeout_s)
             if monitor_started:
                 try:
                     monitor_result = self.monitor.stop_motion_monitor(
@@ -313,10 +325,28 @@ class ExpertStateRunner:
                     command_exc = command_exc or exc
             after, after_error = read_joint_method(arm, ("get_joint_angles", "get_joints", "get_qpos"))
 
-        gate = evaluate_motion_result(
-            monitor_result,
-            timeout=timed_out,
-            sdk_return_ok=command_exc is None,
+        gate = (
+            evaluate_motion_result(
+                monitor_result,
+                timeout=timed_out,
+                sdk_return_ok=command_exc is None,
+            )
+            if monitor_enabled
+            else {
+                "pass": command_exc is None,
+                "status": "PASS_MONITOR_DISABLED" if command_exc is None else "FAULT",
+                "reason": "motion_monitor_disabled",
+                "sdk_return_ok": command_exc is None,
+                "timeout": False,
+                "diverged": False,
+                "max_joint_error": None,
+                "final_joint_error": None,
+                "max_joint_jump": None,
+                "diagnosis": "MOTION_MONITOR_DISABLED",
+                "cartesian_endpoint_feedback_available": None,
+                "endpoint_verification_status": "DISABLED",
+                "metrics": {},
+            }
         )
         metrics = gate.get("metrics") or {}
         context = {
@@ -356,6 +386,11 @@ class ExpertStateRunner:
             "position_error_m": metrics.get("final_position_error"),
             "orientation_error_deg": metrics.get("final_orientation_error"),
         }
+        context.update(jsonable(context_extra or {}))
+        alignment_anchor = context.get("anchor_joint")
+        if alignment_anchor is not None:
+            context.setdefault("current_joint_after", after)
+            context.setdefault("final_max_abs_error", max_abs_error(after, alignment_anchor))
         if command_exc is not None:
             raise self.fault(command_exc, context)
         if not gate["pass"]:
@@ -600,42 +635,100 @@ def execute_recorded_joint_path(
         raise ThreeNutClosedLoopError(
             f"no deterministic {segment} joint path for Nut {key}"
         ) from exc
+    entry_alignment = None
     if segment == "transport":
-        current_joint, read_error = read_joint_method(
-            left_arm, ("get_joint_angles", "get_joints", "get_qpos")
-        )
-        anchor_joint = list(waypoints[0].joints)
-        entry_error = (
-            max_abs_error(current_joint, anchor_joint)
-            if current_joint is not None and len(current_joint) == len(anchor_joint)
-            else None
-        )
-        if (
-            current_joint is None
-            or entry_error is None
-            or entry_error > DETERMINISTIC_PLACE_ENTRY_TOLERANCE_RAD
+        if not (
+            runner.last_success_state == "LEFT_SAFE_LIFT"
+            and runner.previous_state == "LEFT_SAFE_LIFT"
+            and runner.state == "LEFT_PLACE_ABOVE"
         ):
             raise runner.fault(
                 ThreeNutClosedLoopError(
-                    "DETERMINISTIC_PLACE_ENTRY_MISMATCH: "
-                    f"Nut {key} current-to-anchor max_abs_error={entry_error} "
-                    f"threshold={DETERMINISTIC_PLACE_ENTRY_TOLERANCE_RAD}"
+                    "DETERMINISTIC_PLACE_ENTRY_STATE_INVALID: "
+                    f"last_success_state={runner.last_success_state!r}"
                 ),
                 {
                     "command_method": "DETERMINISTIC_PLACE_ENTRY_GATE",
-                    "command_label": f"LEFT_FIXED_TRANSPORT_{key}_ENTRY_GATE",
-                    "joint_read_error": read_error,
-                    "current_joint": current_joint,
-                    "anchor_joint": anchor_joint,
-                    "max_abs_error": entry_error,
-                    "threshold": DETERMINISTIC_PLACE_ENTRY_TOLERANCE_RAD,
+                    "command_label": f"LEFT_FIXED_ENTRY_ALIGN_{key}",
+                    "required_last_success_state": "LEFT_SAFE_LIFT",
+                    "required_state": "LEFT_PLACE_ABOVE",
                 },
             )
+        current_before, read_error = read_joint_method(
+            left_arm, ("get_joint_angles", "get_joints", "get_qpos")
+        )
+        anchor_joint = list(waypoints[0].joints)
+        initial_error = (
+            max_abs_error(current_before, anchor_joint)
+            if current_before is not None and len(current_before) == len(anchor_joint)
+            else None
+        )
+        entry_context = {
+            "current_joint_before": current_before,
+            "anchor_joint": anchor_joint,
+            "initial_max_abs_error": initial_error,
+            "eligibility_threshold": DETERMINISTIC_PLACE_ENTRY_ELIGIBILITY_RAD,
+            "final_threshold": DETERMINISTIC_PLACE_ENTRY_FINAL_TOLERANCE_RAD,
+            "joint_read_before_error": read_error,
+        }
+        if initial_error is None or initial_error > DETERMINISTIC_PLACE_ENTRY_ELIGIBILITY_RAD:
+            raise runner.fault(
+                ThreeNutClosedLoopError(
+                    "DETERMINISTIC_PLACE_ENTRY_TOO_FAR: "
+                    f"Nut {key} initial_max_abs_error={initial_error} "
+                    f"threshold={DETERMINISTIC_PLACE_ENTRY_ELIGIBILITY_RAD}"
+                ),
+                {
+                    "command_method": "DETERMINISTIC_PLACE_ENTRY_GATE",
+                    "command_label": f"LEFT_FIXED_ENTRY_ALIGN_{key}",
+                    **entry_context,
+                    "threshold": DETERMINISTIC_PLACE_ENTRY_ELIGIBILITY_RAD,
+                },
+            )
+        align_motion = runner.arm_action(
+            label=f"LEFT_FIXED_ENTRY_ALIGN_{key}",
+            arm=left_arm,
+            command_method="move_joints",
+            target_joint=anchor_joint,
+            fn=lambda: left_arm.move_joints(anchor_joint),
+            context_extra=entry_context,
+        )
+        current_after, read_after_error = read_joint_method(
+            left_arm, ("get_joint_angles", "get_joints", "get_qpos")
+        )
+        final_error = (
+            max_abs_error(current_after, anchor_joint)
+            if current_after is not None and len(current_after) == len(anchor_joint)
+            else None
+        )
+        alignment_report = {
+            **entry_context,
+            "sdk_return": align_motion.get("sdk_return"),
+            "current_joint_after": current_after,
+            "final_max_abs_error": final_error,
+            "joint_read_after_error": read_after_error,
+        }
+        if final_error is None or final_error > DETERMINISTIC_PLACE_ENTRY_FINAL_TOLERANCE_RAD:
+            raise runner.fault(
+                ThreeNutClosedLoopError(
+                    "DETERMINISTIC_PLACE_ENTRY_ALIGN_FAILED: "
+                    f"Nut {key} final_max_abs_error={final_error} "
+                    f"threshold={DETERMINISTIC_PLACE_ENTRY_FINAL_TOLERANCE_RAD}"
+                ),
+                {
+                    "command_method": "move_joints",
+                    "command_label": f"LEFT_FIXED_ENTRY_ALIGN_{key}",
+                    **alignment_report,
+                    "threshold": DETERMINISTIC_PLACE_ENTRY_FINAL_TOLERANCE_RAD,
+                },
+            )
+        entry_alignment = {**alignment_report, "motion": align_motion}
     path = tuple(tuple(float(value) for value in item.joints) for item in waypoints)
     rows = move_joints_path(runner, left_arm, path, f"LEFT_FIXED_{segment.upper()}_{key}")
     return {
         "reference_episode": LEFT_FIXED_PLACE_REFERENCE_EPISODE,
         "segment": segment,
+        "entry_alignment": entry_alignment,
         "waypoints": [
             {
                 "joints": list(item.joints),
@@ -1074,7 +1167,7 @@ def plan_summary(
     ]
     per_nut = dynamic_per_nut + (
         [
-            "LEFT_FIXED_TRANSPORT", "LEFT_FIXED_PLACE", "LEFT_RELEASE",
+            "LEFT_FIXED_ENTRY_ALIGN", "LEFT_FIXED_TRANSPORT", "LEFT_FIXED_PLACE", "LEFT_RELEASE",
             "LEFT_FIXED_RETREAT_IF_NONTERMINAL", "LEFT_RETURN_READY_IF_NONTERMINAL",
             "LEFT_READY_CHECK_IF_NONTERMINAL",
         ]

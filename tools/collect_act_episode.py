@@ -750,7 +750,7 @@ def execute_episode(args: argparse.Namespace) -> int:
         watcher.start()
         runner = CollectingExpertRunner(
             1,
-            MotionMonitor(enabled=True),
+            MotionMonitor(enabled=bool(args.monitor)),
             episode_dir / "expert_report.json",
             abort_event=abort_event,
             command_events=command_events,
@@ -866,6 +866,7 @@ def execute_episode(args: argparse.Namespace) -> int:
         "shutdown_errors": shutdown_errors,
         "left_safe_lift_delta_z_m": LEFT_SAFE_LIFT_DELTA_Z_M,
         "deterministic_place_path": bool(args.deterministic_place_path),
+        "motion_monitor_enabled": bool(args.monitor),
         "accepted_for_training": False,
         "rejection_reason": rejection_reason,
         "reset_policy": "operator Web Reset only; collector performs no reset",
@@ -905,7 +906,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--sequence", default="C,B,A", help="Expert nut sequence (default: C,B,A).")
     parser.add_argument("--fps", type=float, default=5.0, help="State sampling frequency (default: 5Hz).")
-    parser.add_argument("--monitor", action="store_true", help="Compatibility flag; MotionMonitor is always enabled.")
+    parser.add_argument(
+        "--monitor",
+        action="store_true",
+        help="Enable MotionMonitor for Expert arm commands (default: disabled).",
+    )
     parser.add_argument(
         "--deterministic-place-path",
         action="store_true",
@@ -956,6 +961,7 @@ def main(argv: list[str] | None = None) -> int:
         "sequence": list(sequence),
         "fps": args.fps,
         "top_camera_only": True,
+        "motion_monitor_enabled": bool(args.monitor),
         "left_safe_lift_delta_z_m": LEFT_SAFE_LIFT_DELTA_Z_M,
         "synthetic_contract_self_test": result,
     }, ensure_ascii=False, indent=2))

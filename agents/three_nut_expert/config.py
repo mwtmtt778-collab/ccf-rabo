@@ -134,7 +134,8 @@ LEFT_PLACE_POSES = {
 # Cartesian retreat returned false without moving, so deterministic C -> B
 # treats B Place + release as terminal success.
 LEFT_FIXED_PLACE_REFERENCE_EPISODE = "episode_20260826_144708_105746"
-DETERMINISTIC_PLACE_ENTRY_TOLERANCE_RAD = 0.10
+DETERMINISTIC_PLACE_ENTRY_ELIGIBILITY_RAD = 0.25
+DETERMINISTIC_PLACE_ENTRY_FINAL_TOLERANCE_RAD = 0.05
 LEFT_FIXED_PLACE_JOINT_PATHS = {
     "C": {
         "transport": (
