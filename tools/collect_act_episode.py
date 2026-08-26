@@ -15,6 +15,7 @@ import math
 import os
 import select
 import sys
+import subprocess
 import threading
 import time
 from datetime import datetime
@@ -48,10 +49,9 @@ from agents.three_nut_expert.config import (  # noqa: E402
 from agents.three_nut_expert.expert import pose_to_list  # noqa: E402
 from tools.motion_monitor import MotionMonitor  # noqa: E402
 from tools.probe_act_recording_sources import (  # noqa: E402
-    discover_camera_topics,
     read_state26_timed,
 )
-from tools.record_act_episode import RawCameraRecorder, jsonable, now_iso  # noqa: E402
+from tools.record_act_episode import jsonable, now_iso  # noqa: E402
 from tools.test_dual_closed_loop_v2 import make_left_bundle, shutdown_left_bundle  # noqa: E402
 from tools.test_dual_closed_loop_v2_1 import LEFT_SAFE_LIFT_DELTA_Z_M  # noqa: E402
 from tools.test_dual_closed_loop_v2_1 import (  # noqa: E402
@@ -145,6 +145,124 @@ class KeyboardAbortWatcher:
         if self._termios is not None and self._old_attrs is not None and self._fd is not None:
             with contextlib.suppress(Exception):
                 self._termios.tcsetattr(self._fd, self._termios.TCSADRAIN, self._old_attrs)
+
+
+class TopCameraSidecarProcess:
+    """Own the top-camera ROS node in a separate Python interpreter."""
+
+    def __init__(self, episode_dir: Path, *, queue_size: int) -> None:
+        self.episode_dir = episode_dir
+        self.queue_size = queue_size
+        self.process: subprocess.Popen[str] | None = None
+        self.reader_thread: threading.Thread | None = None
+        self.ready_event = threading.Event()
+        self.frame_event = threading.Event()
+        self.lines: list[str] = []
+        self.frame_count = 0
+        self.start_info: dict[str, Any] = {}
+        self.summary_info: dict[str, Any] = {}
+        self.error: str | None = None
+        self._lock = threading.Lock()
+
+    def start(self) -> None:
+        script = PROJECT_ROOT / "tools" / "record_act_top_camera_sidecar.py"
+        self.process = subprocess.Popen(
+            [sys.executable, "-u", str(script), "--episode-dir", str(self.episode_dir), "--queue-size", str(self.queue_size)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        self.reader_thread = threading.Thread(target=self._read_output, name="act-top-sidecar-output", daemon=True)
+        self.reader_thread.start()
+
+    def _read_output(self) -> None:
+        assert self.process is not None and self.process.stdout is not None
+        for raw_line in self.process.stdout:
+            line = raw_line.rstrip("\n")
+            with self._lock:
+                self.lines.append(line)
+            print(line, flush=True)
+            if " READY " in f" {line} ":
+                self.ready_event.set()
+                self.start_info = {"raw": line}
+            elif " FRAME " in f" {line} ":
+                with self._lock:
+                    self.frame_count += 1
+                self.frame_event.set()
+            elif " SUMMARY " in f" {line} ":
+                with contextlib.suppress(json.JSONDecodeError):
+                    self.summary_info = json.loads(line.split(" SUMMARY ", 1)[1])
+            elif " ERROR " in f" {line} ":
+                self.error = line
+
+    def wait_ready(self, timeout_s: float) -> None:
+        if not self.ready_event.wait(timeout_s):
+            raise TimeoutError(f"top camera sidecar READY timeout: {self.error or self.lines[-10:]}")
+
+    def wait_frames(self, count: int, timeout_s: float) -> None:
+        deadline = time.monotonic() + timeout_s
+        while True:
+            with self._lock:
+                if self.frame_count >= count:
+                    return
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"top camera sidecar only received {self.frame_count}/{count} frames")
+            self.frame_event.wait(min(remaining, 0.2))
+            self.frame_event.clear()
+
+    def stop(self) -> None:
+        process = self.process
+        if process is None:
+            return
+        if process.poll() is None:
+            try:
+                assert process.stdin is not None
+                process.stdin.write("STOP\n")
+                process.stdin.flush()
+            except (BrokenPipeError, OSError):
+                pass
+            try:
+                process.wait(timeout=15.0)
+            except subprocess.TimeoutExpired:
+                process.terminate()
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    process.wait(timeout=5.0)
+        if self.reader_thread is not None:
+            self.reader_thread.join(timeout=2.0)
+
+    def saved_rows(self, timeline_origin_ns: int) -> list[dict[str, Any]]:
+        path = self.episode_dir / "camera_timestamps.jsonl"
+        rows: list[dict[str, Any]] = []
+        if not path.exists():
+            return rows
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                row = json.loads(line)
+                receive_ns = int(row["receive_monotonic_ns"])
+                rows.append({
+                    "path": row["frame_path"],
+                    "arrival_time_s": (receive_ns - timeline_origin_ns) / 1e9,
+                    "receive_monotonic_ns": receive_ns,
+                    "ros_timestamp": row.get("ros_stamp"),
+                    "width": row.get("width"),
+                    "height": row.get("height"),
+                    "encoding": row.get("encoding"),
+                })
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                continue
+        return sorted(rows, key=lambda row: int(row["receive_monotonic_ns"]))
+
+
+class SidecarCameraRecord:
+    def __init__(self, rows: list[dict[str, Any]], summary: dict[str, Any]) -> None:
+        self.saved = rows
+        self.callback_count = int(summary.get("callback_count", len(rows)))
+        self.queue_drop_count = int(summary.get("queue_drop_count", 0))
+        self.write_error_count = int(summary.get("writer_error_count", 0))
+        self.subscribe_error = None
 
 
 class CollectingExpertRunner(ExpertStateRunner):
@@ -252,6 +370,7 @@ class StateSampler:
                 read_end = time.monotonic()
                 self.samples.append({
                     "monotonic_timestamp": read_end,
+                    "monotonic_ns": time.monotonic_ns(),
                     "time_s": read_end - self.origin,
                     "wall_timestamp": now_iso(),
                     "read_duration_s": read_end - read_start,
@@ -292,28 +411,6 @@ class StateSampler:
         raise TimeoutError(f"no valid 26D state sample arrived within {timeout_s:g}s")
 
 
-def wait_for_first_top_frame(recorder: RawCameraRecorder, timeout_s: float) -> None:
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        record = recorder.records.get(TOP_SOURCE)
-        if record is not None:
-            with recorder._lock:  # Same lock used by RawCameraRecorder's callback/writer.
-                if record.saved:
-                    first = record.saved[0]
-                    if (
-                        first.get("width") == EXPECTED_TOP_WIDTH
-                        and first.get("height") == EXPECTED_TOP_HEIGHT
-                        and str(first.get("encoding", "")).lower() == EXPECTED_TOP_ENCODING
-                    ):
-                        return
-                    raise RuntimeError(
-                        "top frame contract mismatch: expected 960x540 rgb8, got "
-                        f"{first.get('width')}x{first.get('height')} {first.get('encoding')}"
-                    )
-        time.sleep(0.02)
-    raise TimeoutError(f"no valid top frame arrived within {timeout_s:g}s")
-
-
 def modes_for_states(
     state_timestamps: np.ndarray,
     command_events: Sequence[dict[str, Any]],
@@ -345,6 +442,21 @@ def causal_camera_alignment(
     return indices.astype(np.int64), ages
 
 
+def causal_camera_alignment_ns(
+    state_monotonic_ns: np.ndarray,
+    camera_monotonic_ns: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Align absolute Linux monotonic timestamps without crossing processes."""
+    indices = np.searchsorted(camera_monotonic_ns, state_monotonic_ns, side="right") - 1
+    ages = np.full(len(state_monotonic_ns), np.nan, dtype=np.float64)
+    valid = indices >= 0
+    ages[valid] = (
+        state_monotonic_ns[valid].astype(np.float64)
+        - camera_monotonic_ns[indices[valid]].astype(np.float64)
+    ) / 1e9
+    return indices.astype(np.int64), ages
+
+
 def camera_age_summary(ages: np.ndarray) -> dict[str, float | None]:
     valid = ages[np.isfinite(ages)]
     if not len(valid):
@@ -362,6 +474,8 @@ def build_episode_arrays(
     samples: Sequence[dict[str, Any]],
     command_events: Sequence[dict[str, Any]],
     frames: Sequence[dict[str, Any]],
+    *,
+    timeline_origin_ns: int | None = None,
 ) -> dict[str, np.ndarray]:
     states = np.asarray([sample["state"] for sample in samples], dtype=np.float32)
     if not len(samples):
@@ -369,6 +483,13 @@ def build_episode_arrays(
     state_timestamps = np.asarray([sample["time_s"] for sample in samples], dtype=np.float64)
     state_monotonic_timestamps = np.asarray(
         [sample["monotonic_timestamp"] for sample in samples], dtype=np.float64
+    )
+    state_monotonic_ns = np.asarray(
+        [
+            int(sample.get("monotonic_ns", round(sample["monotonic_timestamp"] * 1e9)))
+            for sample in samples
+        ],
+        dtype=np.int64,
     )
     state_wall_timestamps = np.asarray(
         [sample["wall_timestamp"] for sample in samples], dtype=np.str_
@@ -393,16 +514,28 @@ def build_episode_arrays(
         dtype=np.float64,
     )
     camera_frame_paths = np.asarray([frame["path"] for frame in sorted_frames], dtype=np.str_)
-    camera_indices, camera_ages = causal_camera_alignment(state_timestamps, camera_timestamps)
+    camera_monotonic_ns = np.asarray(
+        [int(frame["receive_monotonic_ns"]) for frame in sorted_frames if "receive_monotonic_ns" in frame],
+        dtype=np.int64,
+    )
+    if len(camera_monotonic_ns) == len(sorted_frames) and len(samples):
+        camera_indices, camera_ages = causal_camera_alignment_ns(state_monotonic_ns, camera_monotonic_ns)
+        if timeline_origin_ns is not None:
+            camera_timestamps = (camera_monotonic_ns - int(timeline_origin_ns)) / 1e9
+    else:
+        camera_monotonic_ns = np.empty((0,), dtype=np.int64)
+        camera_indices, camera_ages = causal_camera_alignment(state_timestamps, camera_timestamps)
     return {
         "states": states,
         "state_timestamps": state_timestamps,
         "state_monotonic_timestamps": state_monotonic_timestamps,
+        "state_monotonic_ns": state_monotonic_ns,
         "state_wall_timestamps": state_wall_timestamps,
         "state_read_durations": state_read_durations,
         "grasp_modes_at_state": grasp_modes,
         "hybrid_actions": hybrid_actions,
         "camera_timestamps": camera_timestamps,
+        "camera_monotonic_ns": camera_monotonic_ns,
         "camera_ros_timestamps": camera_ros_timestamps,
         "camera_frame_paths": camera_frame_paths,
         "camera_frame_index_for_state": camera_indices,
@@ -425,6 +558,8 @@ def evaluate_quality(
     modes = arrays["grasp_modes_at_state"]
     state_times = arrays["state_timestamps"]
     camera_times = arrays["camera_timestamps"]
+    state_ns = arrays.get("state_monotonic_ns", np.empty((0,), dtype=np.int64))
+    camera_ns = arrays.get("camera_monotonic_ns", np.empty((0,), dtype=np.int64))
     indices = arrays["camera_frame_index_for_state"]
     ages = arrays["camera_age_s"]
     valid_indices = indices >= 0
@@ -465,7 +600,11 @@ def evaluate_quality(
         "all_observations_have_causal_top_frame": bool(len(indices) == len(states) and valid_indices.all()),
         "camera_never_uses_future_frame": bool(
             valid_indices.all()
-            and np.all(camera_times[indices] <= state_times)
+            and (
+                np.all(camera_ns[indices] <= state_ns)
+                if len(camera_ns) == len(camera_times) and len(state_ns) == len(state_times)
+                else np.all(camera_times[indices] <= state_times)
+            )
             and np.all(ages >= 0.0)
         ) if len(indices) else False,
         "top_frames_960x540_rgb8": bool(
@@ -709,12 +848,11 @@ def execute_episode(args: argparse.Namespace) -> int:
     os.environ.setdefault("ROS_LOG_DIR", str(PROJECT_ROOT / "logs" / "ros"))
 
     started_at = now_iso()
-    timeline_origin = time.monotonic()
+    timeline_origin_ns = time.monotonic_ns()
+    timeline_origin = timeline_origin_ns / 1e9
     abort_event = threading.Event()
     watcher = KeyboardAbortWatcher(abort_event)
-    camera_topics, discovery = discover_camera_topics()
-    top_topics = {TOP_SOURCE: camera_topics[TOP_SOURCE]} if TOP_SOURCE in camera_topics else {}
-    recorder = RawCameraRecorder(top_topics, episode_dir, queue_size=args.queue_size)
+    sidecar = TopCameraSidecarProcess(episode_dir, queue_size=args.queue_size)
     right_bundle = left_bundle = None
     sampler: StateSampler | None = None
     runner: CollectingExpertRunner | None = None
@@ -729,6 +867,10 @@ def execute_episode(args: argparse.Namespace) -> int:
     print("Reset policy: Web Reset only; this collector calls no reset API.", flush=True)
     print("Press q to abort after the current blocking SDK command returns.", flush=True)
     try:
+        sidecar.start()
+        sidecar.wait_ready(args.camera_ready_timeout)
+        sidecar.wait_frames(3, args.camera_ready_timeout)
+        print("Top camera sidecar has received 3 frames; starting formal state timeline and Expert.", flush=True)
         right_bundle = make_right_bundle()
         left_bundle = make_left_bundle()
         devices = {
@@ -737,15 +879,6 @@ def execute_episode(args: argparse.Namespace) -> int:
             "left_hand": left_bundle.left_hand,
             "right_hand": right_bundle.right_hand,
         }
-        recorder.start()
-        if recorder.init_error:
-            raise RuntimeError(f"top camera initialization failed: {recorder.init_error}")
-        if TOP_SOURCE not in recorder.records:
-            raise RuntimeError("top fixed_rgb camera was not discovered")
-        recorder.begin(timeline_origin)
-        print("Waiting for first valid 960x540 rgb8 top frame...", flush=True)
-        wait_for_first_top_frame(recorder, args.camera_ready_timeout)
-        print("Top camera ready; starting formal state timeline and Expert.", flush=True)
         sampler = StateSampler(devices, timeline_origin, args.fps)
         sampler.start()
         sampler.wait_until_ready()
@@ -785,7 +918,7 @@ def execute_episode(args: argparse.Namespace) -> int:
         watcher.close()
         if sampler is not None:
             sampler.stop()
-        recorder.close()
+        sidecar.stop()
         try:
             shutdown_bundle(right_bundle)
         except Exception as exc:
@@ -795,20 +928,23 @@ def execute_episode(args: argparse.Namespace) -> int:
         except Exception as exc:
             shutdown_errors.append(f"left_bundle: {repr(exc)}")
 
-    camera_metadata = recorder.write_metadata()
-    record = recorder.records.get(TOP_SOURCE)
-    if record is None:
-        # A stand-in lets the quality report remain fail-closed and complete.
-        class MissingRecord:
-            saved: list[dict[str, Any]] = []
-            write_error_count = 0
-            queue_drop_count = 0
-            subscribe_error = "top camera unavailable"
-
-        record = MissingRecord()
+    frames = sidecar.saved_rows(timeline_origin_ns)
+    record = SidecarCameraRecord(frames, sidecar.summary_info)
+    camera_metadata = {TOP_DATASET_NAME: {
+        "source_label": TOP_SOURCE,
+        "topic": sidecar.summary_info.get("topic"),
+        "type": sidecar.summary_info.get("type"),
+        **sidecar.summary_info,
+    }}
+    discovery = {"sidecar": sidecar.start_info, "summary": sidecar.summary_info}
     samples = sampler.samples if sampler is not None else []
     state_errors = sampler.errors if sampler is not None else [{"error": "state sampler not started"}]
-    arrays = build_episode_arrays(samples, command_events, record.saved)
+    arrays = build_episode_arrays(
+        samples,
+        command_events,
+        record.saved,
+        timeline_origin_ns=timeline_origin_ns,
+    )
     quality = evaluate_quality(
         arrays,
         state_errors=state_errors,
@@ -816,7 +952,9 @@ def execute_episode(args: argparse.Namespace) -> int:
         requested_sequence=sequence,
         completed_nuts=completed_nuts,
         camera_record=record,
-        camera_writer_error=recorder.writer_shutdown_error,
+        camera_writer_error=(
+            "sidecar process failed" if sidecar.process is not None and sidecar.process.returncode not in (0, None) else None
+        ),
     )
     np.savez_compressed(episode_dir / "telemetry.npz", **arrays)
     write_json(episode_dir / "command_events.json", command_events)
@@ -843,11 +981,13 @@ def execute_episode(args: argparse.Namespace) -> int:
             "states": ["N", 26],
             "state_timestamps": ["N"],
             "state_monotonic_timestamps": ["N"],
+            "state_monotonic_ns": ["N"],
             "state_wall_timestamps": ["N"],
             "state_read_durations": ["N"],
             "grasp_modes_at_state": ["N", 2],
             "hybrid_actions": ["N-1", 28],
             "camera_timestamps": ["F"],
+            "camera_monotonic_ns": ["F"],
             "camera_ros_timestamps": ["F"],
             "camera_frame_paths": ["F"],
             "camera_frame_index_for_state": ["N"],
@@ -855,7 +995,7 @@ def execute_episode(args: argparse.Namespace) -> int:
         },
         "observation": "26D state + causal top RGB only",
         "camera_alignment": "LATEST_PREVIOUS_FRAME",
-        "camera_timestamp_basis": "monotonic callback arrival relative to episode origin",
+        "camera_timestamp_basis": "absolute monotonic_ns callback arrival; relative seconds retained for compatibility",
         "camera_discovery": discovery,
         "camera": camera_metadata.get(TOP_DATASET_NAME, {}),
         "expert_status": expert_status,
