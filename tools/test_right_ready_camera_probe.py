@@ -10,7 +10,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from agents.three_nut_expert.config import DEVICE_IDS  # noqa: E402
+from agents.three_nut_expert.config import DEVICE_IDS, KNOWN_FIXED_NUT_WORLD_POSE  # noqa: E402
+from agents.three_nut_expert.expert import compute_right_approach_pose, compute_right_grasp_pose, pose_to_list  # noqa: E402
 
 RIGHT_READY_1 = [-1.57, -1.5, 0.0, -1.57, 0.0, -1.0, 0.0]
 RIGHT_READY_2 = [0.0, 0.0, 0.0, -2.0, 0.0, 1.0, 0.0]
@@ -60,9 +61,30 @@ def run_motion(arm: object, target: list[float], label: str, blocking: bool) -> 
         return False
 
 
+def run_approach(arm: object, blocking: bool) -> bool:
+    nut = KNOWN_FIXED_NUT_WORLD_POSE["C"]
+    grasp = compute_right_grasp_pose((nut.x, nut.y, nut.z))
+    target = pose_to_list(compute_right_approach_pose(grasp))
+    try:
+        pose_check = arm.pose_check(*target[:3], roll=target[3], pitch=target[4], yaw=target[5])
+        print(f"[PROBE] RIGHT_APPROACH_POSE_CHECK {pose_check!r}", flush=True)
+        if isinstance(pose_check, (list, tuple)) and pose_check and pose_check[0] is False:
+            return False
+        before = [float(v) for v in list(arm.get_joint_angles())[:7]]
+        started = time.monotonic_ns()
+        result = arm.move_to(*target[:3], roll=target[3], pitch=target[4], yaw=target[5], blocking=blocking)
+        print(f"[PROBE] RIGHT_APPROACH call_duration_ms={(time.monotonic_ns() - started) / 1e6:.3f} result={result!r}", flush=True)
+        if result is False:
+            return False
+        return settle(arm, "RIGHT_APPROACH", before)
+    except BaseException as exc:
+        print(f"[PROBE] RIGHT_APPROACH_FAILED exception={exc!r}", flush=True)
+        return False
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Probe sequential right-arm ready motions without other devices.")
-    parser.add_argument("--stop-after", type=int, choices=(1, 2), default=2)
+    parser.add_argument("--stop-after", type=int, choices=(1, 2, 3), default=2)
     parser.add_argument("--blocking", action="store_true", help="Future comparison: use blocking=True.")
     args = parser.parse_args(argv)
     from rabo_robocap import LinkerArmA7
@@ -76,6 +98,13 @@ def main(argv: list[str] | None = None) -> int:
     print("[PROBE] BEFORE_RIGHT_READY_2", flush=True)
     time.sleep(1.0)
     if not run_motion(arm, RIGHT_READY_2, "RIGHT_READY_2", args.blocking):
+        return 1
+    if args.stop_after == 2:
+        time.sleep(15.0)
+        return 0
+    print("[PROBE] BEFORE_RIGHT_APPROACH", flush=True)
+    time.sleep(1.0)
+    if not run_approach(arm, args.blocking):
         return 1
     time.sleep(15.0)
     return 0
