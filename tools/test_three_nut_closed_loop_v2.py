@@ -122,7 +122,8 @@ class StartupTrace:
         if milestone and self.stop_after == milestone.lower():
             print(f"[STARTUP_DIAG_STOP] {milestone}", flush=True)
             time.sleep(15.0)
-            raise SystemExit(0)
+            # Diagnostic stop must not enter the normal cleanup/finally path.
+            os._exit(0)
 
     def timed(self, name: str, fn: Callable[[], Any], *, milestone: str | None = None) -> Any:
         start = time.monotonic_ns()
@@ -1362,7 +1363,7 @@ def run(args: argparse.Namespace) -> int:
     started = datetime.now().astimezone()
     startup.event("REPORT_INIT_START")
     report_path = REPORT_DIR / f"three_nut_v2_{started.strftime('%Y%m%d_%H%M%S')}.json"
-    startup.event("REPORT_INIT_END", duration_ms=0.0)
+    startup.event("REPORT_INIT_END", milestone="report", duration_ms=0.0)
     coordinator = None
     if args.coordinated_execution:
         trace_stamp = started.strftime("%Y%m%d_%H%M%S_%f")
@@ -1398,25 +1399,25 @@ def run(args: argparse.Namespace) -> int:
             pose_setter = make_pose_setter()
         startup.event("SDK_IMPORT_READY")
         startup.event("WORLD_CONTEXT_INIT_START")
-        startup.event("WORLD_CONTEXT_INIT_END", duration_ms=0.0)
+        startup.event("WORLD_CONTEXT_INIT_END", milestone="world_context", duration_ms=0.0)
         from types import SimpleNamespace
         from rabo_robocap import LinkerArmA7, LinkerHandO6Left, LinkerHandO6Right
         startup.event("RIGHT_ARM_INIT_START")
         t_init = time.monotonic_ns()
         right_arm = LinkerArmA7(robot_id=DEVICE_IDS["RIGHT_ARM"], mode="sim")
-        startup.event("RIGHT_ARM_INIT_END", duration_ms=(time.monotonic_ns() - t_init) / 1e6)
+        startup.event("RIGHT_ARM_INIT_END", milestone="right_arm", duration_ms=(time.monotonic_ns() - t_init) / 1e6)
         startup.event("RIGHT_HAND_INIT_START")
         t_init = time.monotonic_ns()
         right_hand = LinkerHandO6Right(robot_id=DEVICE_IDS["RIGHT_HAND"], mode="sim")
-        startup.event("RIGHT_HAND_INIT_END", duration_ms=(time.monotonic_ns() - t_init) / 1e6)
+        startup.event("RIGHT_HAND_INIT_END", milestone="right_hand", duration_ms=(time.monotonic_ns() - t_init) / 1e6)
         startup.event("LEFT_ARM_INIT_START")
         t_init = time.monotonic_ns()
         left_arm = LinkerArmA7(robot_id=DEVICE_IDS["LEFT_ARM"], mode="sim")
-        startup.event("LEFT_ARM_INIT_END", duration_ms=(time.monotonic_ns() - t_init) / 1e6)
+        startup.event("LEFT_ARM_INIT_END", milestone="left_arm", duration_ms=(time.monotonic_ns() - t_init) / 1e6)
         startup.event("LEFT_HAND_INIT_START")
         t_init = time.monotonic_ns()
         left_hand = LinkerHandO6Left(robot_id=DEVICE_IDS["LEFT_HAND"], mode="sim")
-        startup.event("LEFT_HAND_INIT_END", duration_ms=(time.monotonic_ns() - t_init) / 1e6)
+        startup.event("LEFT_HAND_INIT_END", milestone="left_hand", duration_ms=(time.monotonic_ns() - t_init) / 1e6)
         right_bundle = SimpleNamespace(right_arm=right_arm, right_hand=right_hand)
         left_bundle = SimpleNamespace(left_arm=left_arm, left_hand=left_hand)
         startup.event("DEVICE_BUNDLE_READY", milestone="devices")
@@ -1569,7 +1570,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--startup-stop-after",
-        choices=("devices", "coordinator", "expert_ready"),
+        choices=("report", "world_context", "right_arm", "right_hand", "left_arm", "left_hand", "devices", "coordinator", "expert_ready"),
         help="Stop after a startup milestone, sleep 15s, and exit without motion.",
     )
     parser.add_argument("--test-left-ready", action="store_true", help="Run only the no-Nut LEFT_READY candidate motion-chain test.")
