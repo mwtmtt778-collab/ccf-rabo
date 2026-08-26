@@ -408,13 +408,15 @@ class ExpertStateRunner:
         start_text = now_text(True)
         timeout_s = float(self.monitor.config["action_timeout_s"])
         timeout_event = threading.Event()
-        timer = threading.Timer(timeout_s, timeout_event.set)
-        timer.daemon = True
-        timer.start()
+        timer = threading.Timer(timeout_s, timeout_event.set) if self.monitor.enabled else None
+        if timer is not None:
+            timer.daemon = True
+            timer.start()
         try:
             value = fn()
         except BaseException as exc:
-            timer.cancel()
+            if timer is not None:
+                timer.cancel()
             raise self.fault(exc, {
                 "command_method": command_method,
                 "command_label": label,
@@ -423,9 +425,12 @@ class ExpertStateRunner:
                 "elapsed_s": time.monotonic() - start,
                 "timeout": timeout_event.is_set(),
             })
-        timer.cancel()
+        if timer is not None:
+            timer.cancel()
         elapsed = time.monotonic() - start
-        timed_out = timeout_event.is_set() or elapsed >= timeout_s
+        timed_out = bool(self.monitor.enabled) and (
+            timeout_event.is_set() or elapsed >= timeout_s
+        )
         failed, reason = sdk_failed(value)
         if timed_out or failed:
             message = f"{label}: " + ("TIMEOUT" if timed_out else f"SDK return failed: {reason}")
@@ -1031,7 +1036,7 @@ def shutdown_pose_setter(value: Any | None) -> None:
 def run_left_ready_test(args: argparse.Namespace) -> int:
     started = datetime.now().astimezone()
     report_path = REPORT_DIR / f"left_ready_test_{started.strftime('%Y%m%d_%H%M%S')}.json"
-    monitor = MotionMonitor(enabled=True)
+    monitor = MotionMonitor(enabled=motion_gate_enabled(args))
     runner = ExpertStateRunner(1, monitor, report_path)
     left_bundle = None
     report: dict[str, Any] = {
@@ -1102,7 +1107,7 @@ def run_left_return_ready_c_test(args: argparse.Namespace) -> int:
     runner: ExpertStateRunner | None = None
     try:
         left_bundle = make_left_bundle()
-        setup_monitor = MotionMonitor(enabled=True)
+        setup_monitor = MotionMonitor(enabled=motion_gate_enabled(args))
         report["motion_gate_config"] = dict(setup_monitor.config)
         runner = ExpertStateRunner(0, setup_monitor, report_path)
         go_left_initial_ready(runner, left_bundle.left_arm)
@@ -1110,7 +1115,7 @@ def run_left_return_ready_c_test(args: argparse.Namespace) -> int:
 
         retreat = vertical_retreat_from_place(LEFT_PLACE_POSES["C"])
         for cycle in range(1, int(args.return_ready_cycles) + 1):
-            monitor = MotionMonitor(enabled=True)
+            monitor = MotionMonitor(enabled=motion_gate_enabled(args))
             runner = ExpertStateRunner(cycle, monitor, report_path)
             test = {
                 "cycle": cycle,
@@ -1214,6 +1219,8 @@ def plan_summary(
 def run(args: argparse.Namespace) -> int:
     sequence = parse_sequence_arg(args.sequence)
     validate_static_contract(sequence)
+    gate_enabled = motion_gate_enabled(args)
+    print(f"[MOTION_GATE] enabled={gate_enabled}", flush=True)
     if args.plan_only:
         print(json.dumps(
             plan_summary(
@@ -1249,6 +1256,7 @@ def run(args: argparse.Namespace) -> int:
         "right_pick_target_source": "KNOWN_FIXED_NUT_WORLD_POSE with VERIFIED Nut B template",
         "left_pick_uses_post_release_vision": True,
         "deterministic_place_path": bool(args.deterministic_place_path),
+        "motion_gate_enabled": gate_enabled,
         "geometry_policy": "VERIFIED Nut B grasp template for A/B/C; vertical RIGHT_APPROACH added",
         "threshold_status": "PROVISIONAL_THRESHOLD_REQUIRES_RABO_TUNING",
         "trials": [],
@@ -1261,7 +1269,7 @@ def run(args: argparse.Namespace) -> int:
         right_bundle = make_right_bundle()
         left_bundle = make_left_bundle()
         for trial_id in range(1, args.trials + 1):
-            monitor = MotionMonitor(enabled=True)
+            monitor = MotionMonitor(enabled=gate_enabled)
             report.setdefault("motion_gate_config", dict(monitor.config))
             runner = ExpertStateRunner(trial_id, monitor, report_path)
             trial = {"trial_id": trial_id, "status": "RUNNING", "states": runner.states}
@@ -1368,7 +1376,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--headless", action="store_true", default=True, help="Headless mode (default; only supported mode).")
     parser.add_argument("--trials", type=int, default=1, help="Number of complete episodes (default: 1).")
     parser.add_argument("--sequence", default="C,B,A", help="Nut sequence, e.g. C, C,B, or C,B,A (default: C,B,A).")
-    parser.add_argument("--monitor", action="store_true", help="Explicitly request monitoring (V2 arm motion gates always enable it).")
+    parser.add_argument(
+        "--monitor",
+        action="store_true",
+        help="Explicitly request the default-enabled standalone MotionMonitor gate.",
+    )
+    parser.add_argument(
+        "--no-motion-gate",
+        action="store_true",
+        help="Disable MotionMonitor sampling and all monitor-derived fail-stop gates.",
+    )
     parser.add_argument(
         "--deterministic-place-path",
         action="store_true",
@@ -1400,6 +1417,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--recording-probe", "--probe", dest="recording_probe", action="store_true")
     parser.add_argument("--recording-probe-fps", type=float, default=10.0)
     args = parser.parse_args(argv)
+    if args.monitor and args.no_motion_gate:
+        parser.error("--monitor and --no-motion-gate are mutually exclusive")
     try:
         parse_sequence_arg(args.sequence)
     except ThreeNutClosedLoopError as exc:
@@ -1431,6 +1450,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         if missing_retreat:
             parser.error(f"non-terminal deterministic retreat is unavailable for: {missing_retreat}")
     return args
+
+
+def motion_gate_enabled(args: argparse.Namespace) -> bool:
+    """Standalone Expert keeps its historical gate unless explicitly disabled."""
+    return not bool(args.no_motion_gate)
 
 
 if __name__ == "__main__":

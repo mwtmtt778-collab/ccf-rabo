@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import inspect
+import sys
 import tempfile
 import time
 import unittest
@@ -12,7 +13,12 @@ from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 import expert.left_nut_grasp_planner as left_planner_module
+import tools.collect_act_episode as act_collector
 import tools.test_three_nut_closed_loop_v2 as expert_v2
 from agents.three_nut_expert.config import (
     KNOWN_FIXED_NUT_WORLD_POSE,
@@ -190,6 +196,16 @@ class MockArmWithoutPoseFeedback(MockArm):
         return None
 
 
+class MockOutOfWorkspaceArm(MockArm):
+    def pose_check(self, *_args: object, **_kwargs: object) -> list[object]:
+        return [False, "out_of_workspace"]
+
+
+class MockSdkExceptionArm(MockArmWithoutPoseFeedback):
+    def move_to(self, *_args: object, **_kwargs: object) -> bool:
+        raise RuntimeError("mock SDK transport exception")
+
+
 class MockHand:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, object]]] = []
@@ -231,8 +247,10 @@ class CartesianGateTests(unittest.TestCase):
         expert_v2.REPORT_DIR = self.original_report_dir
         self.temp_dir.cleanup()
 
-    def runner(self, *, timeout_s: float = 10.0) -> expert_v2.ExpertStateRunner:
-        monitor = MotionMonitor(enabled=True, output_root=self.root / "motion")
+    def runner(
+        self, *, timeout_s: float = 10.0, monitor_enabled: bool = True
+    ) -> expert_v2.ExpertStateRunner:
+        monitor = MotionMonitor(enabled=monitor_enabled, output_root=self.root / "motion")
         monitor.config["action_timeout_s"] = timeout_s
         runner = expert_v2.ExpertStateRunner(1, monitor, self.root / "report.json")
         runner.enter("MOCK_MOTION", nut="C")
@@ -276,9 +294,7 @@ class CartesianGateTests(unittest.TestCase):
 
     def test_motion_monitor_disabled_does_not_apply_monitor_timeout(self) -> None:
         arm = MockArmWithoutPoseFeedback(move_delay_s=0.03)
-        monitor = MotionMonitor(enabled=False, output_root=self.root / "motion_disabled")
-        monitor.config["action_timeout_s"] = 0.01
-        runner = expert_v2.ExpertStateRunner(1, monitor, self.root / "report.json")
+        runner = self.runner(timeout_s=0.01, monitor_enabled=False)
         runner.enter("COLLECTOR_MONITOR_DISABLED", nut="C")
         result = expert_v2.move_pose(
             runner, arm, TARGET_POSE, "MOCK_COLLECTOR_MONITOR_DISABLED"
@@ -286,6 +302,54 @@ class CartesianGateTests(unittest.TestCase):
         self.assertEqual(result["motion_gate_status"], "PASS_MONITOR_DISABLED")
         self.assertFalse(result["timeout"])
         self.assertEqual(result["motion_monitor"], {})
+
+    def test_no_motion_gate_ignores_large_joint_jump(self) -> None:
+        arm = MockArmWithoutPoseFeedback(joint_after=0.80)
+        runner = self.runner(monitor_enabled=False)
+        self.assertFalse(runner.monitor.enabled)
+        result = expert_v2.move_pose(
+            runner,
+            arm,
+            TARGET_POSE,
+            "MOCK_NO_GATE_JOINT_JUMP",
+        )
+        self.assertEqual(result["motion_gate_status"], "PASS_MONITOR_DISABLED")
+        self.assertIsNone(result["max_joint_jump"])
+        self.assertEqual(result["motion_monitor"], {})
+        self.assertFalse((self.root / "motion").exists())
+
+    def test_no_motion_gate_still_faults_on_sdk_false(self) -> None:
+        arm = MockArmWithoutPoseFeedback(move_result=False)
+        with self.assertRaises(expert_v2.StateFault) as caught:
+            expert_v2.move_pose(
+                self.runner(monitor_enabled=False),
+                arm,
+                TARGET_POSE,
+                "MOCK_NO_GATE_SDK_FALSE",
+            )
+        self.assertIn("SDK return failed", str(caught.exception))
+
+    def test_no_motion_gate_still_faults_on_sdk_exception(self) -> None:
+        with self.assertRaises(expert_v2.StateFault) as caught:
+            expert_v2.move_pose(
+                self.runner(monitor_enabled=False),
+                MockSdkExceptionArm(),
+                TARGET_POSE,
+                "MOCK_NO_GATE_SDK_EXCEPTION",
+            )
+        self.assertIn("mock SDK transport exception", str(caught.exception))
+
+    def test_no_motion_gate_still_faults_on_pose_check_out_of_workspace(self) -> None:
+        arm = MockOutOfWorkspaceArm()
+        with self.assertRaises(expert_v2.StateFault) as caught:
+            expert_v2.move_pose(
+                self.runner(monitor_enabled=False),
+                arm,
+                TARGET_POSE,
+                "MOCK_NO_GATE_OUT_OF_WORKSPACE",
+            )
+        self.assertIn("out_of_workspace", str(caught.exception))
+        self.assertEqual(arm.move_to_calls, 0)
 
     def test_cartesian_endpoint_feedback_unavailable_is_nonfatal(self) -> None:
         arm = MockArmWithoutPoseFeedback()
@@ -551,6 +615,60 @@ class CartesianGateTests(unittest.TestCase):
             expert_v2.parse_args([
                 "--sequence", "C,B,A", "--deterministic-place-path", "--plan-only",
             ])
+
+    def test_no_motion_gate_cli_reaches_disabled_runner_contract(self) -> None:
+        expert_args = expert_v2.parse_args([
+            "--sequence", "C", "--deterministic-place-path", "--no-motion-gate", "--plan-only",
+        ])
+        collector_args = act_collector.build_parser().parse_args([
+            "--sequence", "C", "--deterministic-place-path", "--no-motion-gate",
+        ])
+        self.assertFalse(expert_v2.motion_gate_enabled(expert_args))
+        self.assertFalse(act_collector.motion_gate_enabled(collector_args))
+        self.assertFalse(MotionMonitor(enabled=expert_v2.motion_gate_enabled(expert_args)).enabled)
+        self.assertFalse(MotionMonitor(enabled=act_collector.motion_gate_enabled(collector_args)).enabled)
+
+    def test_collector_c_only_final_release_is_terminal(self) -> None:
+        runner = expert_v2.ExpertStateRunner(
+            1,
+            MotionMonitor(enabled=False, output_root=self.root / "terminal_motion"),
+            self.root / "terminal_report.json",
+        )
+        right_bundle = SimpleNamespace(right_arm=object())
+        left_bundle = SimpleNamespace(left_arm=object())
+        terminal_flags: list[bool] = []
+        originals = (
+            act_collector.go_right_ready,
+            act_collector.go_left_initial_ready,
+            act_collector.execute_right_transfer,
+            act_collector.execute_left_pick_place,
+        )
+        act_collector.go_right_ready = lambda _runner, _arm: None
+        act_collector.go_left_initial_ready = lambda _runner, _arm: None
+        act_collector.execute_right_transfer = lambda *_args, **_kwargs: [0.1, 0.2, 0.3]
+        act_collector.execute_left_pick_place = lambda *_args, **kwargs: terminal_flags.append(
+            bool(kwargs["terminal_after_release"])
+        )
+        try:
+            completed = act_collector.run_expert(
+                runner,
+                ("C",),
+                right_bundle,
+                left_bundle,
+                settle_after_release_s=0.0,
+                vision_target_radius_m=0.1,
+                deterministic_place_path=True,
+            )
+        finally:
+            (
+                act_collector.go_right_ready,
+                act_collector.go_left_initial_ready,
+                act_collector.execute_right_transfer,
+                act_collector.execute_left_pick_place,
+            ) = originals
+        self.assertEqual(completed, ["C"])
+        self.assertEqual(terminal_flags, [True])
+        self.assertEqual(runner.last_success_state, "DONE")
 
     def test_default_plan_uses_scene_initial_pose_without_reset_or_randomization(self) -> None:
         args = expert_v2.parse_args([])

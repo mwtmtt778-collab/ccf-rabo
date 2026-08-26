@@ -690,6 +690,8 @@ def move_episode(source: Path, destination_root: Path) -> Path:
 def execute_episode(args: argparse.Namespace) -> int:
     sequence = parse_sequence_arg(args.sequence)
     validate_static_contract(tuple(sequence))
+    gate_enabled = motion_gate_enabled(args)
+    print(f"[MOTION_GATE] enabled={gate_enabled}", flush=True)
     if not math.isclose(LEFT_SAFE_LIFT_DELTA_Z_M, 0.12, rel_tol=0.0, abs_tol=1e-12):
         raise SystemExit(f"LEFT_SAFE_LIFT_DELTA_Z_M must be 0.12, got {LEFT_SAFE_LIFT_DELTA_Z_M}")
 
@@ -750,7 +752,7 @@ def execute_episode(args: argparse.Namespace) -> int:
         watcher.start()
         runner = CollectingExpertRunner(
             1,
-            MotionMonitor(enabled=bool(args.monitor)),
+            MotionMonitor(enabled=gate_enabled),
             episode_dir / "expert_report.json",
             abort_event=abort_event,
             command_events=command_events,
@@ -866,7 +868,7 @@ def execute_episode(args: argparse.Namespace) -> int:
         "shutdown_errors": shutdown_errors,
         "left_safe_lift_delta_z_m": LEFT_SAFE_LIFT_DELTA_Z_M,
         "deterministic_place_path": bool(args.deterministic_place_path),
-        "motion_monitor_enabled": bool(args.monitor),
+        "motion_monitor_enabled": gate_enabled,
         "accepted_for_training": False,
         "rejection_reason": rejection_reason,
         "reset_policy": "operator Web Reset only; collector performs no reset",
@@ -912,6 +914,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Enable MotionMonitor for Expert arm commands (default: disabled).",
     )
     parser.add_argument(
+        "--no-motion-gate",
+        action="store_true",
+        help="Explicitly disable MotionMonitor sampling and monitor-derived fail-stop gates.",
+    )
+    parser.add_argument(
         "--deterministic-place-path",
         action="store_true",
         help="Use recorded actual_joint C/B fixed transport/place paths; default keeps Cartesian fallback.",
@@ -928,6 +935,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.monitor and args.no_motion_gate:
+        parser.error("--monitor and --no-motion-gate are mutually exclusive")
     try:
         sequence = parse_sequence_arg(args.sequence)
     except Exception as exc:
@@ -955,17 +964,24 @@ def main(argv: list[str] | None = None) -> int:
     if args.execute:
         return execute_episode(args)
     result = synthetic_contract_self_test()
+    gate_enabled = motion_gate_enabled(args)
+    print(f"[MOTION_GATE] enabled={gate_enabled}", flush=True)
     print("DRY RUN: no robot, hand, camera, or reset API was invoked.")
     print(json.dumps({
         "static_contract": "PASS",
         "sequence": list(sequence),
         "fps": args.fps,
         "top_camera_only": True,
-        "motion_monitor_enabled": bool(args.monitor),
+        "motion_monitor_enabled": gate_enabled,
         "left_safe_lift_delta_z_m": LEFT_SAFE_LIFT_DELTA_Z_M,
         "synthetic_contract_self_test": result,
     }, ensure_ascii=False, indent=2))
     return 0
+
+
+def motion_gate_enabled(args: argparse.Namespace) -> bool:
+    """Collector gates are opt-in; --no-motion-gate makes that contract explicit."""
+    return bool(args.monitor) and not bool(args.no_motion_gate)
 
 
 if __name__ == "__main__":
