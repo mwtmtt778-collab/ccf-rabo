@@ -61,6 +61,7 @@ from tools.motion_monitor import (  # noqa: E402
     max_abs_error,
     read_joint_method,
 )
+from agents.three_nut_expert.execution import ExecutionCoordinator  # noqa: E402
 from tools.probe_act_recording_sources import IntegratedRecordingProbe  # noqa: E402
 from tools.test_dual_closed_loop_v2 import make_left_bundle, shutdown_left_bundle  # noqa: E402
 from tools.test_dual_closed_loop_v2_1 import (  # noqa: E402
@@ -138,7 +139,7 @@ def validate_static_contract(sequence: tuple[str, ...]) -> None:
             raise ThreeNutClosedLoopError(f"incomplete static contract for Nut {key}")
 
 
-def pose_check_cartesian(arm: Any, pose: list[float]) -> tuple[list[float] | None, dict[str, Any]]:
+def pose_check_cartesian(arm: Any, pose: list[float], *, coordinator: ExecutionCoordinator | None = None, phase: str = "POSE_CHECK") -> tuple[list[float] | None, dict[str, Any]]:
     if not hasattr(arm, "pose_check"):
         return None, {
             "pose_check_reachable": False,
@@ -146,7 +147,8 @@ def pose_check_cartesian(arm: Any, pose: list[float]) -> tuple[list[float] | Non
             "reason": "pose_check unavailable",
         }
     try:
-        raw = arm.pose_check(*pose[:3], roll=pose[3], pitch=pose[4], yaw=pose[5])
+        call = lambda: arm.pose_check(*pose[:3], roll=pose[3], pitch=pose[4], yaw=pose[5])
+        raw = coordinator.call(phase=phase, device="LEFT_ARM" if phase.startswith("LEFT") else "RIGHT_ARM", operation="pose_check", fn=call) if coordinator else call()
     except Exception as exc:
         return None, {
             "pose_check_reachable": False,
@@ -180,6 +182,8 @@ class ExpertStateRunner:
     states: list[dict[str, Any]] = field(default_factory=list)
     fault_path: str | None = None
     nonblocking_motion: bool = False
+    coordinator: ExecutionCoordinator | None = None
+    phase_started_monotonic: float = 0.0
 
     def _wait_nonblocking_settle(self, arm: Any, label: str, before: list[float] | None) -> tuple[list[float], dict[str, Any]]:
         timeout_s = 20.0 if "TRANSPORT" in label else 15.0
@@ -191,7 +195,12 @@ class ExpertStateRunner:
         while time.monotonic() - started < timeout_s:
             time.sleep(0.2)
             try:
-                current = [float(v) for v in list(arm.get_joint_angles())[:7]]
+                if self.coordinator is not None:
+                    device = "LEFT_ARM" if label.startswith("LEFT") else "RIGHT_ARM"
+                    raw = self.coordinator.call(phase=label, device=device, operation="get_joint_angles", fn=lambda: arm.get_joint_angles())
+                else:
+                    raw = arm.get_joint_angles()
+                current = [float(v) for v in list(raw)[:7]]
             except BaseException as exc:
                 print(f"[NONBLOCKING_MOTION] phase={label} error={exc!r}", flush=True)
                 raise ThreeNutClosedLoopError(f"{label}: nonblocking settle read failed: {exc}") from exc
@@ -217,6 +226,8 @@ class ExpertStateRunner:
                 print(f"[NONBLOCKING_MOTION] phase={label} settled=True elapsed={elapsed:.3f} max_delta={max_delta:.6f}", flush=True)
                 return current, {"settled": True, "movement_started": movement_started, "max_delta": max_delta, "settle_elapsed_s": elapsed}
         print(f"[NONBLOCKING_MOTION] phase={label} timeout={timeout_s:g}s", flush=True)
+        if self.coordinator is not None:
+            self.coordinator._trace("timeout", phase=label, device=("LEFT_ARM" if label.startswith("LEFT") else "RIGHT_ARM"), operation="motion_settle")
         raise ThreeNutClosedLoopError(f"{label}: NONBLOCKING_MOTION_TIMEOUT")
 
     def enter(self, state: str, *, nut: str | None = None) -> None:
@@ -225,6 +236,9 @@ class ExpertStateRunner:
         if nut is not None:
             self.nut = nut
         print(f"\n[STATE] {self.previous_state} -> {self.state} nut={self.nut or '-'}", flush=True)
+        if self.coordinator is not None:
+            self.coordinator.phase_start(self.state)
+            self.phase_started_monotonic = time.monotonic()
 
     def pass_state(self, details: dict[str, Any] | None = None) -> None:
         row = {
@@ -237,6 +251,8 @@ class ExpertStateRunner:
         }
         self.states.append(jsonable(row))
         self.last_success_state = self.state
+        if self.coordinator is not None and self.phase_started_monotonic:
+            self.coordinator.phase_end(self.state, time.monotonic() - self.phase_started_monotonic)
         print(f"[STATE_PASS] {self.state}", flush=True)
 
     def fault(self, exc: BaseException, context: dict[str, Any] | None = None) -> StateFault:
@@ -313,11 +329,20 @@ class ExpertStateRunner:
         pose_check: dict[str, Any] | None = None,
         context_extra: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        before, before_error = read_joint_method(arm, ("get_joint_angles", "get_joints", "get_qpos"))
+        nonblocking = bool(self.nonblocking_motion or self.coordinator is not None)
+        if self.coordinator is not None:
+            try:
+                device = "LEFT_ARM" if label.startswith("LEFT") else "RIGHT_ARM"
+                before = list(self.coordinator.call(phase=label, device=device, operation="get_joint_angles", fn=lambda: arm.get_joint_angles()))[:7]
+                before_error = None
+            except Exception as exc:
+                before, before_error = None, repr(exc)
+        else:
+            before, before_error = read_joint_method(arm, ("get_joint_angles", "get_joints", "get_qpos"))
         start_text = now_text(True)
         started = time.monotonic()
         timeout_s = float(self.monitor.config["action_timeout_s"])
-        monitor_enabled = bool(self.monitor.enabled) and not self.nonblocking_motion
+        monitor_enabled = bool(self.monitor.enabled) and not nonblocking
         timeout_event = threading.Event()
 
         def mark_timeout() -> None:
@@ -346,13 +371,17 @@ class ExpertStateRunner:
                 monitor_started = True
                 assert timer is not None
                 timer.start()
-            if self.nonblocking_motion:
+            if nonblocking:
                 print(f"[NONBLOCKING_MOTION] phase={label} command={command_method} sent=True", flush=True)
-            value = fn()
+            if self.coordinator is not None:
+                device = "LEFT_ARM" if label.startswith("LEFT") else "RIGHT_ARM"
+                value = self.coordinator.call(phase=label, device=device, operation=command_method, fn=fn)
+            else:
+                value = fn()
             failed, reason = sdk_failed(value)
             if failed:
                 command_exc = ThreeNutClosedLoopError(f"{label}: SDK return failed: {reason}")
-            elif self.nonblocking_motion:
+            elif nonblocking:
                 after, settle = self._wait_nonblocking_settle(arm, label, before)
         except BaseException as exc:
             command_exc = exc
@@ -369,7 +398,7 @@ class ExpertStateRunner:
                     )
                 except Exception as exc:
                     command_exc = command_exc or exc
-            if not self.nonblocking_motion:
+            if not nonblocking:
                 after, after_error = read_joint_method(arm, ("get_joint_angles", "get_joints", "get_qpos"))
 
         gate = (
@@ -415,7 +444,7 @@ class ExpertStateRunner:
             "timeout": timed_out,
             "sdk_returned_after_timeout": bool(timed_out),
             "motion_monitor": monitor_result or {},
-            "nonblocking_motion": self.nonblocking_motion,
+            "nonblocking_motion": nonblocking,
             "motion_settle": locals().get("settle", {}),
             "gate": gate,
             "sdk_return": jsonable(value),
@@ -462,7 +491,11 @@ class ExpertStateRunner:
             timer.daemon = True
             timer.start()
         try:
-            value = fn()
+            if self.coordinator is not None:
+                hand_device = "LEFT_HAND" if command_method.startswith("left_hand") else "RIGHT_HAND"
+                value = self.coordinator.call(phase=label, device=hand_device, operation=command_method, fn=fn)
+            else:
+                value = fn()
         except BaseException as exc:
             if timer is not None:
                 timer.cancel()
@@ -552,7 +585,7 @@ def move_joints_path(
             arm=arm,
             command_method="move_joints",
             target_joint=target,
-            fn=lambda target=target: arm.move_joints(target, blocking=not runner.nonblocking_motion),
+            fn=lambda target=target: arm.move_joints(target, blocking=False if runner.coordinator else not runner.nonblocking_motion),
         ))
     return rows
 
@@ -564,7 +597,7 @@ def move_pose(
     label: str,
 ) -> dict[str, Any]:
     values = pose_to_list(pose) if isinstance(pose, Pose6) else [float(v) for v in pose]
-    target_joint, pose_check = pose_check_cartesian(arm, values)
+    target_joint, pose_check = pose_check_cartesian(arm, values, coordinator=runner.coordinator, phase=label)
     if not pose_check["pose_check_reachable"]:
         raise runner.fault(ThreeNutClosedLoopError(f"{label}: Cartesian pose_check failed: {pose_check['pose_check_reason']}"), {
             "command_method": "pose_check",
@@ -579,7 +612,7 @@ def move_pose(
         if label.startswith(("RIGHT_APPROACH_", "RIGHT_PICK_", "RIGHT_SAFE_LIFT_")):
             print("[RIGHT_MOVE_COMMAND]")
             print(f"{label} = {json.dumps(values)}")
-        return arm.move_to(*values[:3], roll=values[3], pitch=values[4], yaw=values[5], blocking=not runner.nonblocking_motion)
+        return arm.move_to(*values[:3], roll=values[3], pitch=values[4], yaw=values[5], blocking=False if runner.coordinator else not runner.nonblocking_motion)
 
     return runner.arm_action(
         label=label,
@@ -744,12 +777,19 @@ def execute_recorded_joint_path(
             arm=left_arm,
             command_method="move_joints",
             target_joint=anchor_joint,
-            fn=lambda: left_arm.move_joints(anchor_joint, blocking=not runner.nonblocking_motion),
+            fn=lambda: left_arm.move_joints(anchor_joint, blocking=False if runner.coordinator else not runner.nonblocking_motion),
             context_extra=entry_context,
         )
-        current_after, read_after_error = read_joint_method(
-            left_arm, ("get_joint_angles", "get_joints", "get_qpos")
-        )
+        if runner.coordinator is not None:
+            try:
+                current_after = list(runner.coordinator.call(phase=f"LEFT_FIXED_ENTRY_ALIGN_{key}", device="LEFT_ARM", operation="get_joint_angles", fn=lambda: left_arm.get_joint_angles()))[:7]
+                read_after_error = None
+            except Exception as exc:
+                current_after, read_after_error = None, repr(exc)
+        else:
+            current_after, read_after_error = read_joint_method(
+                left_arm, ("get_joint_angles", "get_joints", "get_qpos")
+            )
         final_error = (
             max_abs_error(current_after, anchor_joint)
             if current_after is not None and len(current_after) == len(anchor_joint)
@@ -1288,6 +1328,10 @@ def run(args: argparse.Namespace) -> int:
 
     started = datetime.now().astimezone()
     report_path = REPORT_DIR / f"three_nut_v2_{started.strftime('%Y%m%d_%H%M%S')}.json"
+    coordinator = None
+    if args.coordinated_execution:
+        trace_stamp = started.strftime("%Y%m%d_%H%M%S_%f")
+        coordinator = ExecutionCoordinator(PROJECT_ROOT / "reports" / "execution_trace" / f"{trace_stamp}.jsonl")
     report: dict[str, Any] = {
         "experiment": "three_nut_closed_loop_v2",
         "timestamp": started.isoformat(timespec="seconds"),
@@ -1307,6 +1351,7 @@ def run(args: argparse.Namespace) -> int:
         "deterministic_place_path": bool(args.deterministic_place_path),
         "motion_gate_enabled": gate_enabled,
         "nonblocking_motion": bool(args.nonblocking_motion),
+        "coordinated_execution": bool(args.coordinated_execution),
         "geometry_policy": "VERIFIED Nut B grasp template for A/B/C; vertical RIGHT_APPROACH added",
         "threshold_status": "PROVISIONAL_THRESHOLD_REQUIRES_RABO_TUNING",
         "trials": [],
@@ -1321,7 +1366,7 @@ def run(args: argparse.Namespace) -> int:
         for trial_id in range(1, args.trials + 1):
             monitor = MotionMonitor(enabled=gate_enabled)
             report.setdefault("motion_gate_config", dict(monitor.config))
-            runner = ExpertStateRunner(trial_id, monitor, report_path, nonblocking_motion=bool(args.nonblocking_motion))
+            runner = ExpertStateRunner(trial_id, monitor, report_path, nonblocking_motion=bool(args.nonblocking_motion), coordinator=coordinator)
             trial = {"trial_id": trial_id, "status": "RUNNING", "states": runner.states}
             report["trials"].append(trial)
             try:
@@ -1397,7 +1442,7 @@ def run(args: argparse.Namespace) -> int:
             finally:
                 trial["states"] = runner.states
                 write_json(report_path, report)
-        report["status"] = "PASS"
+            report["status"] = "PASS"
         report["overall_success"] = True
         return_code = 0
     except KeyboardInterrupt as exc:
@@ -1407,6 +1452,8 @@ def run(args: argparse.Namespace) -> int:
         report.update({"status": "FAILED", "overall_success": False, "failure_reason": repr(exc)})
         return_code = 1
     finally:
+        if coordinator is not None:
+            coordinator.write_summary(coordinator.trace_path.with_name(coordinator.trace_path.stem + "_summary.json"))
         if probe is not None:
             try:
                 report["recording_probe"] = probe.stop(task_status=report["status"])
@@ -1448,6 +1495,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--nonblocking-motion",
         action="store_true",
         help="Send each arm motion once with blocking=False and wait for joint settling.",
+    )
+    parser.add_argument(
+        "--coordinated-execution",
+        action="store_true",
+        help="Serialize multi-device SDK invocations and emit an execution trace.",
     )
     parser.add_argument("--test-left-ready", action="store_true", help="Run only the no-Nut LEFT_READY candidate motion-chain test.")
     parser.add_argument(

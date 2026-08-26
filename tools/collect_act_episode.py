@@ -74,6 +74,7 @@ from tools.test_three_nut_closed_loop_v2 import (  # noqa: E402
     parse_sequence_arg,
     validate_static_contract,
 )
+from agents.three_nut_expert.execution import ExecutionCoordinator  # noqa: E402
 
 
 class EpisodeAbort(RuntimeError):
@@ -342,7 +343,7 @@ class CollectingExpertRunner(ExpertStateRunner):
 class StateSampler:
     """Poll 26D state on its own fixed-rate thread."""
 
-    def __init__(self, devices: dict[str, Any], origin: float, fps: float) -> None:
+    def __init__(self, devices: dict[str, Any], origin: float, fps: float, coordinator: ExecutionCoordinator | None = None) -> None:
         self.devices = devices
         self.origin = origin
         self.fps = fps
@@ -351,6 +352,9 @@ class StateSampler:
         self.overrun_periods = 0
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
+        self.coordinator = coordinator
+        self.state_sample_delay_ms: list[float] = []
+        self.state_sample_missed_deadline_count = 0
 
     def start(self) -> None:
         self.thread = threading.Thread(target=self._run, name="act-v1-state-sampler", daemon=True)
@@ -366,7 +370,11 @@ class StateSampler:
                 continue
             read_start = time.monotonic()
             try:
-                state, components, component_durations = read_state26_timed(self.devices)
+                read_fn = lambda: read_state26_timed(self.devices)
+                if self.coordinator is not None:
+                    state, components, component_durations = self.coordinator.call(phase="STATE_SAMPLE", device="STATE_SAMPLER", operation="read_state26", fn=read_fn)
+                else:
+                    state, components, component_durations = read_fn()
                 read_end = time.monotonic()
                 self.samples.append({
                     "monotonic_timestamp": read_end,
@@ -391,6 +399,7 @@ class StateSampler:
             if read_end > deadline:
                 missed = max(1, int((read_end - deadline) / interval) + 1)
                 self.overrun_periods += missed
+                self.state_sample_missed_deadline_count += missed
                 deadline += missed * interval
 
     def stop(self) -> None:
@@ -855,6 +864,7 @@ def execute_episode(args: argparse.Namespace) -> int:
     sidecar = TopCameraSidecarProcess(episode_dir, queue_size=args.queue_size)
     right_bundle = left_bundle = None
     sampler: StateSampler | None = None
+    coordinator: ExecutionCoordinator | None = None
     runner: CollectingExpertRunner | None = None
     command_events: list[dict[str, Any]] = []
     completed_nuts: list[str] = []
@@ -879,7 +889,10 @@ def execute_episode(args: argparse.Namespace) -> int:
             "left_hand": left_bundle.left_hand,
             "right_hand": right_bundle.right_hand,
         }
-        sampler = StateSampler(devices, timeline_origin, args.fps)
+        if args.coordinated_execution:
+            trace_stamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S_%f")
+            coordinator = ExecutionCoordinator(PROJECT_ROOT / "reports" / "execution_trace" / f"collector_{trace_stamp}.jsonl")
+        sampler = StateSampler(devices, timeline_origin, args.fps, coordinator=coordinator)
         sampler.start()
         sampler.wait_until_ready()
         watcher.start()
@@ -891,6 +904,7 @@ def execute_episode(args: argparse.Namespace) -> int:
             command_events=command_events,
             timeline_origin=timeline_origin,
             nonblocking_motion=bool(args.nonblocking_motion),
+            coordinator=coordinator,
         )
         expert_status = "RUNNING"
         completed_nuts = run_expert(
@@ -919,6 +933,8 @@ def execute_episode(args: argparse.Namespace) -> int:
         watcher.close()
         if sampler is not None:
             sampler.stop()
+        if coordinator is not None and coordinator.trace_path is not None:
+            coordinator.write_summary(coordinator.trace_path.with_name(coordinator.trace_path.stem + "_summary.json"))
         sidecar.stop()
         try:
             shutdown_bundle(right_bundle)
@@ -1011,6 +1027,8 @@ def execute_episode(args: argparse.Namespace) -> int:
         "deterministic_place_path": bool(args.deterministic_place_path),
         "nonblocking_motion": bool(args.nonblocking_motion),
         "motion_monitor_enabled": gate_enabled,
+        "coordinated_execution": bool(args.coordinated_execution),
+        "state_sample_missed_deadline_count": sampler.state_sample_missed_deadline_count if sampler is not None else 0,
         "accepted_for_training": False,
         "rejection_reason": rejection_reason,
         "reset_policy": "operator Web Reset only; collector performs no reset",
@@ -1069,6 +1087,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--nonblocking-motion",
         action="store_true",
         help="Send each arm motion with blocking=False and wait for joint settling.",
+    )
+    parser.add_argument(
+        "--coordinated-execution",
+        action="store_true",
+        help="Serialize Expert, hand, and sampler SDK invocations with an execution trace.",
     )
     parser.add_argument("--episode-id", help="Optional unique episode directory name.")
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)

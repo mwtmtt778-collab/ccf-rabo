@@ -35,6 +35,7 @@ from agents.three_nut_expert.expert import (
 from expert.left_nut_grasp_planner import LeftNutGraspPlanner
 from tools.test_left_grasp_v1 import RIGHT_NUT_B_GRASP_POSE
 from tools.motion_monitor import MotionMonitor
+from agents.three_nut_expert.execution import ExecutionCoordinator
 
 
 TARGET_POSE = [0.10, 0.20, -0.10, 0.0, 0.8, 0.0]
@@ -597,6 +598,22 @@ class CartesianGateTests(unittest.TestCase):
             expert_v2.time.monotonic = original_monotonic
         self.assertIn("NONBLOCKING_MOTION_TIMEOUT", str(caught.exception))
 
+    def test_execution_coordinator_serializes_and_traces_switches(self) -> None:
+        coordinator = ExecutionCoordinator(quiet_s=0.0)
+        active = 0
+        maximum = 0
+
+        def call() -> bool:
+            nonlocal active, maximum
+            active += 1; maximum = max(maximum, active); time.sleep(0.01); active -= 1
+            return True
+
+        coordinator.call(phase="P1", device="RIGHT_ARM", operation="move_joints", fn=call)
+        coordinator.call(phase="P2", device="RIGHT_HAND", operation="clench", fn=call)
+        self.assertEqual(maximum, 1)
+        self.assertEqual(coordinator.summary()["device_switch_count"], 1)
+        self.assertEqual(coordinator.summary()["sdk_call_count"], 2)
+
     def deterministic_entry_runner(self) -> expert_v2.ExpertStateRunner:
         runner = self.runner()
         runner.enter("LEFT_SAFE_LIFT", nut="C")
@@ -689,6 +706,8 @@ class CartesianGateTests(unittest.TestCase):
         self.assertFalse(MotionMonitor(enabled=expert_v2.motion_gate_enabled(expert_args)).enabled)
         self.assertFalse(MotionMonitor(enabled=act_collector.motion_gate_enabled(collector_args)).enabled)
         self.assertTrue(collector_args.nonblocking_motion)
+        coordinated_args = act_collector.build_parser().parse_args(["--coordinated-execution"])
+        self.assertTrue(coordinated_args.coordinated_execution)
 
     def test_collector_c_only_final_release_is_terminal(self) -> None:
         runner = expert_v2.ExpertStateRunner(
