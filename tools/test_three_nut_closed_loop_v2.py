@@ -575,6 +575,11 @@ def vertical_retreat_from_place(place: Pose6) -> list[float]:
     return [place.x, place.y, place.z + LEFT_SAFE_LIFT_DELTA_Z_M, place.roll, place.pitch, place.yaw]
 
 
+def place_above_pose(place: Pose6, safe_z: float) -> list[float]:
+    """Keep the verified Place x/y/RPY while staying at the current safe height."""
+    return [place.x, place.y, float(safe_z), place.roll, place.pitch, place.yaw]
+
+
 def execute_right_transfer(
     runner: ExpertStateRunner,
     key: str,
@@ -753,8 +758,23 @@ def execute_left_pick_place(
     lift_rows.append(move_pose(runner, left_bundle.left_arm, extra_safe_lift, "LEFT_SAFE_LIFT_FINAL"))
     runner.pass_state({"moves": lift_rows, "safe_lift_pose": extra_safe_lift})
 
-    runner.enter("LEFT_PLACE")
     place = LEFT_PLACE_POSES[key]
+    place_above = place_above_pose(place, extra_safe_lift[2])
+    runner.enter("LEFT_PLACE_ABOVE")
+    place_above_row = move_pose(
+        runner,
+        left_bundle.left_arm,
+        place_above,
+        f"LEFT_PLACE_ABOVE_{key}",
+    )
+    runner.pass_state({
+        "move": place_above_row,
+        "place_above_pose": place_above,
+        "safe_z_source": "extra_safe_lift.z",
+        "place_xy_rpy_source": f"LEFT_PLACE_POSES[{key!r}]",
+    })
+
+    runner.enter("LEFT_PLACE")
     place_row = move_pose(runner, left_bundle.left_arm, place, f"LEFT_PLACE_{key}")
     runner.hand_action(label="LEFT_RELEASE_OPEN", command_method="left_hand.clench", fn=lambda: left_bundle.left_hand.clench(*list(HAND_OPEN)))
     runner.pass_state({"move": place_row, "place_pose": pose_to_list(place)})
@@ -927,7 +947,7 @@ def plan_summary(sequence: tuple[str, ...], reset_to_nominal: bool) -> dict[str,
         "RIGHT_RELEASE", "RIGHT_SAFE_RETREAT", "RIGHT_READY", "RIGHT_READY_CHECK",
         "LEFT_VISION", "LEFT_APPROACH", "LEFT_THUMB_TUCK", "LEFT_DESCENT",
         "LEFT_GRASP", "LEFT_GRASP_FORCE", "LEFT_SAFE_LIFT",
-        "LEFT_PLACE", "LEFT_SAFE_RETREAT", "LEFT_RETURN_READY", "LEFT_READY_CHECK",
+        "LEFT_PLACE_ABOVE", "LEFT_PLACE", "LEFT_SAFE_RETREAT", "LEFT_RETURN_READY", "LEFT_READY_CHECK",
     ]
     return {
         "status": "PLAN_ONLY_NO_RABO_SDK",

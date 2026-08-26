@@ -428,6 +428,17 @@ class CartesianGateTests(unittest.TestCase):
             state_names[approach_index:approach_index + 6],
             ["LEFT_APPROACH", "LEFT_THUMB_TUCK", "LEFT_DESCENT", "LEFT_GRASP", "LEFT_GRASP_FORCE", "LEFT_SAFE_LIFT"],
         )
+        safe_lift_index = state_names.index("LEFT_SAFE_LIFT")
+        self.assertEqual(
+            state_names[safe_lift_index:safe_lift_index + 3],
+            ["LEFT_SAFE_LIFT", "LEFT_PLACE_ABOVE", "LEFT_PLACE"],
+        )
+        safe_lift_z = runner.states[safe_lift_index]["details"]["safe_lift_pose"][2]
+        place_above = runner.states[safe_lift_index + 1]["details"]["place_above_pose"]
+        place = pose_to_list(expert_v2.LEFT_PLACE_POSES["C"])
+        self.assertEqual(place_above, [place[0], place[1], safe_lift_z, *place[3:]])
+        self.assertEqual(arm.move_to_history[-3], place_above)
+        self.assertEqual(arm.move_to_history[-2], place)
         self.assertEqual(ready_calls, ["LEFT_RETURN_READY"])
 
     def test_move_joints_gate_regression_passes(self) -> None:

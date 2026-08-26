@@ -655,8 +655,8 @@ def execute_episode(args: argparse.Namespace) -> int:
     if tuple(sequence) != NUT_SEQUENCE:
         raise SystemExit("formal ACT V1 collector requires exact sequence C,B,A")
     validate_static_contract(tuple(sequence))
-    if not math.isclose(LEFT_SAFE_LIFT_DELTA_Z_M, 0.18, rel_tol=0.0, abs_tol=1e-12):
-        raise SystemExit(f"LEFT_SAFE_LIFT_DELTA_Z_M must be 0.18, got {LEFT_SAFE_LIFT_DELTA_Z_M}")
+    if not math.isclose(LEFT_SAFE_LIFT_DELTA_Z_M, 0.12, rel_tol=0.0, abs_tol=1e-12):
+        raise SystemExit(f"LEFT_SAFE_LIFT_DELTA_Z_M must be 0.12, got {LEFT_SAFE_LIFT_DELTA_Z_M}")
 
     output_root = args.output_root if args.output_root.is_absolute() else PROJECT_ROOT / args.output_root
     temporary_root = output_root / "temporary"
@@ -895,7 +895,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(f"settle-after-release-s must be at least {minimum_settle:g}s")
 
     validate_static_contract(tuple(sequence))
-    if not math.isclose(LEFT_SAFE_LIFT_DELTA_Z_M, 0.18, rel_tol=0.0, abs_tol=1e-12):
+    if not math.isclose(LEFT_SAFE_LIFT_DELTA_Z_M, 0.12, rel_tol=0.0, abs_tol=1e-12):
         raise SystemExit(f"height contract failed: LEFT_SAFE_LIFT_DELTA_Z_M={LEFT_SAFE_LIFT_DELTA_Z_M}")
     if args.execute:
         return execute_episode(args)
