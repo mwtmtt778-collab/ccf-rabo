@@ -99,10 +99,38 @@ def format_gap(item: dict[str, Any], index: int) -> list[str]:
 def analyze(camera: list[dict[str, Any]], trace: list[dict[str, Any]]) -> str:
     if len(camera) < 2:
         raise ValueError("at least two camera timestamps are required")
+    if not trace:
+        raise ValueError("at least one execution timestamp is required")
     gaps = gap_rows(camera)
+    camera_first = camera[0]["receive_monotonic_ns"]
+    camera_last = camera[-1]["receive_monotonic_ns"]
+    execution_first = trace[0]["monotonic_ns"]
+    execution_last = trace[-1]["monotonic_ns"]
+    overlap = execution_first <= camera_last and camera_first <= execution_last
+    tail_gap_ns = execution_last - camera_last
+    tail = None
+    if tail_gap_ns > 500_000_000:
+        before = [row for row in trace if row["monotonic_ns"] <= camera_last]
+        after = [row for row in trace if row["monotonic_ns"] > camera_last]
+        active = None
+        for row in before:
+            if row.get("phase") or row.get("device") or row.get("operation"):
+                active = row
+        tail = {"last_camera": camera[-1], "execution_end_ns": execution_last, "gap_ns": tail_gap_ns,
+                "active": active, "before": before[-1] if before else None,
+                "after_first": after[0] if after else None, "after_recent": after[:20]}
     first = gaps[0] if gaps else None
     correlated = [correlate(gap, trace) for gap in gaps]
-    lines = ["# Camera / Execution Correlation", "", f"- camera_frames: `{len(camera)}`", f"- execution_events: `{len(trace)}`", ""]
+    lines = ["# Camera / Execution Correlation", "", "## Timeline ranges", "",
+             f"- camera.first_ns: `{camera_first}`", f"- camera.last_ns: `{camera_last}`",
+             f"- camera.duration_s: `{(camera_last - camera_first) / 1e9:.6f}`",
+             f"- execution.first_ns: `{execution_first}`", f"- execution.last_ns: `{execution_last}`",
+             f"- execution.duration_s: `{(execution_last - execution_first) / 1e9:.6f}`",
+             f"- execution_first_minus_camera_first_ms: `{(execution_first - camera_first) / 1e6:.3f}`",
+             f"- execution_last_minus_camera_last_ms: `{(execution_last - camera_last) / 1e6:.3f}`",
+             f"- TIMELINE_OVERLAP: `{str(overlap).upper()}`",
+             f"- POSSIBLE_WRONG_EXECUTION_TRACE: `{str(not overlap).upper()}`", "",
+             f"- camera_frames: `{len(camera)}`", f"- execution_events: `{len(trace)}`", ""]
     for threshold in (500, 1000, 2000):
         lines.append(f"- gaps_gt_{threshold}ms: `{sum(item['gap_ns'] > threshold * 1e6 for item in gaps)}`")
     lines.append("")
@@ -119,6 +147,34 @@ def analyze(camera: list[dict[str, Any]], trace: list[dict[str, Any]]) -> str:
     lines.extend(["## Correlated gaps", ""])
     for index, item in enumerate(correlated, 1):
         lines.extend(format_gap(item, index))
+    lines.extend(["## OPEN_ENDED_TAIL_GAP", ""])
+    if tail is None:
+        lines.append(f"- tail_gap_ms: `{tail_gap_ns / 1e6:.3f}` (not greater than 500 ms)")
+    else:
+        lines.extend([
+            "- OPEN_ENDED_TAIL_GAP: `true`",
+            f"- last_camera_frame_ns: `{camera_last}`",
+            f"- execution_end_ns: `{execution_last}`",
+            f"- tail_gap_ms: `{tail_gap_ns / 1e6:.3f}`",
+        ])
+        active = tail.get("active")
+        lines.extend(["", "### TAIL_FREEZE_START", ""])
+        if active:
+            lines.extend([f"- TAIL_FREEZE_START_PHASE: `{active.get('phase', 'UNKNOWN')}`",
+                          f"- TAIL_FREEZE_START_DEVICE: `{active.get('device', 'UNKNOWN')}`",
+                          f"- TAIL_FREEZE_START_OPERATION: `{active.get('operation', 'UNKNOWN')}`"])
+        else:
+            lines.extend(["- TAIL_FREEZE_START_PHASE: `OPERATION_NOT_PROVEN`",
+                          "- TAIL_FREEZE_START_DEVICE: `OPERATION_NOT_PROVEN`",
+                          "- TAIL_FREEZE_START_OPERATION: `OPERATION_NOT_PROVEN`"])
+        lines.extend(["", "### LAST_CAMERA_FRAME", "",
+                      f"- last_camera_frame_ns: `{camera_last}`",
+                      f"- event_before_last_frame: `{event_text(tail['before']) if tail.get('before') else 'NONE'}`",
+                      f"- first_event_after_last_frame: `{event_text(tail['after_first']) if tail.get('after_first') else 'NONE'}`",
+                      "", "### Events after last camera frame (up to 20)", ""])
+        after_events = [row for row in trace if row["monotonic_ns"] > camera_last][:20]
+        for row in after_events:
+            lines.append(f"- +{(row['monotonic_ns'] - camera_last) / 1e6:.3f}ms {event_text(row)}")
     return "\n".join(lines)
 
 
@@ -127,11 +183,15 @@ def self_test() -> None:
     trace = [
         {"event": "sdk_call_end", "monotonic_ns": 100_000_000, "phase": "RIGHT_LIFT", "device": "RIGHT_ARM", "operation": "get_joint_angles"},
         {"event": "phase_start", "monotonic_ns": 800_000_000, "phase": "LEFT_PLACE", "device": "LEFT_ARM"},
+        {"event": "sdk_call_end", "monotonic_ns": 4_000_000_000, "phase": "RIGHT_READY", "device": "RIGHT_ARM", "operation": "move_joints"},
     ]
     report = analyze(camera, trace)
     assert "FIRST_CAMERA_FREEZE_PHASE = `RIGHT_LIFT`" in report
     assert "gap_ms: `600.000`" in report
     assert "gap_ms: `1300.000`" in report
+    assert "OPEN_ENDED_TAIL_GAP: `true`" in report
+    assert "tail_gap_ms: `2000.000`" in report
+    assert "TIMELINE_OVERLAP: `TRUE`" in report
     print("synthetic camera/execution correlation self-test: PASS")
 
 
