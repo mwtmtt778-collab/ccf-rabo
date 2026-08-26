@@ -26,9 +26,12 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from agents.three_nut_expert.config import (  # noqa: E402
+    DETERMINISTIC_PLACE_ENTRY_TOLERANCE_RAD,
     HAND_OPEN,
     KNOWN_FIXED_NUT_WORLD_POSE,
     KNOWN_FIXED_NUT_WORLD_POSE_STATUS,
+    LEFT_FIXED_PLACE_JOINT_PATHS,
+    LEFT_FIXED_PLACE_REFERENCE_EPISODE,
     LEFT_PLACE_POSES,
     LEFT_PRE_JOINTS,
     NUT_IDS,
@@ -213,6 +216,10 @@ class ExpertStateRunner:
             "max_joint_error": context.get("max_joint_error"),
             "final_joint_error": context.get("final_joint_error"),
             "max_joint_jump": context.get("max_joint_jump"),
+            "current_joint": context.get("current_joint"),
+            "anchor_joint": context.get("anchor_joint"),
+            "max_abs_error": context.get("max_abs_error"),
+            "threshold": context.get("threshold"),
             "command_start_time": context.get("command_start_time"),
             "command_end_time": context.get("command_end_time"),
             "elapsed_s": context.get("elapsed_s"),
@@ -580,6 +587,68 @@ def place_above_pose(place: Pose6, safe_z: float) -> list[float]:
     return [place.x, place.y, float(safe_z), place.roll, place.pitch, place.yaw]
 
 
+def execute_recorded_joint_path(
+    runner: ExpertStateRunner,
+    left_arm: Any,
+    key: str,
+    segment: str,
+) -> dict[str, Any]:
+    """Execute sparse actual_joint samples from the successful reference Episode."""
+    try:
+        waypoints = LEFT_FIXED_PLACE_JOINT_PATHS[key][segment]
+    except KeyError as exc:
+        raise ThreeNutClosedLoopError(
+            f"no deterministic {segment} joint path for Nut {key}"
+        ) from exc
+    if segment == "transport":
+        current_joint, read_error = read_joint_method(
+            left_arm, ("get_joint_angles", "get_joints", "get_qpos")
+        )
+        anchor_joint = list(waypoints[0].joints)
+        entry_error = (
+            max_abs_error(current_joint, anchor_joint)
+            if current_joint is not None and len(current_joint) == len(anchor_joint)
+            else None
+        )
+        if (
+            current_joint is None
+            or entry_error is None
+            or entry_error > DETERMINISTIC_PLACE_ENTRY_TOLERANCE_RAD
+        ):
+            raise runner.fault(
+                ThreeNutClosedLoopError(
+                    "DETERMINISTIC_PLACE_ENTRY_MISMATCH: "
+                    f"Nut {key} current-to-anchor max_abs_error={entry_error} "
+                    f"threshold={DETERMINISTIC_PLACE_ENTRY_TOLERANCE_RAD}"
+                ),
+                {
+                    "command_method": "DETERMINISTIC_PLACE_ENTRY_GATE",
+                    "command_label": f"LEFT_FIXED_TRANSPORT_{key}_ENTRY_GATE",
+                    "joint_read_error": read_error,
+                    "current_joint": current_joint,
+                    "anchor_joint": anchor_joint,
+                    "max_abs_error": entry_error,
+                    "threshold": DETERMINISTIC_PLACE_ENTRY_TOLERANCE_RAD,
+                },
+            )
+    path = tuple(tuple(float(value) for value in item.joints) for item in waypoints)
+    rows = move_joints_path(runner, left_arm, path, f"LEFT_FIXED_{segment.upper()}_{key}")
+    return {
+        "reference_episode": LEFT_FIXED_PLACE_REFERENCE_EPISODE,
+        "segment": segment,
+        "waypoints": [
+            {
+                "joints": list(item.joints),
+                "source_trajectory": item.source_trajectory,
+                "sample_index": item.sample_index,
+                "time_s": item.time_s,
+            }
+            for item in waypoints
+        ],
+        "path": rows,
+    }
+
+
 def execute_right_transfer(
     runner: ExpertStateRunner,
     key: str,
@@ -694,7 +763,17 @@ def execute_left_pick_place(
     key: str,
     left_bundle: Any,
     nut_world_xyz: list[float],
+    *,
+    deterministic_place_path: bool = False,
+    terminal_after_release: bool = False,
 ) -> None:
+    if deterministic_place_path:
+        if key not in LEFT_FIXED_PLACE_JOINT_PATHS:
+            raise ThreeNutClosedLoopError(f"no deterministic place path for Nut {key}")
+        if not terminal_after_release and "retreat" not in LEFT_FIXED_PLACE_JOINT_PATHS[key]:
+            raise ThreeNutClosedLoopError(
+                f"Nut {key} has no successful deterministic retreat; it must be terminal"
+            )
     planner = LeftNutGraspPlanner(left_arm=left_bundle.left_arm, left_hand=left_bundle.left_hand)
     plan = planner.build_plan(nut_world_xyz)
     preflight = planner.preflight_grasp_chain(plan)
@@ -760,6 +839,47 @@ def execute_left_pick_place(
 
     place = LEFT_PLACE_POSES[key]
     place_above = place_above_pose(place, extra_safe_lift[2])
+    if deterministic_place_path:
+        runner.enter("LEFT_PLACE_ABOVE")
+        transport = execute_recorded_joint_path(
+            runner, left_bundle.left_arm, key, "transport"
+        )
+        runner.pass_state({
+            "motion": transport,
+            "place_above_pose": place_above,
+            "execution": "RECORDED_ACTUAL_JOINT_WAYPOINTS",
+        })
+
+        runner.enter("LEFT_PLACE")
+        fixed_place = execute_recorded_joint_path(
+            runner, left_bundle.left_arm, key, "place"
+        )
+        runner.hand_action(
+            label="LEFT_RELEASE_OPEN",
+            command_method="left_hand.clench",
+            fn=lambda: left_bundle.left_hand.clench(*list(HAND_OPEN)),
+        )
+        runner.pass_state({
+            "motion": fixed_place,
+            "place_pose": pose_to_list(place),
+            "execution": "RECORDED_ACTUAL_JOINT_WAYPOINTS",
+            "terminal_after_release": terminal_after_release,
+        })
+        if terminal_after_release:
+            return
+
+        runner.enter("LEFT_SAFE_RETREAT")
+        fixed_retreat = execute_recorded_joint_path(
+            runner, left_bundle.left_arm, key, "retreat"
+        )
+        runner.pass_state({
+            "motion": fixed_retreat,
+            "safe_retreat_pose": vertical_retreat_from_place(place),
+            "execution": "RECORDED_ACTUAL_JOINT_WAYPOINTS",
+        })
+        go_left_return_ready(runner, left_bundle.left_arm)
+        return
+
     runner.enter("LEFT_PLACE_ABOVE")
     place_above_row = move_pose(
         runner,
@@ -941,14 +1061,29 @@ def run_left_return_ready_c_test(args: argparse.Namespace) -> int:
     return return_code
 
 
-def plan_summary(sequence: tuple[str, ...], reset_to_nominal: bool) -> dict[str, Any]:
-    per_nut = [
+def plan_summary(
+    sequence: tuple[str, ...],
+    reset_to_nominal: bool,
+    deterministic_place_path: bool = False,
+) -> dict[str, Any]:
+    dynamic_per_nut = [
         "RIGHT_APPROACH", "RIGHT_THUMB_TUCK", "RIGHT_GRASP", "RIGHT_GRASP_FORCE", "RIGHT_LIFT",
         "RIGHT_RELEASE", "RIGHT_SAFE_RETREAT", "RIGHT_READY", "RIGHT_READY_CHECK",
         "LEFT_VISION", "LEFT_APPROACH", "LEFT_THUMB_TUCK", "LEFT_DESCENT",
         "LEFT_GRASP", "LEFT_GRASP_FORCE", "LEFT_SAFE_LIFT",
-        "LEFT_PLACE_ABOVE", "LEFT_PLACE", "LEFT_SAFE_RETREAT", "LEFT_RETURN_READY", "LEFT_READY_CHECK",
     ]
+    per_nut = dynamic_per_nut + (
+        [
+            "LEFT_FIXED_TRANSPORT", "LEFT_FIXED_PLACE", "LEFT_RELEASE",
+            "LEFT_FIXED_RETREAT_IF_NONTERMINAL", "LEFT_RETURN_READY_IF_NONTERMINAL",
+            "LEFT_READY_CHECK_IF_NONTERMINAL",
+        ]
+        if deterministic_place_path
+        else [
+            "LEFT_PLACE_ABOVE", "LEFT_PLACE", "LEFT_SAFE_RETREAT",
+            "LEFT_RETURN_READY", "LEFT_READY_CHECK",
+        ]
+    )
     return {
         "status": "PLAN_ONLY_NO_RABO_SDK",
         "sequence": list(sequence),
@@ -958,6 +1093,10 @@ def plan_summary(sequence: tuple[str, ...], reset_to_nominal: bool) -> dict[str,
         "right_pick_uses_vision": False,
         "right_pick_target_source": "KNOWN_FIXED_NUT_WORLD_POSE with VERIFIED Nut B template",
         "left_pick_uses_post_release_vision": True,
+        "deterministic_place_path": deterministic_place_path,
+        "deterministic_place_reference_episode": (
+            LEFT_FIXED_PLACE_REFERENCE_EPISODE if deterministic_place_path else None
+        ),
         "episode_init": (
             "deterministic SetEntityPose A/B/C to VERIFIED_SCENE_FIXED_POSE"
             if reset_to_nominal
@@ -965,7 +1104,11 @@ def plan_summary(sequence: tuple[str, ...], reset_to_nominal: bool) -> dict[str,
         ),
         "initial_ready": ["RIGHT_READY", "RIGHT_READY_CHECK", "LEFT_READY", "LEFT_READY_CHECK"],
         "per_nut_template": per_nut,
-        "final": ["RIGHT_READY", "RIGHT_READY_CHECK", "LEFT_RETURN_READY", "LEFT_READY_CHECK", "DONE"],
+        "final": (
+            ["FINAL_NUT_PLACE", "FINAL_NUT_RELEASE", "DONE"]
+            if deterministic_place_path
+            else ["RIGHT_READY", "RIGHT_READY_CHECK", "LEFT_RETURN_READY", "LEFT_READY_CHECK", "DONE"]
+        ),
         "left_initial_ready_path": [list(joints) for joints in LEFT_INITIAL_READY_PATH],
         "left_return_ready": {
             "source": "actual joints read after LEFT_SAFE_RETREAT",
@@ -979,7 +1122,15 @@ def run(args: argparse.Namespace) -> int:
     sequence = parse_sequence_arg(args.sequence)
     validate_static_contract(sequence)
     if args.plan_only:
-        print(json.dumps(plan_summary(sequence, bool(args.reset_to_nominal)), ensure_ascii=False, indent=2))
+        print(json.dumps(
+            plan_summary(
+                sequence,
+                bool(args.reset_to_nominal),
+                bool(args.deterministic_place_path),
+            ),
+            ensure_ascii=False,
+            indent=2,
+        ))
         return 0
     if args.test_left_ready:
         return run_left_ready_test(args)
@@ -1004,6 +1155,7 @@ def run(args: argparse.Namespace) -> int:
         "right_pick_uses_vision": False,
         "right_pick_target_source": "KNOWN_FIXED_NUT_WORLD_POSE with VERIFIED Nut B template",
         "left_pick_uses_post_release_vision": True,
+        "deterministic_place_path": bool(args.deterministic_place_path),
         "geometry_policy": "VERIFIED Nut B grasp template for A/B/C; vertical RIGHT_APPROACH added",
         "threshold_status": "PROVISIONAL_THRESHOLD_REQUIRES_RABO_TUNING",
         "trials": [],
@@ -1047,7 +1199,7 @@ def run(args: argparse.Namespace) -> int:
                     )
                     probe.mark_phase("START_RECORDING", event="ENTER", trial_id=trial_id)
 
-                for key in sequence:
+                for index, key in enumerate(sequence):
                     if probe is not None:
                         probe.mark_phase("NUT", event="ENTER", nut=key)
                     runtime_nut_world_xyz = pose_to_list(KNOWN_FIXED_NUT_WORLD_POSE[key])[:3]
@@ -1060,12 +1212,22 @@ def run(args: argparse.Namespace) -> int:
                         vision_radius_m=float(args.vision_target_radius_m),
                         settle_after_release_s=float(args.settle_after_release_s),
                     )
-                    execute_left_pick_place(runner, key, left_bundle, released_xyz)
+                    execute_left_pick_place(
+                        runner,
+                        key,
+                        left_bundle,
+                        released_xyz,
+                        deterministic_place_path=bool(args.deterministic_place_path),
+                        terminal_after_release=(
+                            bool(args.deterministic_place_path) and index == len(sequence) - 1
+                        ),
+                    )
                     if probe is not None:
                         probe.mark_phase("NUT", event="EXIT", nut=key, success=True)
 
-                go_right_ready(runner, right_bundle.right_arm)
-                go_left_return_ready(runner, left_bundle.left_arm)
+                if not args.deterministic_place_path:
+                    go_right_ready(runner, right_bundle.right_arm)
+                    go_left_return_ready(runner, left_bundle.left_arm)
                 runner.enter("DONE")
                 runner.pass_state({"completed_nuts": list(sequence)})
                 trial["status"] = "PASS"
@@ -1114,6 +1276,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--trials", type=int, default=1, help="Number of complete episodes (default: 1).")
     parser.add_argument("--sequence", default="C,B,A", help="Nut sequence, e.g. C, C,B, or C,B,A (default: C,B,A).")
     parser.add_argument("--monitor", action="store_true", help="Explicitly request monitoring (V2 arm motion gates always enable it).")
+    parser.add_argument(
+        "--deterministic-place-path",
+        action="store_true",
+        help=(
+            "Use recorded actual_joint waypoints for fixed C/B transport/place; "
+            "the final Nut ends after release. Default keeps Cartesian fallback."
+        ),
+    )
     parser.add_argument("--test-left-ready", action="store_true", help="Run only the no-Nut LEFT_READY candidate motion-chain test.")
     parser.add_argument(
         "--test-left-return-ready",
@@ -1155,6 +1325,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error(f"--settle-after-release-s must be at least {minimum_wait:g}s")
     if args.vision_target_radius_m <= 0 or args.recording_probe_fps <= 0:
         parser.error("vision radius and recording FPS must be > 0")
+    if args.deterministic_place_path:
+        deterministic_sequence = parse_sequence_arg(args.sequence)
+        unsupported = [key for key in deterministic_sequence if key not in LEFT_FIXED_PLACE_JOINT_PATHS]
+        if unsupported:
+            parser.error(f"deterministic place path is unavailable for: {unsupported}")
+        missing_retreat = [
+            key
+            for key in deterministic_sequence[:-1]
+            if "retreat" not in LEFT_FIXED_PLACE_JOINT_PATHS[key]
+        ]
+        if missing_retreat:
+            parser.error(f"non-terminal deterministic retreat is unavailable for: {missing_retreat}")
     return args
 
 

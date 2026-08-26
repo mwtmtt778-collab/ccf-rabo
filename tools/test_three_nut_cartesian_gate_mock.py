@@ -361,7 +361,8 @@ class CartesianGateTests(unittest.TestCase):
     def test_left_pick_has_no_entry_ready_repeat(self) -> None:
         source = inspect.getsource(expert_v2.execute_left_pick_place)
         self.assertNotIn("go_left_initial_ready(", source)
-        self.assertEqual(source.count("go_left_return_ready("), 1)
+        # One return call belongs to each mutually exclusive place branch.
+        self.assertEqual(source.count("go_left_return_ready("), 2)
         self.assertGreater(source.index("go_left_return_ready("), source.index('runner.enter("LEFT_SAFE_RETREAT")'))
 
     def test_left_return_ready_path_uses_five_linear_segments_to_unchanged_goal(self) -> None:
@@ -454,6 +455,53 @@ class CartesianGateTests(unittest.TestCase):
         self.assertTrue(result["gate"]["pass"])
         self.assertAlmostEqual(result["final_joint_error"], 0.0)
         self.assertTrue(result["joint_target_based_divergence_available"])
+
+    def test_recorded_c_transport_uses_only_frozen_actual_joint_waypoints(self) -> None:
+        arm = MockArm()
+        waypoints = expert_v2.LEFT_FIXED_PLACE_JOINT_PATHS["C"]["transport"]
+        arm.joints = list(waypoints[0].joints)
+        result = expert_v2.execute_recorded_joint_path(
+            self.runner(), arm, "C", "transport"
+        )
+        self.assertEqual(arm.move_to_calls, 0)
+        self.assertEqual(
+            arm.move_joints_history,
+            [list(item.joints) for item in waypoints],
+        )
+        self.assertEqual(result["reference_episode"], expert_v2.LEFT_FIXED_PLACE_REFERENCE_EPISODE)
+        self.assertTrue(all(row["gate"]["pass"] for row in result["path"]))
+
+    def test_recorded_transport_entry_mismatch_faults_before_any_motion(self) -> None:
+        arm = MockArm()
+        arm.joints = [0.0] * 7
+        runner = self.runner()
+        with self.assertRaises(expert_v2.StateFault) as caught:
+            expert_v2.execute_recorded_joint_path(runner, arm, "C", "transport")
+        self.assertIn("DETERMINISTIC_PLACE_ENTRY_MISMATCH", str(caught.exception))
+        self.assertEqual(arm.move_joints_history, [])
+        self.assertEqual(arm.move_to_history, [])
+        snapshot = caught.exception.context
+        self.assertEqual(snapshot["current_joint"], [0.0] * 7)
+        self.assertEqual(
+            snapshot["anchor_joint"],
+            list(expert_v2.LEFT_FIXED_PLACE_JOINT_PATHS["C"]["transport"][0].joints),
+        )
+        self.assertGreater(snapshot["max_abs_error"], 0.10)
+        self.assertEqual(snapshot["threshold"], 0.10)
+
+    def test_deterministic_parser_requires_b_to_be_terminal(self) -> None:
+        accepted = expert_v2.parse_args([
+            "--sequence", "C,B", "--deterministic-place-path", "--plan-only",
+        ])
+        self.assertTrue(accepted.deterministic_place_path)
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            expert_v2.parse_args([
+                "--sequence", "B,C", "--deterministic-place-path", "--plan-only",
+            ])
+        with redirect_stderr(StringIO()), self.assertRaises(SystemExit):
+            expert_v2.parse_args([
+                "--sequence", "C,B,A", "--deterministic-place-path", "--plan-only",
+            ])
 
     def test_default_plan_uses_scene_initial_pose_without_reset_or_randomization(self) -> None:
         args = expert_v2.parse_args([])

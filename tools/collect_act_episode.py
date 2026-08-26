@@ -43,6 +43,7 @@ if str(PROJECT_ROOT) not in sys.path:
 from agents.three_nut_expert.config import (  # noqa: E402
     KNOWN_FIXED_NUT_WORLD_POSE,
     KNOWN_FIXED_NUT_WORLD_POSE_STATUS,
+    LEFT_FIXED_PLACE_JOINT_PATHS,
 )
 from agents.three_nut_expert.expert import pose_to_list  # noqa: E402
 from tools.motion_monitor import MotionMonitor  # noqa: E402
@@ -628,6 +629,7 @@ def run_expert(
     *,
     settle_after_release_s: float,
     vision_target_radius_m: float,
+    deterministic_place_path: bool,
 ) -> list[str]:
     """Orchestrate the existing Expert functions without reset or new geometry."""
     completed: list[str] = []
@@ -642,7 +644,7 @@ def run_expert(
     go_left_initial_ready(runner, left_bundle.left_arm)
     runner.enter("READY_CHECK")
     runner.pass_state({"right_ready": True, "left_ready": True})
-    for key in sequence:
+    for index, key in enumerate(sequence):
         runtime_xyz = pose_to_list(KNOWN_FIXED_NUT_WORLD_POSE[key])[:3]
         released_xyz = execute_right_transfer(
             runner,
@@ -653,10 +655,18 @@ def run_expert(
             vision_radius_m=vision_target_radius_m,
             settle_after_release_s=settle_after_release_s,
         )
-        execute_left_pick_place(runner, key, left_bundle, released_xyz)
+        execute_left_pick_place(
+            runner,
+            key,
+            left_bundle,
+            released_xyz,
+            deterministic_place_path=deterministic_place_path,
+            terminal_after_release=(deterministic_place_path and index == len(sequence) - 1),
+        )
         completed.append(key)
-    go_right_ready(runner, right_bundle.right_arm)
-    go_left_return_ready(runner, left_bundle.left_arm)
+    if not deterministic_place_path:
+        go_right_ready(runner, right_bundle.right_arm)
+        go_left_return_ready(runner, left_bundle.left_arm)
     runner.enter("DONE")
     runner.pass_state({"completed_nuts": completed})
     return completed
@@ -754,6 +764,7 @@ def execute_episode(args: argparse.Namespace) -> int:
             left_bundle,
             settle_after_release_s=args.settle_after_release_s,
             vision_target_radius_m=args.vision_target_radius_m,
+            deterministic_place_path=bool(args.deterministic_place_path),
         )
         expert_done = runner.state == "DONE" and runner.last_success_state == "DONE"
         expert_status = "PASS" if expert_done else "FAILED"
@@ -854,6 +865,7 @@ def execute_episode(args: argparse.Namespace) -> int:
         "state_overrun_periods": sampler.overrun_periods if sampler is not None else 0,
         "shutdown_errors": shutdown_errors,
         "left_safe_lift_delta_z_m": LEFT_SAFE_LIFT_DELTA_Z_M,
+        "deterministic_place_path": bool(args.deterministic_place_path),
         "accepted_for_training": False,
         "rejection_reason": rejection_reason,
         "reset_policy": "operator Web Reset only; collector performs no reset",
@@ -894,6 +906,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sequence", default="C,B,A", help="Expert nut sequence (default: C,B,A).")
     parser.add_argument("--fps", type=float, default=5.0, help="State sampling frequency (default: 5Hz).")
     parser.add_argument("--monitor", action="store_true", help="Compatibility flag; MotionMonitor is always enabled.")
+    parser.add_argument(
+        "--deterministic-place-path",
+        action="store_true",
+        help="Use recorded actual_joint C/B fixed transport/place paths; default keeps Cartesian fallback.",
+    )
     parser.add_argument("--episode-id", help="Optional unique episode directory name.")
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--queue-size", type=int, default=96)
@@ -914,6 +931,15 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("fps, queue-size, and camera-ready-timeout must be > 0")
     if args.vision_target_radius_m <= 0:
         parser.error("vision-target-radius-m must be > 0")
+    if args.deterministic_place_path:
+        unsupported = [key for key in sequence if key not in LEFT_FIXED_PLACE_JOINT_PATHS]
+        if unsupported:
+            parser.error(f"deterministic place path is unavailable for: {unsupported}")
+        missing_retreat = [
+            key for key in sequence[:-1] if "retreat" not in LEFT_FIXED_PLACE_JOINT_PATHS[key]
+        ]
+        if missing_retreat:
+            parser.error(f"non-terminal deterministic retreat is unavailable for: {missing_retreat}")
     minimum_settle = RIGHT_RELEASE_OPEN_WAIT_S + RIGHT_OBSERVATION_STABLE_WAIT_S
     if args.settle_after_release_s < minimum_settle:
         parser.error(f"settle-after-release-s must be at least {minimum_settle:g}s")
