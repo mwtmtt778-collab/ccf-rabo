@@ -62,9 +62,10 @@ class FramePacket:
 
 
 class TopCameraSidecar:
-    def __init__(self, episode_dir: Path, *, queue_size: int = DEFAULT_QUEUE_SIZE) -> None:
+    def __init__(self, episode_dir: Path, *, queue_size: int = DEFAULT_QUEUE_SIZE, camera_topic: str | None = None) -> None:
         self.episode_dir = episode_dir
         self.camera_dir = episode_dir / "cameras" / TOP_DATASET_NAME
+        self.camera_topic_override = camera_topic
         self.timestamps_path = episode_dir / "camera_timestamps.jsonl"
         self.queue: Queue[FramePacket] = Queue(maxsize=max(1, int(queue_size)))
         self.stop_event = threading.Event()
@@ -207,8 +208,13 @@ class TopCameraSidecar:
         self.node = rclpy.create_node("act_top_camera_sidecar")
         topics, discovery = discover_camera_topics()
         selected = topics.get(TOP_SOURCE)
+        if self.camera_topic_override:
+            alias = {"top": TOP_SOURCE, "right_wrist": "right_wrist_rgb", "left_wrist": "left_wrist_rgb"}.get(self.camera_topic_override, self.camera_topic_override)
+            selected = topics.get(alias)
+            if selected is None:
+                selected = next((item for item in topics.values() if item.get("topic") == self.camera_topic_override), None)
         if not selected:
-            raise RuntimeError("fixed_rgb top camera topic was not discovered")
+            raise RuntimeError(f"camera topic not discovered: {self.camera_topic_override or TOP_SOURCE}")
         self.topic = selected["topic"]
         self.type_name = selected["type"]
         msg_type = load_message_class(self.type_name)
@@ -351,6 +357,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--episode-dir", type=Path, help="Temporary Episode directory.")
     parser.add_argument("--duration", type=float, help="Optional self-stop duration; otherwise wait for STOP on stdin.")
     parser.add_argument("--queue-size", type=int, default=DEFAULT_QUEUE_SIZE)
+    parser.add_argument("--camera-topic", help="Optional exact ROS Image topic override.")
     parser.add_argument("--self-test", action="store_true", help="Run synthetic sidecar timestamp test without ROS.")
     parser.add_argument("--synthetic-run", action="store_true", help="Run a no-ROS READY/STOP subprocess fixture.")
     return parser
@@ -370,7 +377,7 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("--episode-dir is required")
     if args.duration is not None and args.duration <= 0:
         raise SystemExit("--duration must be > 0")
-    sidecar = TopCameraSidecar(args.episode_dir, queue_size=args.queue_size)
+    sidecar = TopCameraSidecar(args.episode_dir, queue_size=args.queue_size, camera_topic=args.camera_topic)
     try:
         sidecar.start()
         sidecar.run(duration_s=args.duration)

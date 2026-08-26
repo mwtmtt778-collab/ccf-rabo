@@ -152,9 +152,10 @@ class KeyboardAbortWatcher:
 class TopCameraSidecarProcess:
     """Own the top-camera ROS node in a separate Python interpreter."""
 
-    def __init__(self, episode_dir: Path, *, queue_size: int) -> None:
+    def __init__(self, episode_dir: Path, *, queue_size: int, camera_topic: str | None = None) -> None:
         self.episode_dir = episode_dir
         self.queue_size = queue_size
+        self.camera_topic = camera_topic
         self.process: subprocess.Popen[str] | None = None
         self.reader_thread: threading.Thread | None = None
         self.ready_event = threading.Event()
@@ -169,7 +170,8 @@ class TopCameraSidecarProcess:
     def start(self) -> None:
         script = PROJECT_ROOT / "tools" / "record_act_top_camera_sidecar.py"
         self.process = subprocess.Popen(
-            [sys.executable, "-u", str(script), "--episode-dir", str(self.episode_dir), "--queue-size", str(self.queue_size)],
+            [sys.executable, "-u", str(script), "--episode-dir", str(self.episode_dir), "--queue-size", str(self.queue_size)]
+            + (["--camera-topic", self.camera_topic] if self.camera_topic else []),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -267,6 +269,64 @@ class SidecarCameraRecord:
         self.subscribe_error = None
 
 
+class PassiveStateRecorder:
+    """Best-effort ROS JointState cache; never calls the robot SDK."""
+    def __init__(self) -> None:
+        self.latest: dict[str, list[float]] = {}
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.thread: threading.Thread | None = None
+        self.error: str | None = None
+        self.node: Any = None
+        self.rclpy: Any = None
+
+    def start(self) -> None:
+        self.thread = threading.Thread(target=self._run, name="act-passive-state-ros", daemon=True)
+        self.thread.start()
+
+    def _run(self) -> None:
+        try:
+            import rclpy
+            from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
+            from sensor_msgs.msg import JointState
+            rclpy.init(args=None)
+            self.rclpy = rclpy
+            self.node = rclpy.create_node("act_passive_state_recorder")
+            qos = QoSProfile(history=HistoryPolicy.KEEP_LAST, depth=1, reliability=ReliabilityPolicy.BEST_EFFORT)
+            topics = [(name, types) for name, types in self.node.get_topic_names_and_types() if "sensor_msgs/msg/JointState" in types]
+            for name, _types in topics:
+                key = "left_arm" if ("rbd03" in name or "left" in name.lower()) else ("right_arm" if ("r412" in name or "right" in name.lower()) else None)
+                if key is None:
+                    continue
+                self.node.create_subscription(JointState, name, lambda msg, k=key: self._callback(k, msg), qos)
+            while not self.stop_event.is_set():
+                rclpy.spin_once(self.node, timeout_sec=0.05)
+        except BaseException as exc:
+            self.error = repr(exc)
+
+    def _callback(self, key: str, msg: Any) -> None:
+        values = [float(v) for v in list(getattr(msg, "position", []))[:7]]
+        if len(values) == 7:
+            with self.lock:
+                self.latest[key] = values
+
+    def snapshot(self) -> tuple[list[float], list[float], list[float], list[float]]:
+        with self.lock:
+            if "left_arm" not in self.latest or "right_arm" not in self.latest:
+                raise RuntimeError("passive ROS arm JointState cache incomplete")
+            left = list(self.latest["left_arm"])
+            right = list(self.latest["right_arm"])
+        return left, right, [0.0] * 6, [0.0] * 6
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        if self.thread is not None:
+            self.thread.join(timeout=2.0)
+        if self.rclpy is not None and self.rclpy.ok():
+            with contextlib.suppress(Exception):
+                self.rclpy.shutdown()
+
+
 class CollectingExpertRunner(ExpertStateRunner):
     """Add abort boundaries and real hand-command events to the current runner."""
 
@@ -344,7 +404,7 @@ class CollectingExpertRunner(ExpertStateRunner):
 class StateSampler:
     """Poll 26D state on its own fixed-rate thread."""
 
-    def __init__(self, devices: dict[str, Any], origin: float, fps: float, coordinator: ExecutionCoordinator | None = None) -> None:
+    def __init__(self, devices: dict[str, Any], origin: float, fps: float, coordinator: ExecutionCoordinator | None = None, passive: PassiveStateRecorder | None = None) -> None:
         self.devices = devices
         self.origin = origin
         self.fps = fps
@@ -354,6 +414,7 @@ class StateSampler:
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
         self.coordinator = coordinator
+        self.passive = passive
         self.state_sample_delay_ms: list[float] = []
         self.state_sample_missed_deadline_count = 0
 
@@ -371,7 +432,12 @@ class StateSampler:
                 continue
             read_start = time.monotonic()
             try:
-                read_fn = lambda: read_state26_timed(self.devices)
+                def read_fn() -> tuple[list[float], dict[str, list[float]], dict[str, float]]:
+                    if self.passive is not None:
+                        left, right, left_hand, right_hand = self.passive.snapshot()
+                        components = {"left_arm": left, "right_arm": right, "left_hand_clench": left_hand, "right_hand_clench": right_hand}
+                        return left + right + left_hand + right_hand, components, {key: 0.0 for key in components}
+                    return read_state26_timed(self.devices)
                 if self.coordinator is not None:
                     state, components, component_durations = self.coordinator.call(phase="STATE_SAMPLE", device="STATE_SAMPLER", operation="read_state26", fn=read_fn)
                 else:
@@ -862,10 +928,11 @@ def execute_episode(args: argparse.Namespace) -> int:
     timeline_origin = timeline_origin_ns / 1e9
     abort_event = threading.Event()
     watcher = KeyboardAbortWatcher(abort_event)
-    sidecar = TopCameraSidecarProcess(episode_dir, queue_size=args.queue_size)
+    sidecar = TopCameraSidecarProcess(episode_dir, queue_size=args.queue_size, camera_topic=args.camera_topic)
     right_bundle = left_bundle = None
     sampler: StateSampler | None = None
     coordinator: ExecutionCoordinator | None = None
+    passive_state: PassiveStateRecorder | None = None
     runner: CollectingExpertRunner | None = None
     command_events: list[dict[str, Any]] = []
     completed_nuts: list[str] = []
@@ -893,7 +960,10 @@ def execute_episode(args: argparse.Namespace) -> int:
         if args.coordinated_execution:
             trace_stamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S_%f")
             coordinator = ExecutionCoordinator(PROJECT_ROOT / "reports" / "execution_trace" / f"collector_{trace_stamp}.jsonl")
-        sampler = StateSampler(devices, timeline_origin, args.fps, coordinator=coordinator)
+        if args.minimal_c_expert:
+            passive_state = PassiveStateRecorder()
+            passive_state.start()
+        sampler = StateSampler(devices, timeline_origin, args.fps, coordinator=coordinator, passive=passive_state)
         sampler.start()
         sampler.wait_until_ready()
         watcher.start()
@@ -939,6 +1009,8 @@ def execute_episode(args: argparse.Namespace) -> int:
         watcher.close()
         if sampler is not None:
             sampler.stop()
+        if passive_state is not None:
+            passive_state.stop()
         if coordinator is not None and coordinator.trace_path is not None:
             coordinator.write_summary(coordinator.trace_path.with_name(coordinator.trace_path.stem + "_summary.json"))
         sidecar.stop()
@@ -1035,6 +1107,8 @@ def execute_episode(args: argparse.Namespace) -> int:
         "motion_monitor_enabled": gate_enabled,
         "coordinated_execution": bool(args.coordinated_execution),
         "minimal_c_expert": bool(args.minimal_c_expert),
+        "arm_state_source": "ros_joint_state_passive_cache" if args.minimal_c_expert else "sdk_read_state26",
+        "camera_topic_selection": args.camera_topic,
         "state_sample_missed_deadline_count": sampler.state_sample_missed_deadline_count if sampler is not None else 0,
         "accepted_for_training": False,
         "rejection_reason": rejection_reason,
@@ -1109,6 +1183,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--queue-size", type=int, default=96)
     parser.add_argument("--camera-ready-timeout", type=float, default=15.0)
+    parser.add_argument("--camera-topic", choices=("top", "right_wrist", "left_wrist"), default="top")
     parser.add_argument("--settle-after-release-s", type=float, default=DEFAULT_SETTLE_AFTER_RELEASE_S)
     parser.add_argument("--vision-target-radius-m", type=float, default=DEFAULT_VISION_TARGET_RADIUS_M)
     return parser
