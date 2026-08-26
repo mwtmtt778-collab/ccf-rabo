@@ -74,6 +74,7 @@ from tools.test_three_nut_closed_loop_v2 import (  # noqa: E402
     parse_sequence_arg,
     validate_static_contract,
 )
+from tools.run_act_c_only_expert import run_act_c_only_expert  # noqa: E402
 from agents.three_nut_expert.execution import ExecutionCoordinator  # noqa: E402
 
 
@@ -898,24 +899,29 @@ def execute_episode(args: argparse.Namespace) -> int:
         watcher.start()
         runner = CollectingExpertRunner(
             1,
-            MotionMonitor(enabled=gate_enabled),
+            MotionMonitor(enabled=False if args.minimal_c_expert else gate_enabled),
             episode_dir / "expert_report.json",
             abort_event=abort_event,
             command_events=command_events,
             timeline_origin=timeline_origin,
-            nonblocking_motion=bool(args.nonblocking_motion),
-            coordinator=coordinator,
+            nonblocking_motion=bool(args.nonblocking_motion or args.minimal_c_expert),
+            coordinator=None if args.minimal_c_expert else coordinator,
         )
         expert_status = "RUNNING"
-        completed_nuts = run_expert(
-            runner,
-            sequence,
-            right_bundle,
-            left_bundle,
-            settle_after_release_s=args.settle_after_release_s,
-            vision_target_radius_m=args.vision_target_radius_m,
-            deterministic_place_path=bool(args.deterministic_place_path),
-        )
+        if args.minimal_c_expert:
+            completed_nuts = run_act_c_only_expert(
+                runner, right_bundle, left_bundle,
+                settle_after_release_s=args.settle_after_release_s,
+                vision_target_radius_m=args.vision_target_radius_m,
+                deterministic_place_path=True,
+            )
+        else:
+            completed_nuts = run_expert(
+                runner, sequence, right_bundle, left_bundle,
+                settle_after_release_s=args.settle_after_release_s,
+                vision_target_radius_m=args.vision_target_radius_m,
+                deterministic_place_path=bool(args.deterministic_place_path),
+            )
         expert_done = runner.state == "DONE" and runner.last_success_state == "DONE"
         expert_status = "PASS" if expert_done else "FAILED"
     except EpisodeAbort as exc:
@@ -1028,6 +1034,7 @@ def execute_episode(args: argparse.Namespace) -> int:
         "nonblocking_motion": bool(args.nonblocking_motion),
         "motion_monitor_enabled": gate_enabled,
         "coordinated_execution": bool(args.coordinated_execution),
+        "minimal_c_expert": bool(args.minimal_c_expert),
         "state_sample_missed_deadline_count": sampler.state_sample_missed_deadline_count if sampler is not None else 0,
         "accepted_for_training": False,
         "rejection_reason": rejection_reason,
@@ -1093,6 +1100,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Serialize Expert, hand, and sampler SDK invocations with an execution trace.",
     )
+    parser.add_argument(
+        "--minimal-c-expert",
+        action="store_true",
+        help="Use the minimal terminal C-only collection Expert.",
+    )
     parser.add_argument("--episode-id", help="Optional unique episode directory name.")
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--queue-size", type=int, default=96)
@@ -1115,6 +1127,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("fps, queue-size, and camera-ready-timeout must be > 0")
     if args.vision_target_radius_m <= 0:
         parser.error("vision-target-radius-m must be > 0")
+    if args.minimal_c_expert and sequence != ("C",):
+        parser.error("--minimal-c-expert requires --sequence C")
     if args.deterministic_place_path:
         unsupported = [key for key in sequence if key not in LEFT_FIXED_PLACE_JOINT_PATHS]
         if unsupported:
