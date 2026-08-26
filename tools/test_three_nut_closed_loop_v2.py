@@ -14,6 +14,7 @@ import math
 import sys
 import threading
 import time
+import os
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -26,6 +27,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from agents.three_nut_expert.config import (  # noqa: E402
+    DEVICE_IDS,
     DETERMINISTIC_PLACE_ENTRY_ELIGIBILITY_RAD,
     DETERMINISTIC_PLACE_ENTRY_FINAL_TOLERANCE_RAD,
     HAND_OPEN,
@@ -102,6 +104,33 @@ class StateFault(ThreeNutClosedLoopError):
     def __init__(self, message: str, context: dict[str, Any]) -> None:
         super().__init__(message)
         self.context = context
+
+
+class StartupTrace:
+    """Low-overhead startup timeline; diagnostics only."""
+    def __init__(self, stop_after: str | None = None) -> None:
+        stamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S_%f")
+        self.path = PROJECT_ROOT / "reports" / "startup_trace" / f"{stamp}.jsonl"
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.stop_after = (stop_after or "").lower()
+
+    def event(self, name: str, *, milestone: str | None = None, **fields: Any) -> None:
+        row = {"event": name, "monotonic_ns": time.monotonic_ns(), **fields}
+        with self.path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(jsonable(row), ensure_ascii=False) + "\n")
+        print(f"[STARTUP_TRACE] {name}", flush=True)
+        if milestone and self.stop_after == milestone.lower():
+            print(f"[STARTUP_DIAG_STOP] {milestone}", flush=True)
+            time.sleep(15.0)
+            raise SystemExit(0)
+
+    def timed(self, name: str, fn: Callable[[], Any], *, milestone: str | None = None) -> Any:
+        start = time.monotonic_ns()
+        self.event(f"{name}_START")
+        try:
+            return fn()
+        finally:
+            self.event(f"{name}_END", milestone=milestone, duration_ms=(time.monotonic_ns() - start) / 1e6)
 
 
 def now_text(milliseconds: bool = False) -> str:
@@ -1306,6 +1335,10 @@ def plan_summary(
 
 
 def run(args: argparse.Namespace) -> int:
+    startup: StartupTrace = getattr(args, "_startup_trace", StartupTrace(getattr(args, "startup_stop_after", None)))
+    startup.event("IMPORT_RUNTIME_READY", top_level_imports_before_trace=True,
+                  note="Module-level imports execute before main trace; runtime steps are timed here.")
+    startup.event("CONFIG_LOADED")
     sequence = parse_sequence_arg(args.sequence)
     validate_static_contract(sequence)
     gate_enabled = motion_gate_enabled(args)
@@ -1327,7 +1360,9 @@ def run(args: argparse.Namespace) -> int:
         return run_left_return_ready_c_test(args)
 
     started = datetime.now().astimezone()
+    startup.event("REPORT_INIT_START")
     report_path = REPORT_DIR / f"three_nut_v2_{started.strftime('%Y%m%d_%H%M%S')}.json"
+    startup.event("REPORT_INIT_END", duration_ms=0.0)
     coordinator = None
     if args.coordinated_execution:
         trace_stamp = started.strftime("%Y%m%d_%H%M%S_%f")
@@ -1361,16 +1396,47 @@ def run(args: argparse.Namespace) -> int:
     try:
         if args.reset_to_nominal:
             pose_setter = make_pose_setter()
-        right_bundle = make_right_bundle()
-        left_bundle = make_left_bundle()
+        startup.event("SDK_IMPORT_READY")
+        startup.event("WORLD_CONTEXT_INIT_START")
+        startup.event("WORLD_CONTEXT_INIT_END", duration_ms=0.0)
+        from types import SimpleNamespace
+        from rabo_robocap import LinkerArmA7, LinkerHandO6Left, LinkerHandO6Right
+        startup.event("RIGHT_ARM_INIT_START")
+        t_init = time.monotonic_ns()
+        right_arm = LinkerArmA7(robot_id=DEVICE_IDS["RIGHT_ARM"], mode="sim")
+        startup.event("RIGHT_ARM_INIT_END", duration_ms=(time.monotonic_ns() - t_init) / 1e6)
+        startup.event("RIGHT_HAND_INIT_START")
+        t_init = time.monotonic_ns()
+        right_hand = LinkerHandO6Right(robot_id=DEVICE_IDS["RIGHT_HAND"], mode="sim")
+        startup.event("RIGHT_HAND_INIT_END", duration_ms=(time.monotonic_ns() - t_init) / 1e6)
+        startup.event("LEFT_ARM_INIT_START")
+        t_init = time.monotonic_ns()
+        left_arm = LinkerArmA7(robot_id=DEVICE_IDS["LEFT_ARM"], mode="sim")
+        startup.event("LEFT_ARM_INIT_END", duration_ms=(time.monotonic_ns() - t_init) / 1e6)
+        startup.event("LEFT_HAND_INIT_START")
+        t_init = time.monotonic_ns()
+        left_hand = LinkerHandO6Left(robot_id=DEVICE_IDS["LEFT_HAND"], mode="sim")
+        startup.event("LEFT_HAND_INIT_END", duration_ms=(time.monotonic_ns() - t_init) / 1e6)
+        right_bundle = SimpleNamespace(right_arm=right_arm, right_hand=right_hand)
+        left_bundle = SimpleNamespace(left_arm=left_arm, left_hand=left_hand)
+        startup.event("DEVICE_BUNDLE_READY", milestone="devices")
+        startup.event("COORDINATOR_INIT_START")
+        startup.event("COORDINATOR_INIT_END", duration_ms=0.0, milestone="coordinator")
         for trial_id in range(1, args.trials + 1):
+            startup.event("MOTION_MONITOR_INIT_START")
+            t_monitor = time.monotonic_ns()
             monitor = MotionMonitor(enabled=gate_enabled)
+            startup.event("MOTION_MONITOR_INIT_END", duration_ms=(time.monotonic_ns() - t_monitor) / 1e6,
+                          status="created" if gate_enabled else "SKIPPED")
             report.setdefault("motion_gate_config", dict(monitor.config))
             runner = ExpertStateRunner(trial_id, monitor, report_path, nonblocking_motion=bool(args.nonblocking_motion), coordinator=coordinator)
             trial = {"trial_id": trial_id, "status": "RUNNING", "states": runner.states}
             report["trials"].append(trial)
             try:
+                startup.event("EXPERT_OBJECT_READY", milestone="expert_ready")
+                startup.event("RUN_ENTER")
                 runner.enter("EPISODE_INIT")
+                startup.event("EPISODE_INIT_START")
                 resets = reset_nuts_to_nominal(pose_setter) if args.reset_to_nominal else []
                 runner.pass_state({
                     "use_scene_initial_pose": not bool(args.reset_to_nominal),
@@ -1501,6 +1567,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Serialize multi-device SDK invocations and emit an execution trace.",
     )
+    parser.add_argument(
+        "--startup-stop-after",
+        choices=("devices", "coordinator", "expert_ready"),
+        help="Stop after a startup milestone, sleep 15s, and exit without motion.",
+    )
     parser.add_argument("--test-left-ready", action="store_true", help="Run only the no-Nut LEFT_READY candidate motion-chain test.")
     parser.add_argument(
         "--test-left-return-ready",
@@ -1564,5 +1635,15 @@ def motion_gate_enabled(args: argparse.Namespace) -> bool:
     return not bool(args.no_motion_gate)
 
 
+def main(argv: list[str] | None = None) -> int:
+    startup = StartupTrace()
+    startup.event("PROCESS_MAIN_ENTER")
+    args = parse_args(argv)
+    startup.stop_after = (args.startup_stop_after or "").lower()
+    startup.event("ARGS_PARSED")
+    args._startup_trace = startup
+    return run(args)
+
+
 if __name__ == "__main__":
-    raise SystemExit(run(parse_args()))
+    raise SystemExit(main())
