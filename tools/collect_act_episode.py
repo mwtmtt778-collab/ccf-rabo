@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Collect one formal ACT V1 C -> B -> A Expert episode.
+"""Collect one formal ACT V1 Expert episode (default C -> B -> A).
 
 Without ``--execute`` this script performs only static and synthetic contract
 checks.  Execute mode never resets the scene; the operator must use Web Reset
@@ -65,7 +65,6 @@ from tools.test_right_release_stability import (  # noqa: E402
 )
 from tools.test_three_nut_closed_loop_v2 import (  # noqa: E402
     ExpertStateRunner,
-    NUT_SEQUENCE,
     execute_left_pick_place,
     execute_right_transfer,
     go_left_initial_ready,
@@ -415,6 +414,7 @@ def evaluate_quality(
     *,
     state_errors: Sequence[dict[str, Any]],
     expert_done: bool,
+    requested_sequence: Sequence[str],
     completed_nuts: Sequence[str],
     camera_record: Any,
     camera_writer_error: str | None,
@@ -460,7 +460,7 @@ def evaluate_quality(
         ),
         "no_state_read_error": not state_errors,
         "expert_complete_done": expert_done,
-        "completed_nuts_c_b_a": list(completed_nuts) == ["C", "B", "A"],
+        "completed_nuts_match_requested_sequence": list(completed_nuts) == list(requested_sequence),
         "all_observations_have_causal_top_frame": bool(len(indices) == len(states) and valid_indices.all()),
         "camera_never_uses_future_frame": bool(
             valid_indices.all()
@@ -502,6 +502,8 @@ def evaluate_quality(
         "state_count": int(len(states)),
         "transition_count": int(max(0, len(states) - 1)),
         "state_read_error_count": len(state_errors),
+        "requested_sequence": list(requested_sequence),
+        "completed_nuts": list(completed_nuts),
     }
 
 
@@ -570,12 +572,35 @@ def synthetic_contract_self_test() -> dict[str, Any]:
         arrays,
         state_errors=[],
         expert_done=True,
+        requested_sequence=("C", "B", "A"),
         completed_nuts=("C", "B", "A"),
         camera_record=SyntheticCameraRecord(),
         camera_writer_error=None,
     )
     if quality["result"] != "PASS":
         raise AssertionError(f"synthetic quality contract failed: {quality['checks']}")
+    quality_cb = evaluate_quality(
+        arrays,
+        state_errors=[],
+        expert_done=True,
+        requested_sequence=("C", "B"),
+        completed_nuts=("C", "B"),
+        camera_record=SyntheticCameraRecord(),
+        camera_writer_error=None,
+    )
+    if not quality_cb["checks"]["completed_nuts_match_requested_sequence"]:
+        raise AssertionError("requested C,B sequence was not accepted")
+    quality_incomplete = evaluate_quality(
+        arrays,
+        state_errors=[],
+        expert_done=True,
+        requested_sequence=("C", "B"),
+        completed_nuts=("C",),
+        camera_record=SyntheticCameraRecord(),
+        camera_writer_error=None,
+    )
+    if quality_incomplete["checks"]["completed_nuts_match_requested_sequence"]:
+        raise AssertionError("incomplete requested sequence was accepted")
     expected_modes = [[0, 0], [1, 0], [1, 1], [0, 1]]
     if arrays["grasp_modes_at_state"].tolist() != expected_modes:
         raise AssertionError("persistent grasp mode alignment failed")
@@ -590,6 +615,8 @@ def synthetic_contract_self_test() -> dict[str, Any]:
         "hybrid_actions_shape": list(arrays["hybrid_actions"].shape),
         "action_state_exact_match": quality["checks"]["action_state_exact_match"],
         "future_frame_rejected": True,
+        "requested_c_b_sequence_pass": True,
+        "incomplete_c_b_sequence_rejected": True,
     }
 
 
@@ -652,8 +679,6 @@ def move_episode(source: Path, destination_root: Path) -> Path:
 
 def execute_episode(args: argparse.Namespace) -> int:
     sequence = parse_sequence_arg(args.sequence)
-    if tuple(sequence) != NUT_SEQUENCE:
-        raise SystemExit("formal ACT V1 collector requires exact sequence C,B,A")
     validate_static_contract(tuple(sequence))
     if not math.isclose(LEFT_SAFE_LIFT_DELTA_Z_M, 0.12, rel_tol=0.0, abs_tol=1e-12):
         raise SystemExit(f"LEFT_SAFE_LIFT_DELTA_Z_M must be 0.12, got {LEFT_SAFE_LIFT_DELTA_Z_M}")
@@ -775,6 +800,7 @@ def execute_episode(args: argparse.Namespace) -> int:
         arrays,
         state_errors=state_errors,
         expert_done=expert_done,
+        requested_sequence=sequence,
         completed_nuts=completed_nuts,
         camera_record=record,
         camera_writer_error=recorder.writer_shutdown_error,
@@ -858,14 +884,14 @@ def execute_episode(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Collect one formal ACT V1 C -> B -> A Expert episode."
+        description="Collect one formal ACT V1 Expert episode (default C -> B -> A)."
     )
     parser.add_argument(
         "--execute",
         action="store_true",
         help="Drive the current blocking Expert once. Without this flag: dry-run only.",
     )
-    parser.add_argument("--sequence", default="C,B,A", help="Frozen formal sequence (default: C,B,A).")
+    parser.add_argument("--sequence", default="C,B,A", help="Expert nut sequence (default: C,B,A).")
     parser.add_argument("--fps", type=float, default=5.0, help="State sampling frequency (default: 5Hz).")
     parser.add_argument("--monitor", action="store_true", help="Compatibility flag; MotionMonitor is always enabled.")
     parser.add_argument("--episode-id", help="Optional unique episode directory name.")
@@ -884,8 +910,6 @@ def main(argv: list[str] | None = None) -> int:
         sequence = parse_sequence_arg(args.sequence)
     except Exception as exc:
         parser.error(str(exc))
-    if tuple(sequence) != NUT_SEQUENCE:
-        parser.error("formal ACT V1 collector requires exact sequence C,B,A")
     if args.fps <= 0 or args.queue_size <= 0 or args.camera_ready_timeout <= 0:
         parser.error("fps, queue-size, and camera-ready-timeout must be > 0")
     if args.vision_target_radius_m <= 0:
