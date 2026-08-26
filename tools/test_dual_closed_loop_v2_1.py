@@ -57,7 +57,7 @@ from tools.test_right_release_stability import (  # noqa: E402
 RIGHT_OBSERVATION_JOINTS = tuple(tuple(float(value) for value in joints) for joints in RIGHT_PRE_JOINTS)
 RIGHT_RELEASE_OPEN_WAIT_S = 1.0
 RIGHT_OBSERVATION_STABLE_WAIT_S = 2.0
-LEFT_SAFE_LIFT_DELTA_Z_M = 0.12
+LEFT_SAFE_LIFT_DELTA_Z_M = 0.18
 
 
 class DualClosedLoopV21Error(RuntimeError):

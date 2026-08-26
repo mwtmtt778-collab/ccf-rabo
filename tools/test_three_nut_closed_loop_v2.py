@@ -762,7 +762,11 @@ def execute_left_pick_place(
     runner.enter("LEFT_SAFE_RETREAT")
     retreat = vertical_retreat_from_place(place)
     retreat_row = move_pose(runner, left_bundle.left_arm, retreat, f"LEFT_SAFE_RETREAT_{key}")
-    runner.pass_state({"move": retreat_row, "safe_retreat_pose": retreat, "geometry": "vertical + existing 0.12m safe-lift delta"})
+    runner.pass_state({
+        "move": retreat_row,
+        "safe_retreat_pose": retreat,
+        "geometry": f"vertical + existing {LEFT_SAFE_LIFT_DELTA_Z_M:g}m safe-lift delta",
+    })
     go_left_return_ready(runner, left_bundle.left_arm)
 
 
