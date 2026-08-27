@@ -1,9 +1,5 @@
 {
   "camera_topic": "auto",
-  "left_arm_name": "linker_left",
-  "right_arm_name": "linker_right",
-  "left_hand_name": "hand_left",
-  "right_hand_name": "hand_right",
   "model": "models/act_c_fixed_point_v1.onnx",
   "contract": "models/act_c_fixed_point_v1.json",
   "dry_run_log": "logs/act_c_runtime_dry_run.jsonl",

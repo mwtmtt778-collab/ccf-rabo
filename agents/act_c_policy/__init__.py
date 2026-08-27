@@ -1,12 +1,15 @@
-"""Official Rabo entrypoint for the fixed-point Nut C ACT policy."""
+"""Rabo Case entrypoint for the fixed-point Nut C ACT policy."""
 
 from __future__ import annotations
 
-from .runtime import main
+from .runtime import run_official_agent
 
 __all__ = ["run"]
 
 
 def run() -> None:
-    """Official fixed-point C Agent: serial receding-horizon execution."""
-    raise SystemExit(main(["--execute-mvp"]))
+    """Automatically execute the fixed-point C task when Rabo starts this Agent."""
+    print("Agent loaded: act_c_policy", flush=True)
+    status = run_official_agent()
+    if status:
+        raise SystemExit(status)

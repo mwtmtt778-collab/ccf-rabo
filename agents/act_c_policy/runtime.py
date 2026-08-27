@@ -62,10 +62,6 @@ class ActCConfig:
     repo_root: Path
     path: Path
     camera_topic: str
-    left_arm_name: str
-    right_arm_name: str
-    left_hand_name: str
-    right_hand_name: str
     model: Path
     contract: Path
     dry_run_log: Path
@@ -100,8 +96,7 @@ def load_config(
     except (OSError, json.JSONDecodeError) as exc:
         raise RuntimeFault(f"ACT C config unreadable: {exc!r}") from exc
     required = {
-        "camera_topic", "left_arm_name", "right_arm_name", "left_hand_name",
-        "right_hand_name", "model", "contract", "dry_run_log", "execute_log",
+        "camera_topic", "model", "contract", "dry_run_log", "execute_log",
         "max_delta_rad", "joint_limit_margin_rad",
     }
     missing = sorted(required - set(raw))
@@ -113,10 +108,6 @@ def load_config(
         repo_root=repo_root.resolve(),
         path=path,
         camera_topic=str(raw["camera_topic"]),
-        left_arm_name=str(raw["left_arm_name"]),
-        right_arm_name=str(raw["right_arm_name"]),
-        left_hand_name=str(raw["left_hand_name"]),
-        right_hand_name=str(raw["right_hand_name"]),
         model=model,
         contract=contract,
         dry_run_log=_repo_path(repo_root, raw["dry_run_log"], "dry_run_log"),
@@ -124,10 +115,8 @@ def load_config(
         max_delta_rad=float(raw["max_delta_rad"]),
         joint_limit_margin_rad=float(raw["joint_limit_margin_rad"]),
     )
-    if not config.camera_topic or not all(
-        (config.left_arm_name, config.right_arm_name, config.left_hand_name, config.right_hand_name)
-    ):
-        raise RuntimeFault("ACT C device names and camera_topic must be nonempty")
+    if not config.camera_topic:
+        raise RuntimeFault("ACT C camera_topic must be nonempty")
     if not 0 < config.max_delta_rad <= MAX_DELTA_PER_STEP:
         raise RuntimeFault(f"max_delta_rad must be in (0,{MAX_DELTA_PER_STEP}]")
     half_width = float(np.min(ARM_JOINT_LIMITS[:, 1] - ARM_JOINT_LIMITS[:, 0])) / 2.0
@@ -408,19 +397,25 @@ def require_sdk_success(value: Any, operation: str) -> None:
 
 
 class SdkDeviceBundle:
-    """Portable Rabo SDK clients selected only by config device names."""
+    """The exact arm/hand factories proven by run_c_only_serial_expert.py."""
 
-    def __init__(self, config: ActCConfig, *, include_hands: bool) -> None:
-        from rabo_robocap import LinkerArmA7, LinkerHandO6Left, LinkerHandO6Right
+    def __init__(self) -> None:
+        from tools.test_dual_closed_loop_v2 import make_left_bundle, shutdown_left_bundle
+        from tools.test_right_release_stability import make_right_bundle, shutdown_bundle
 
         self.closed = False
+        self.right_bundle = self.left_bundle = None
+        self._shutdown_right = shutdown_bundle
+        self._shutdown_left = shutdown_left_bundle
         self.left_arm = self.right_arm = self.left_hand = self.right_hand = None
         try:
-            self.left_arm = LinkerArmA7(robot_id=config.left_arm_name, mode="sim")
-            self.right_arm = LinkerArmA7(robot_id=config.right_arm_name, mode="sim")
-            if include_hands:
-                self.left_hand = LinkerHandO6Left(robot_id=config.left_hand_name, mode="sim")
-                self.right_hand = LinkerHandO6Right(robot_id=config.right_hand_name, mode="sim")
+            # Preserve the successful Expert initialization order and DEVICE_IDS source.
+            self.right_bundle = make_right_bundle()
+            self.left_bundle = make_left_bundle()
+            self.right_arm = self.right_bundle.right_arm
+            self.right_hand = self.right_bundle.right_hand
+            self.left_arm = self.left_bundle.left_arm
+            self.left_hand = self.left_bundle.left_hand
         except BaseException:
             self.close()
             raise
@@ -429,10 +424,10 @@ class SdkDeviceBundle:
         if self.closed:
             return
         self.closed = True
-        for device in (self.left_hand, self.right_hand, self.left_arm, self.right_arm):
-            if device is not None and hasattr(device, "shutdown"):
-                with contextlib.suppress(Exception):
-                    device.shutdown()
+        with contextlib.suppress(Exception):
+            self._shutdown_right(self.right_bundle)
+        with contextlib.suppress(Exception):
+            self._shutdown_left(self.left_bundle)
 
 
 class SdkArmStateSource:
@@ -1145,13 +1140,12 @@ def validate_contract_file(path: Path) -> None:
 def _initialize_live(
     args: argparse.Namespace,
     config: ActCConfig,
-    *,
-    include_hands: bool,
 ) -> tuple[RuntimeResources, TopCameraReader, RuntimeStateReader, OnnxPolicy, SdkDeviceBundle]:
     import rclpy
 
     validate_contract_file(config.contract)
     policy = OnnxPolicy(config.model, threads=args.threads)
+    print("Model READY", flush=True)
     owner = RclpyOwner(rclpy)
     resources = RuntimeResources(owner)
     try:
@@ -1160,19 +1154,26 @@ def _initialize_live(
         print(f"Selected TOP: {camera_topic}", flush=True)
         camera = TopCameraReader(rclpy, topic=camera_topic)
         resources.camera = camera
-        sdk = SdkDeviceBundle(config, include_hands=include_hands)
-        resources.sdk = sdk
-        assert sdk.left_arm is not None and sdk.right_arm is not None
-        state_source = SdkArmStateSource(sdk.left_arm, sdk.right_arm)
-        state_reader = RuntimeStateReader(state_source)
         deadline = time.monotonic() + float(args.ready_timeout)
         camera.wait_ready(max(0.0, deadline - time.monotonic()))
         print("Camera READY", flush=True)
+        sdk = SdkDeviceBundle()
+        resources.sdk = sdk
+        assert sdk.left_arm is not None and sdk.right_arm is not None
+        assert sdk.left_hand is not None and sdk.right_hand is not None
+        print("Rabo arm/hand devices READY", flush=True)
+        state_source = SdkArmStateSource(sdk.left_arm, sdk.right_arm)
+        state_reader = RuntimeStateReader(state_source)
         state_reader.wait_ready(max(0.0, deadline - time.monotonic()))
         state, _ = state_reader.snapshot()
         if not np.isfinite(state).all():
             raise RuntimeFault("state26 is not finite at readiness gate")
-        print("State26 READY", flush=True)
+        print("State READY", flush=True)
+        # Fail closed before constructing an arm executor or sending any hand/arm command.
+        first_camera = camera.snapshot()
+        first_state, _ = state_reader.snapshot()
+        policy.infer(first_camera.image, first_state)
+        print("First ONNX inference READY", flush=True)
         return resources, camera, state_reader, policy, sdk
     except BaseException:
         resources.close()
@@ -1182,9 +1183,7 @@ def _initialize_live(
 def run_live_dry(args: argparse.Namespace, config: ActCConfig) -> dict[str, Any]:
     resources: RuntimeResources | None = None
     try:
-        resources, camera, state_reader, policy, _sdk = _initialize_live(
-            args, config, include_hands=False
-        )
+        resources, camera, state_reader, policy, _sdk = _initialize_live(args, config)
         runtime = FixedPointCRuntime(camera, state_reader, policy, rate_hz=args.rate)
         print("ACT C FIXED-POINT POLICY", flush=True)
         print(f"Model: {config.model}", flush=True)
@@ -1199,9 +1198,7 @@ def run_live_dry(args: argparse.Namespace, config: ActCConfig) -> dict[str, Any]
 def run_live_mvp(args: argparse.Namespace, config: ActCConfig) -> dict[str, Any]:
     resources: RuntimeResources | None = None
     try:
-        resources, camera, state_reader, policy, sdk = _initialize_live(
-            args, config, include_hands=True
-        )
+        resources, camera, state_reader, policy, sdk = _initialize_live(args, config)
         assert sdk.left_arm is not None and sdk.right_arm is not None
         assert sdk.left_hand is not None and sdk.right_hand is not None
         state_source = state_reader.passive
@@ -1249,6 +1246,30 @@ def run_live_mvp(args: argparse.Namespace, config: ActCConfig) -> dict[str, Any]
     finally:
         if resources is not None:
             resources.close()
+
+
+def run_official_agent() -> int:
+    """Rabo Case lifecycle entrypoint; no CLI flags are required or inspected."""
+    args = argparse.Namespace(
+        threads=2,
+        ready_timeout=20.0,
+        rate=POLICY_HZ,
+        duration=10.0,
+        observe_hz=5.0,
+        start_threshold_rad=0.003,
+        settle_threshold_rad=0.002,
+        settle_samples=3,
+        post_settle_s=0.2,
+        motion_timeout_s=20.0,
+        no_motion_grace_s=1.0,
+    )
+    try:
+        config = load_config(DEFAULT_CONFIG, repo_root=PROJECT_ROOT)
+        run_live_mvp(args, config)
+        return 0
+    except BaseException as exc:
+        print(f"FAULT: {exc!r}", file=sys.stderr, flush=True)
+        return 1
 
 
 def build_parser() -> argparse.ArgumentParser:

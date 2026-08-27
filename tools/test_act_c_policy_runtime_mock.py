@@ -10,6 +10,7 @@ import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 
@@ -29,6 +30,7 @@ from agents.act_c_policy.runtime import (
     RuntimeResources,
     RuntimeFault,
     RuntimeStateReader,
+    SdkDeviceBundle,
     SerialRecedingHorizonMvp,
     TopCameraReader,
     build_safe_arm_target,
@@ -373,10 +375,6 @@ class RuntimeTests(unittest.TestCase):
         (root / "models/contract.json").write_text("{}", encoding="utf-8")
         config = {
             "camera_topic": "auto",
-            "left_arm_name": "linker_left",
-            "right_arm_name": "linker_right",
-            "left_hand_name": "hand_left",
-            "right_hand_name": "hand_right",
             "model": "models/policy.onnx",
             "contract": "models/contract.json",
             "dry_run_log": "logs/dry.jsonl",
@@ -436,13 +434,73 @@ class RuntimeTests(unittest.TestCase):
         camera.close()
         self.assertEqual(calls, ["wake", "remove_node", "executor_shutdown", "destroy_node"])
 
-    def test_agent_and_tool_share_runtime_main(self) -> None:
+    def test_agent_and_tool_use_the_same_runtime_module(self) -> None:
         import agents.act_c_policy as agent_entry
         import agents.act_c_policy.runtime as runtime
         import tools.run_act_c_policy_rabo as tool_entry
 
-        self.assertIs(agent_entry.main, runtime.main)
+        self.assertIs(agent_entry.run_official_agent, runtime.run_official_agent)
         self.assertIs(tool_entry.main, runtime.main)
+
+    def test_rabo_default_loader_discovers_and_runs_act_c_policy(self) -> None:
+        import main as project_entry
+
+        calls = []
+        fake_agent = SimpleNamespace(run=lambda: calls.append("run"))
+        with mock.patch.object(project_entry.sys, "argv", ["main.py"]), mock.patch.object(
+            project_entry.importlib, "import_module", return_value=fake_agent
+        ) as importer:
+            project_entry.main()
+        importer.assert_called_once_with("agents.act_c_policy")
+        self.assertEqual(calls, ["run"])
+        self.assertFalse(project_entry.RUN_ROBOT_STATE_TEST_ON_DEFAULT_START)
+
+    def test_official_agent_run_uses_no_cli_flags(self) -> None:
+        import agents.act_c_policy as agent_entry
+
+        with mock.patch.object(agent_entry, "run_official_agent", return_value=0) as lifecycle:
+            agent_entry.run()
+        lifecycle.assert_called_once_with()
+
+    def test_official_lifecycle_loads_config_and_executes_mvp(self) -> None:
+        import agents.act_c_policy.runtime as runtime
+
+        config = object()
+        with mock.patch.object(runtime, "load_config", return_value=config) as load, mock.patch.object(
+            runtime, "run_live_mvp", return_value={"status": "DONE"}
+        ) as execute:
+            self.assertEqual(runtime.run_official_agent(), 0)
+        load.assert_called_once_with(runtime.DEFAULT_CONFIG, repo_root=runtime.PROJECT_ROOT)
+        args, selected_config = execute.call_args.args
+        self.assertIs(selected_config, config)
+        self.assertEqual(args.motion_timeout_s, 20.0)
+
+    def test_platform_requirements_install_onnxruntime(self) -> None:
+        requirements = (PROJECT_ROOT / "requirements.txt").read_text(encoding="utf-8")
+        self.assertRegex(requirements, r"(?m)^onnxruntime[^\n]*$")
+
+    def test_sdk_bundle_reuses_successful_c_expert_factories(self) -> None:
+        calls = []
+        right = SimpleNamespace(right_arm=object(), right_hand=object())
+        left = SimpleNamespace(left_arm=object(), left_hand=object())
+        with mock.patch(
+            "tools.test_right_release_stability.make_right_bundle",
+            side_effect=lambda: calls.append("make_right") or right,
+        ), mock.patch(
+            "tools.test_dual_closed_loop_v2.make_left_bundle",
+            side_effect=lambda: calls.append("make_left") or left,
+        ), mock.patch(
+            "tools.test_right_release_stability.shutdown_bundle",
+            side_effect=lambda bundle: calls.append(("shutdown_right", bundle)),
+        ), mock.patch(
+            "tools.test_dual_closed_loop_v2.shutdown_left_bundle",
+            side_effect=lambda bundle: calls.append(("shutdown_left", bundle)),
+        ):
+            devices = SdkDeviceBundle()
+            devices.close()
+            devices.close()
+        self.assertEqual(calls[:2], ["make_right", "make_left"])
+        self.assertEqual(calls[2:], [("shutdown_right", right), ("shutdown_left", left)])
 
 
 if __name__ == "__main__":

@@ -1,60 +1,32 @@
-# ACT C Fixed-Point Agent — GitHub Deployment
+# ACT C Fixed-Point Agent — Rabo Case Deployment
 
-This deployment uses only files committed to the `agent_system` repository. The training repository, Episodes, rosbags, checkpoints, and local training outputs are not required.
+The GitHub `agent_system` repository is the only deployment source. Training repositories, Episodes, rosbags, checkpoints, and training outputs are not part of deployment.
 
-## Current Rabo
+## Normal platform operation
 
-```bash
-cd /workspace/agent_system
-git pull origin main
-python3 -m pip install -r requirements-act-c.txt
-python3 tools/check_act_c_environment.py --discover
-python3 -u tools/run_act_c_policy_rabo.py --dry-run
-```
+Rabo starts the Case controller without user-supplied arguments. The repository `main.py` selects `act_c_policy`, imports `agents.act_c_policy`, and calls its exported `run()` lifecycle entrypoint. There is no separate Agent registry, decorator, or manifest in this project.
 
-Only after the dry-run reports `PASS`, start the formal Agent:
+The user workflow is:
 
-```bash
-python3 -u main.py act_c_policy
-```
+1. Open the Rabo Case backed by this repository revision.
+2. Start the Case/Agent in the Rabo platform.
+3. Observe `Agent loaded`, readiness gates, and then `DONE` or `FAULT` in platform logs.
 
-For the retained explicit MVP debug entrypoint:
+No terminal, Python command, CLI flag, or separately started tool process is part of normal operation.
 
-```bash
-python3 -u tools/run_act_c_policy_rabo.py --execute-mvp
-```
+At startup the Agent loads the repository-owned ONNX model, discovers the TOP camera, initializes the same arm/hand bundles used by the successful C Expert, validates live state26 and one ONNX inference, and only then constructs the serial arm executor and begins the task.
 
-The legacy `--execute` entrypoint remains disabled and fail-closed.
+## New Rabo / Case synchronization
 
-## New Rabo
+Connect or update the Case from the same GitHub repository and revision, then let the Rabo platform install/build the Case dependencies from the root `requirements.txt`. Select/start the Case normally. `onnxruntime` is declared in that platform dependency file.
 
-```bash
-git clone <agent_system-repo-url> agent_system
-cd agent_system
-python3 -m pip install -r requirements-act-c.txt
-python3 tools/check_act_c_environment.py --discover
-```
+The camera defaults to `"auto"`. It selects the unique RGB `sensor_msgs/msg/Image` topic whose entity is not one of the discovered seven-joint arm entities. Zero or multiple legal candidates produce a fail-closed `FAULT`; a platform developer may then set `camera_topic` explicitly in `config/act_c_policy.json` and commit that Case configuration.
 
-The default camera setting is `"auto"`. It selects the unique RGB `sensor_msgs/msg/Image` topic whose entity is not one of the discovered seven-joint arm entities. If discovery reports zero or multiple legal candidates, edit only:
+Arm and hand construction is not name-discovered and does not use guessed aliases. It directly reuses `make_right_bundle()` and `make_left_bundle()` from the successfully executed C Expert stack, including its verified `DEVICE_IDS` source and shutdown helpers.
 
-```text
-config/act_c_policy.json
-```
+## Development-only diagnostics
 
-Set `camera_topic` to one of the exact image topics printed by the checker. If the new scene does not use the standard Rabo logical device names, update the four arm/hand name fields in the same JSON; do not edit Python.
-
-Then validate again:
-
-```bash
-python3 tools/check_act_c_environment.py --discover
-python3 -u tools/run_act_c_policy_rabo.py --dry-run
-```
-
-After dry-run PASS:
-
-```bash
-python3 -u main.py act_c_policy
-```
+`tools/run_act_c_policy_rabo.py` and `tools/check_act_c_environment.py` remain available to developers for diagnostics. They are not formal deployment entrypoints and are not required for normal Rabo Agent startup.
 
 ## Repository-owned deployment assets
 
@@ -62,7 +34,8 @@ python3 -u main.py act_c_policy
 - `models/act_c_fixed_point_v1.onnx`
 - `models/act_c_fixed_point_v1.json`
 - `config/act_c_policy.json`
-- `requirements-act-c.txt`
+- `requirements.txt`
+- `requirements-act-c.txt` (development convenience only)
 - `tools/check_act_c_environment.py`
 - `tools/run_act_c_policy_rabo.py`
 
