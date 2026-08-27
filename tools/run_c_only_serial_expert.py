@@ -41,13 +41,65 @@ from tools.test_dual_closed_loop_v2_1 import (  # noqa: E402
 )
 from tools.test_dual_closed_loop_v2_2 import (  # noqa: E402
     RIGHT_RELEASE_POSE,
-    build_right_release_safe_height_pose,
 )
 from tools.test_right_release_stability import (  # noqa: E402
     DEFAULT_HOLD_AFTER_GRASP_S,
     DEFAULT_SETTLE_AFTER_RELEASE_S,
     DEFAULT_VISION_TARGET_RADIUS_M,
     TARGET_NUT_B_WORLD_POSE,
+)
+
+
+# [VERIFIED] Unmodified SDK-order samples from the successful
+# RIGHT_RELEASE_SAFE_HEIGHT trajectory in episode_20260826_144708_105746.
+# Intermediate points are telemetry.npz states[199,201,203,205, 7:14]; the
+# terminal point is expert_states RIGHT_SAFE_RETREAT.move.joint_after.
+RIGHT_RELEASE_SAFE_JOINT_PATH = (
+    (
+        0.7453176379203796,
+        0.04430386796593666,
+        1.0963411331176758,
+        -1.3637889623641968,
+        -1.3782968521118164,
+        0.42015182971954346,
+        -1.317345142364502,
+    ),
+    (
+        0.8841877579689026,
+        0.016344869509339333,
+        1.1822478771209717,
+        -1.4212772846221924,
+        -1.5596474409103394,
+        0.3535405099391937,
+        -1.3983210325241089,
+    ),
+    (
+        0.9969002604484558,
+        -0.006356131751090288,
+        1.251999020576477,
+        -1.467968463897705,
+        -1.706965684890747,
+        0.2994275987148285,
+        -1.4640942811965942,
+    ),
+    (
+        1.1160832643508911,
+        -0.030346693471074104,
+        1.3257124423980713,
+        -1.5172969102859497,
+        -1.862575650215149,
+        0.24226896464824677,
+        -1.533569574356079,
+    ),
+    (
+        1.2227206244205195,
+        -0.051811932772827037,
+        1.391666589012047,
+        -1.5614329713680626,
+        -2.0018056990128485,
+        0.19112702025328832,
+        -1.595731698495557,
+    ),
 )
 
 
@@ -441,7 +493,10 @@ class SerialExpert:
             lambda: right_hand.clench(*list(HAND_OPEN)), clench6_after=HAND_OPEN, grasp_mode_after=0,
             dwell_s=max(self.args.hand_dwell_s, float(RIGHT_RELEASE_OPEN_WAIT_S)),
         )
-        self.move_to("RIGHT_RETREAT", "right_arm", right_arm, pose_to_list(build_right_release_safe_height_pose()))
+        safe_index = len(RIGHT_RELEASE_SAFE_JOINT_PATH)
+        for index, target in enumerate(RIGHT_RELEASE_SAFE_JOINT_PATH, start=1):
+            phase = "RIGHT_RETREAT_SAFE" if index == safe_index else f"RIGHT_RETREAT_WP{index}"
+            self.move_joints(phase, "right_arm", right_arm, target)
         for index, target in enumerate(RIGHT_OBSERVATION_JOINTS, start=1):
             self.move_joints(f"RIGHT_RETURN_READY_{index}", "right_arm", right_arm, target)
 
