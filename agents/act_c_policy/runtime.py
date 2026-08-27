@@ -1,12 +1,9 @@
-"""Single-camera fixed-point Nut C ACT runtime.
-
-The first deployment stage is deliberately dry-run only.  It receives passive
-ROS observations and runs ONNX at 5 Hz, but opens no robot SDK control client.
-"""
+"""Single-camera fixed-point Nut C ACT dry-run and serial execution MVP."""
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import math
 import sys
@@ -23,12 +20,33 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_MODEL = PROJECT_ROOT / "models" / "act_c_fixed_point_v1.onnx"
 DEFAULT_CONTRACT = PROJECT_ROOT / "models" / "act_c_fixed_point_v1.json"
 DEFAULT_DRY_RUN_LOG = PROJECT_ROOT / "logs" / "act_c_runtime_dry_run.jsonl"
+DEFAULT_MVP_LOG = PROJECT_ROOT / "logs" / "act_c_execute_mvp.jsonl"
 TOP_RGB_TOPIC = "/gs_1eebee6f37512bbc1d125b25511e912c/r6ef2dc_tp_cam_303d2b1ce0"
 HAND_OPEN = np.zeros(6, dtype=np.float32)
 STATE_DIM = 26
 ACTION_DIM = 28
 CHUNK_SIZE = 10
 POLICY_HZ = 5.0
+MAX_DELTA_PER_STEP = 0.10
+MIN_ARM_COMMAND_DELTA = 0.005
+MAX_POLICY_STEPS = 150
+POST_DONE_ARM_STEPS = 5
+MODE_RISE_THRESHOLD = 0.8
+MODE_FALL_THRESHOLD = 0.2
+MODE_CONFIRM_SAMPLES = 3
+# Retained LinkerArmA7 SDK/SDF limits in public SDK J1..J7 order, radians.
+ARM_JOINT_LIMITS = np.asarray(
+    [
+        (-2.18, 3.75),
+        (-3.20, 0.07),
+        (-2.69, 2.69),
+        (-2.05, 2.05),
+        (-2.69, 2.69),
+        (-1.59, 1.59),
+        (-1.59, 1.59),
+    ],
+    dtype=np.float32,
+)
 # PassiveArmState.observation() retains subscription order
 # [J1,J5,J4,J7,J3,J2,J6].  This is the same verified conversion used by its
 # arm_state.jsonl logger to produce training order [J1,J2,J3,J4,J5,J6,J7].
@@ -201,6 +219,27 @@ class RuntimeStateReader:
             raise RuntimeFault(f"invalid state26: shape={state.shape}, finite={np.isfinite(state).all()}")
         return state, min(int(left.timestamp_monotonic_ns), int(right.timestamp_monotonic_ns))
 
+    def set_hand_position(self, hand: str, target: Sequence[float]) -> None:
+        values = np.asarray(target, dtype=np.float32)
+        if values.shape != (6,) or not np.isfinite(values).all():
+            raise RuntimeFault(f"invalid {hand} hand position target: {values}")
+        if hand == "left":
+            self.left_hand = values.copy()
+        elif hand == "right":
+            self.right_hand = values.copy()
+        else:
+            raise ValueError(f"unknown hand: {hand}")
+
+    def set_hand_mode(self, hand: str, mode: int) -> None:
+        if mode not in (0, 1):
+            raise ValueError(f"invalid hand mode: {mode}")
+        if hand == "left":
+            self.left_mode = mode
+        elif hand == "right":
+            self.right_mode = mode
+        else:
+            raise ValueError(f"unknown hand: {hand}")
+
 
 class OnnxPolicy:
     def __init__(self, model_path: Path, *, threads: int = 2, session: Any | None = None) -> None:
@@ -351,6 +390,298 @@ class FixedPointCRuntime:
         return summary
 
 
+@dataclass(frozen=True)
+class ArmTarget:
+    raw_prediction: np.ndarray
+    clipped_target: np.ndarray
+    max_raw_delta: float
+    max_executed_delta: float
+
+
+def build_safe_arm_target(
+    current_arm14: Sequence[float] | np.ndarray,
+    predicted_arm14: Sequence[float] | np.ndarray,
+    *,
+    max_delta_per_step: float = MAX_DELTA_PER_STEP,
+) -> ArmTarget:
+    current = np.asarray(current_arm14, dtype=np.float32)
+    predicted = np.asarray(predicted_arm14, dtype=np.float32)
+    if current.shape != (14,) or predicted.shape != (14,):
+        raise RuntimeFault(f"arm target shape mismatch: current={current.shape}, predicted={predicted.shape}")
+    if not np.isfinite(current).all() or not np.isfinite(predicted).all():
+        raise RuntimeFault("arm current/prediction contains NaN or Inf")
+    if max_delta_per_step <= 0:
+        raise ValueError("max_delta_per_step must be positive")
+    low = np.tile(ARM_JOINT_LIMITS[:, 0], 2)
+    high = np.tile(ARM_JOINT_LIMITS[:, 1], 2)
+    if np.any(current < low) or np.any(current > high):
+        raise RuntimeFault("current real arm state is outside SDK hard limits")
+    raw_delta = predicted - current
+    clipped_delta = np.clip(raw_delta, -max_delta_per_step, max_delta_per_step)
+    target = np.clip(current + clipped_delta, low, high).astype(np.float32, copy=False)
+    executed_delta = target - current
+    if float(np.max(np.abs(executed_delta))) > max_delta_per_step + 1e-6:
+        raise RuntimeFault("internal arm delta clip violation")
+    return ArmTarget(
+        raw_prediction=predicted.copy(),
+        clipped_target=target.copy(),
+        max_raw_delta=float(np.max(np.abs(raw_delta))),
+        max_executed_delta=float(np.max(np.abs(executed_delta))),
+    )
+
+
+@dataclass(frozen=True)
+class ModeDecision:
+    mode: int
+    apply_hand: bool
+    transition: str | None
+
+
+class ConstrainedHandModeState:
+    """Three-sample hysteresis for one POSITION -> FORCE -> DONE sequence."""
+
+    def __init__(
+        self,
+        *,
+        rise_threshold: float = MODE_RISE_THRESHOLD,
+        fall_threshold: float = MODE_FALL_THRESHOLD,
+        confirm_samples: int = MODE_CONFIRM_SAMPLES,
+    ) -> None:
+        if not 0 <= fall_threshold < rise_threshold <= 1:
+            raise ValueError("mode thresholds must satisfy 0 <= fall < rise <= 1")
+        if confirm_samples < 1:
+            raise ValueError("confirm_samples must be >= 1")
+        self.rise_threshold = float(rise_threshold)
+        self.fall_threshold = float(fall_threshold)
+        self.confirm_samples = int(confirm_samples)
+        self.state = "POSITION"
+        self.high_count = 0
+        self.low_count = 0
+
+    def update(self, score: float, *, enabled: bool = True) -> ModeDecision:
+        score = float(score)
+        if not math.isfinite(score):
+            raise RuntimeFault("hand mode score contains NaN or Inf")
+        if self.state == "DONE":
+            return ModeDecision(0, False, None)
+        if not enabled:
+            if self.state != "POSITION":
+                raise RuntimeFault("cannot disable a hand after FORCE has started")
+            self.high_count = 0
+            return ModeDecision(0, True, None)
+        if self.state == "POSITION":
+            self.high_count = self.high_count + 1 if score >= self.rise_threshold else 0
+            if self.high_count >= self.confirm_samples:
+                self.state = "FORCE"
+                self.high_count = 0
+                self.low_count = 0
+                return ModeDecision(1, True, "POSITION_TO_FORCE")
+            return ModeDecision(0, True, None)
+        if self.state == "FORCE":
+            self.low_count = self.low_count + 1 if score <= self.fall_threshold else 0
+            if self.low_count >= self.confirm_samples:
+                self.state = "DONE"
+                self.low_count = 0
+                return ModeDecision(0, True, "FORCE_TO_DONE")
+            return ModeDecision(1, True, None)
+        raise RuntimeFault(f"unknown hand mode state: {self.state}")
+
+
+class SerialRecedingHorizonMvp:
+    def __init__(
+        self,
+        camera: Any,
+        state_reader: RuntimeStateReader,
+        policy: OnnxPolicy,
+        arm_executor: Any,
+        left_hand_executor: Any,
+        right_hand_executor: Any,
+        *,
+        max_policy_steps: int = MAX_POLICY_STEPS,
+        post_done_arm_steps: int = POST_DONE_ARM_STEPS,
+        max_delta_per_step: float = MAX_DELTA_PER_STEP,
+        no_arm_move_threshold: float = MIN_ARM_COMMAND_DELTA,
+        monotonic_ns: Any = time.monotonic_ns,
+        sleep: Any = time.sleep,
+    ) -> None:
+        if max_policy_steps < 1 or post_done_arm_steps < 0:
+            raise ValueError("invalid MVP step limits")
+        self.camera = camera
+        self.state_reader = state_reader
+        self.policy = policy
+        self.arm_executor = arm_executor
+        self.left_hand_executor = left_hand_executor
+        self.right_hand_executor = right_hand_executor
+        self.max_policy_steps = int(max_policy_steps)
+        self.post_done_arm_steps = int(post_done_arm_steps)
+        self.max_delta_per_step = float(max_delta_per_step)
+        self.no_arm_move_threshold = float(no_arm_move_threshold)
+        self.monotonic_ns = monotonic_ns
+        self.sleep = sleep
+        self.right_mode = ConstrainedHandModeState()
+        self.left_mode = ConstrainedHandModeState()
+
+    def _apply_hand(
+        self,
+        hand: str,
+        executor: Any,
+        target: np.ndarray,
+        decision: ModeDecision,
+    ) -> str:
+        if not decision.apply_hand:
+            return "DONE_NO_HAND_COMMAND"
+        semantic = executor.apply(target.tolist(), decision.mode, blocking=True)
+        self.state_reader.set_hand_mode(hand, decision.mode)
+        if decision.mode == 0:
+            self.state_reader.set_hand_position(hand, target)
+        return semantic
+
+    def run(self, log_path: Path) -> dict[str, Any]:
+        log_path = log_path.resolve()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        post_done_started = False
+        post_done_steps = 0
+        with log_path.open("w", encoding="utf-8", buffering=1) as stream:
+            for step in range(self.max_policy_steps):
+                now_ns = int(self.monotonic_ns())
+                camera = self.camera.snapshot()
+                state, state_timestamp_ns = self.state_reader.snapshot()
+                if state.shape != (1, STATE_DIM) or state.dtype != np.float32 or not np.isfinite(state).all():
+                    raise RuntimeFault(f"invalid live state26: {state.shape}/{state.dtype}")
+                chunk, onnx_ms = self.policy.infer(camera.image, state)
+                if chunk.shape != (1, CHUNK_SIZE, ACTION_DIM) or not np.isfinite(chunk).all():
+                    raise RuntimeFault("ONNX action chunk contains NaN/Inf or has wrong shape")
+                action = chunk[0, 0]
+                arm_target = build_safe_arm_target(
+                    state[0, :14], action[:14], max_delta_per_step=self.max_delta_per_step
+                )
+                print(
+                    "[ACT_MVP_TARGET] "
+                    f"raw_pred_target={arm_target.raw_prediction.tolist()} "
+                    f"clipped_target={arm_target.clipped_target.tolist()} "
+                    f"max_raw_delta={arm_target.max_raw_delta:.6f} "
+                    f"max_executed_delta={arm_target.max_executed_delta:.6f}",
+                    flush=True,
+                )
+                arm_commanded = arm_target.max_executed_delta >= self.no_arm_move_threshold
+                settled = True
+                if arm_commanded:
+                    settled = bool(
+                        self.arm_executor.move_pair(
+                            arm_target.clipped_target[:7].tolist(),
+                            arm_target.clipped_target[7:14].tolist(),
+                            step=step,
+                        )
+                    )
+                    if not settled:
+                        raise TimeoutError("passive settle returned false")
+                else:
+                    self.sleep(0.2)
+
+                right_decision = self.right_mode.update(float(action[27]), enabled=True)
+                left_decision = self.left_mode.update(
+                    float(action[26]), enabled=self.right_mode.state == "DONE"
+                )
+                right_semantic = self._apply_hand(
+                    "right", self.right_hand_executor, action[20:26], right_decision
+                )
+                left_semantic = self._apply_hand(
+                    "left", self.left_hand_executor, action[14:20], left_decision
+                )
+                row = {
+                    "event": "ACT_MVP_STEP",
+                    "step": step,
+                    "timestamp_monotonic_ns": now_ns,
+                    "camera_age_ms": (now_ns - int(camera.timestamp_monotonic_ns)) / 1e6,
+                    "state_age_ms": (now_ns - int(state_timestamp_ns)) / 1e6,
+                    "onnx_ms": float(onnx_ms),
+                    "raw_pred_target": arm_target.raw_prediction.tolist(),
+                    "clipped_target": arm_target.clipped_target.tolist(),
+                    "raw_delta_max": arm_target.max_raw_delta,
+                    "executed_delta_max": arm_target.max_executed_delta,
+                    "right_score": float(action[27]),
+                    "right_mode": self.right_mode.state,
+                    "right_hand_semantic": right_semantic,
+                    "left_score": float(action[26]),
+                    "left_mode": self.left_mode.state,
+                    "left_hand_semantic": left_semantic,
+                    "arm_commanded": arm_commanded,
+                    "settled": settled,
+                }
+                stream.write(json.dumps(row, ensure_ascii=False) + "\n")
+                print(
+                    "[ACT_MVP] "
+                    f"step={step} camera_age_ms={row['camera_age_ms']:.1f} "
+                    f"state_age_ms={row['state_age_ms']:.1f} onnx_ms={onnx_ms:.2f} "
+                    f"raw_delta_max={arm_target.max_raw_delta:.6f} "
+                    f"executed_delta_max={arm_target.max_executed_delta:.6f} "
+                    f"right_score={float(action[27]):.3f} right_mode={self.right_mode.state} "
+                    f"left_score={float(action[26]):.3f} left_mode={self.left_mode.state} "
+                    f"arm_commanded={arm_commanded} settled={settled}",
+                    flush=True,
+                )
+
+                both_done = self.right_mode.state == "DONE" and self.left_mode.state == "DONE"
+                if post_done_started:
+                    post_done_steps += 1
+                    if post_done_steps >= self.post_done_arm_steps:
+                        print("ACT C MVP FINISHED", flush=True)
+                        return {
+                            "status": "DONE",
+                            "policy_steps": step + 1,
+                            "post_done_arm_steps": post_done_steps,
+                            "log": str(log_path),
+                        }
+                elif both_done:
+                    post_done_started = True
+                    if self.post_done_arm_steps == 0:
+                        print("ACT C MVP FINISHED", flush=True)
+                        return {
+                            "status": "DONE",
+                            "policy_steps": step + 1,
+                            "post_done_arm_steps": 0,
+                            "log": str(log_path),
+                        }
+        raise RuntimeFault("MAX_POLICY_STEPS_EXCEEDED")
+
+
+class _NullEventWriter:
+    def write(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+
+class _SerialArmExecutor:
+    """Adapter over the retained serial move_joints + passive-settle implementation."""
+
+    def __init__(self, serial: Any, left_arm: Any, right_arm: Any) -> None:
+        self.serial = serial
+        self.left_arm = left_arm
+        self.right_arm = right_arm
+
+    def move_pair(self, left_target: list[float], right_target: list[float], *, step: int) -> bool:
+        self.serial.move_joints(f"ACT_MVP_{step:03d}_LEFT", "left_arm", self.left_arm, left_target)
+        self.serial.move_joints(f"ACT_MVP_{step:03d}_RIGHT", "right_arm", self.right_arm, right_target)
+        return True
+
+
+def _append_mvp_fault(log_path: Path, exc: BaseException) -> None:
+    with contextlib.suppress(Exception):
+        log_path = log_path.resolve()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with log_path.open("a", encoding="utf-8") as stream:
+            stream.write(
+                json.dumps(
+                    {
+                        "event": "FAULT",
+                        "timestamp_monotonic_ns": time.monotonic_ns(),
+                        "error": repr(exc),
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+
+
 def validate_contract_file(path: Path) -> None:
     contract = json.loads(path.read_text(encoding="utf-8"))
     if contract.get("camera_count") != 1 or contract.get("state_dim") != 26:
@@ -385,11 +716,90 @@ def run_live_dry(args: argparse.Namespace) -> dict[str, Any]:
         passive.close()
 
 
+def run_live_mvp(args: argparse.Namespace) -> dict[str, Any]:
+    from agents.three_nut_expert.config import RIGHT_GRASP_FORCE
+    from expert.left_nut_grasp_planner import GRASP_FORCE as LEFT_GRASP_FORCE
+    from tools.run_c_only_serial_expert import PassiveArmState, SerialExpert
+    from tools.test_hybrid_action_replay import HybridHandExecutor
+
+    validate_contract_file(args.contract.resolve())
+    passive = PassiveArmState(history_hz=args.observe_hz)
+    camera: TopCameraReader | None = None
+    right = left = None
+    try:
+        camera = TopCameraReader(passive.rclpy)
+        state_reader = RuntimeStateReader(passive)
+        deadline = time.monotonic() + args.ready_timeout
+        camera.wait_ready(max(0.0, deadline - time.monotonic()))
+        print("TOP READY", flush=True)
+        state_reader.wait_ready(max(0.0, deadline - time.monotonic()))
+        state, _ = state_reader.snapshot()
+        if not np.isfinite(state).all():
+            raise RuntimeFault("state26 is not finite at readiness gate")
+        print("Passive state READY", flush=True)
+        policy = OnnxPolicy(args.model, threads=args.threads)
+
+        from tools.test_right_release_stability import make_right_bundle
+        from tools.test_dual_closed_loop_v2 import make_left_bundle
+
+        right = make_right_bundle()
+        left = make_left_bundle()
+        serial = SerialExpert(_NullEventWriter(), passive, right, left, args)
+        arm_executor = _SerialArmExecutor(serial, left.left_arm, right.right_arm)
+
+        def right_clench(target: list[float], blocking: bool) -> Any:
+            return right.right_hand.clench(*target, blocking=blocking)
+
+        def right_force(blocking: bool) -> Any:
+            return right.right_hand.grasp_force(**RIGHT_GRASP_FORCE, blocking=blocking)
+
+        def left_clench(target: list[float], blocking: bool) -> Any:
+            return left.left_hand.clench(*target, blocking=blocking)
+
+        def left_force(blocking: bool) -> Any:
+            return left.left_hand.grasp_force(**LEFT_GRASP_FORCE, blocking=blocking)
+
+        print("ACT C SERIAL RECEDING-HORIZON MVP", flush=True)
+        print("This is NOT 5Hz streaming.", flush=True)
+        print(f"Arm target max delta: {MAX_DELTA_PER_STEP:.2f} rad", flush=True)
+        print("Mode control: constrained hysteresis", flush=True)
+        print("Execution: serial move + passive settle", flush=True)
+        runtime = SerialRecedingHorizonMvp(
+            camera,
+            state_reader,
+            policy,
+            arm_executor,
+            HybridHandExecutor(left_clench, left_force),
+            HybridHandExecutor(right_clench, right_force),
+        )
+        return runtime.run(args.mvp_log)
+    except BaseException as exc:
+        _append_mvp_fault(args.mvp_log, exc)
+        raise
+    finally:
+        if camera is not None:
+            with contextlib.suppress(Exception):
+                camera.close()
+        if right is not None:
+            from tools.test_right_release_stability import shutdown_bundle
+
+            with contextlib.suppress(Exception):
+                shutdown_bundle(right)
+        if left is not None:
+            from tools.test_dual_closed_loop_v2 import shutdown_left_bundle
+
+            with contextlib.suppress(Exception):
+                shutdown_left_bundle(left)
+        with contextlib.suppress(Exception):
+            passive.close()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--dry-run", action="store_true")
     mode.add_argument("--execute", action="store_true")
+    mode.add_argument("--execute-mvp", action="store_true")
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
     parser.add_argument("--contract", type=Path, default=DEFAULT_CONTRACT)
     parser.add_argument("--duration", type=float, default=10.0)
@@ -397,6 +807,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ready-timeout", type=float, default=20.0)
     parser.add_argument("--threads", type=int, default=2)
     parser.add_argument("--log", type=Path, default=DEFAULT_DRY_RUN_LOG)
+    parser.add_argument("--mvp-log", type=Path, default=DEFAULT_MVP_LOG)
+    parser.add_argument("--observe-hz", type=float, default=5.0)
+    parser.add_argument("--start-threshold-rad", type=float, default=0.003)
+    parser.add_argument("--settle-threshold-rad", type=float, default=0.002)
+    parser.add_argument("--settle-samples", type=int, default=3)
+    parser.add_argument("--post-settle-s", type=float, default=0.2)
+    parser.add_argument("--motion-timeout-s", type=float, default=20.0)
+    parser.add_argument("--no-motion-grace-s", type=float, default=1.0)
     return parser
 
 
@@ -409,7 +827,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             "to the existing HybridHandExecutor's exact {0,1} modes. No SDK client was created."
         )
     try:
-        run_live_dry(args)
+        if args.execute_mvp:
+            run_live_mvp(args)
+        else:
+            run_live_dry(args)
         return 0
     except BaseException as exc:
         print(f"FAULT: {exc!r}", file=sys.stderr, flush=True)

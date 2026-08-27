@@ -18,11 +18,16 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from agents.act_c_policy.runtime import (
+    ARM_JOINT_LIMITS,
     CameraSnapshot,
+    ConstrainedHandModeState,
     FixedPointCRuntime,
     OnnxPolicy,
+    RuntimeFault,
     RuntimeStateReader,
+    SerialRecedingHorizonMvp,
     TopCameraReader,
+    build_safe_arm_target,
     main,
 )
 from tools.test_hybrid_action_replay import HybridHandExecutor
@@ -73,6 +78,61 @@ class FakePolicy:
         output[0, 0, :26] = state[0]
         output[0, 0, 26:] = [0.1, 0.9]
         return output, 5.0
+
+
+class FakeMvpStateReader:
+    def __init__(self) -> None:
+        self.state = np.zeros((1, 26), dtype=np.float32)
+
+    def snapshot(self):
+        return self.state.copy(), int(1e9)
+
+    def set_hand_position(self, hand, target) -> None:
+        section = slice(14, 20) if hand == "left" else slice(20, 26)
+        self.state[0, section] = np.asarray(target, dtype=np.float32)
+
+    def set_hand_mode(self, hand, mode) -> None:
+        return None
+
+
+class SequencePolicy:
+    def __init__(self, actions) -> None:
+        self.actions = [np.asarray(action, dtype=np.float32) for action in actions]
+        self.index = 0
+
+    def infer(self, image, state):
+        action = self.actions[min(self.index, len(self.actions) - 1)]
+        self.index += 1
+        output = np.zeros((1, 10, 28), dtype=np.float32)
+        output[0, 0] = action
+        return output, 1.0
+
+
+class FakeArmExecutor:
+    def __init__(self, error=None) -> None:
+        self.calls = []
+        self.error = error
+
+    def move_pair(self, left_target, right_target, *, step):
+        self.calls.append((left_target, right_target, step))
+        if self.error is not None:
+            raise self.error
+        return True
+
+
+def fake_hand_executor(calls, name):
+    return HybridHandExecutor(
+        lambda target, blocking: calls.append((name, "clench", target, blocking)) or True,
+        lambda blocking: calls.append((name, "force", blocking)) or True,
+    )
+
+
+def action_with(*, arm=0.0, left_score=0.0, right_score=0.0):
+    action = np.zeros(28, dtype=np.float32)
+    action[:14] = arm
+    action[26] = left_score
+    action[27] = right_score
+    return action
 
 
 class FakeIo:
@@ -151,6 +211,110 @@ class RuntimeTests(unittest.TestCase):
     def test_execute_fails_closed_before_sdk_creation(self) -> None:
         with self.assertRaisesRegex(SystemExit, "EXECUTE_DISABLED_FAIL_CLOSED"):
             main(["--execute"])
+
+    def test_mvp_one_rad_prediction_is_clipped_to_point_one(self) -> None:
+        target = build_safe_arm_target(np.zeros(14), np.ones(14))
+        self.assertAlmostEqual(target.max_raw_delta, 1.0)
+        self.assertLessEqual(target.max_executed_delta, 0.100001)
+        self.assertTrue(np.all(np.abs(target.clipped_target) <= 0.100001))
+
+    def test_mvp_joint_limit_clamp(self) -> None:
+        current = np.zeros(14, dtype=np.float32)
+        current[1] = 0.06
+        predicted = current.copy()
+        predicted[1] = 1.0
+        target = build_safe_arm_target(current, predicted)
+        self.assertAlmostEqual(float(target.clipped_target[1]), float(ARM_JOINT_LIMITS[1, 1]), places=6)
+        self.assertLessEqual(target.max_executed_delta, 0.100001)
+
+    def test_right_mode_completes_zero_one_zero(self) -> None:
+        mode = ConstrainedHandModeState()
+        states = [mode.update(score).mode for score in [0.9, 0.9, 0.9, 0.5, 0.1, 0.1, 0.1]]
+        self.assertEqual(states, [0, 0, 1, 1, 1, 1, 0])
+        self.assertEqual(mode.state, "DONE")
+
+    def test_left_force_is_gated_until_right_done(self) -> None:
+        right = ConstrainedHandModeState()
+        left = ConstrainedHandModeState()
+        for _ in range(3):
+            right.update(0.0)
+            decision = left.update(1.0, enabled=right.state == "DONE")
+            self.assertEqual(decision.mode, 0)
+            self.assertEqual(left.state, "POSITION")
+        for score in [1.0, 1.0, 1.0, 0.0, 0.0, 0.0]:
+            right.update(score)
+            left.update(1.0, enabled=right.state == "DONE")
+        self.assertEqual(right.state, "DONE")
+        self.assertEqual(left.state, "POSITION")
+        left.update(1.0, enabled=True)
+        left.update(1.0, enabled=True)
+        decision = left.update(1.0, enabled=True)
+        self.assertEqual(decision.mode, 1)
+        self.assertEqual(left.state, "FORCE")
+
+    def test_mvp_force_rising_edge_calls_once(self) -> None:
+        calls = []
+        executor = fake_hand_executor(calls, "right")
+        mode = ConstrainedHandModeState()
+        for score in [0.9, 0.9, 0.9, 0.9, 0.9]:
+            decision = mode.update(score)
+            executor.apply([0.0] * 6, decision.mode, blocking=True)
+        self.assertEqual(sum(call[1] == "force" for call in calls), 1)
+
+    def test_mvp_nan_action_fails(self) -> None:
+        calls = []
+        runtime = SerialRecedingHorizonMvp(
+            FakeCamera(FakeClock()), FakeMvpStateReader(),
+            SequencePolicy([action_with(arm=np.nan)]), FakeArmExecutor(),
+            fake_hand_executor(calls, "left"), fake_hand_executor(calls, "right"),
+            max_policy_steps=1, sleep=lambda _: None,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(RuntimeFault, "NaN/Inf"):
+                runtime.run(Path(directory) / "mvp.jsonl")
+
+    def test_mvp_settle_timeout_fails(self) -> None:
+        calls = []
+        runtime = SerialRecedingHorizonMvp(
+            FakeCamera(FakeClock()), FakeMvpStateReader(),
+            SequencePolicy([action_with(arm=0.1)]),
+            FakeArmExecutor(TimeoutError("settle timeout")),
+            fake_hand_executor(calls, "left"), fake_hand_executor(calls, "right"),
+            max_policy_steps=1, sleep=lambda _: None,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(TimeoutError, "settle timeout"):
+                runtime.run(Path(directory) / "mvp.jsonl")
+
+    def test_mvp_max_policy_steps_fails(self) -> None:
+        calls = []
+        runtime = SerialRecedingHorizonMvp(
+            FakeCamera(FakeClock()), FakeMvpStateReader(),
+            SequencePolicy([action_with()]), FakeArmExecutor(),
+            fake_hand_executor(calls, "left"), fake_hand_executor(calls, "right"),
+            max_policy_steps=2, sleep=lambda _: None,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(RuntimeFault, "MAX_POLICY_STEPS_EXCEEDED"):
+                runtime.run(Path(directory) / "mvp.jsonl")
+
+    def test_mvp_finishes_after_five_additional_predictions(self) -> None:
+        calls = []
+        actions = []
+        for step in range(16):
+            right_score = 0.9 if step < 3 else 0.1
+            left_score = 0.9 if 5 <= step < 8 else 0.1
+            actions.append(action_with(left_score=left_score, right_score=right_score))
+        runtime = SerialRecedingHorizonMvp(
+            FakeCamera(FakeClock()), FakeMvpStateReader(), SequencePolicy(actions),
+            FakeArmExecutor(), fake_hand_executor(calls, "left"),
+            fake_hand_executor(calls, "right"), max_policy_steps=20, sleep=lambda _: None,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            report = runtime.run(Path(directory) / "mvp.jsonl")
+        self.assertEqual(report["status"], "DONE")
+        self.assertEqual(report["policy_steps"], 16)
+        self.assertEqual(report["post_done_arm_steps"], 5)
 
 
 if __name__ == "__main__":
