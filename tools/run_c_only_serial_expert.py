@@ -52,8 +52,8 @@ from tools.test_right_release_stability import (  # noqa: E402
 
 # [VERIFIED] Unmodified SDK-order samples from the successful
 # RIGHT_RELEASE_SAFE_HEIGHT trajectory in episode_20260826_144708_105746.
-# Intermediate points are telemetry.npz states[199,201,203,205, 7:14]; the
-# terminal point is expert_states RIGHT_SAFE_RETREAT.move.joint_after.
+# Waypoints are telemetry.npz states[199,201,203,205,206, 7:14]. Sample 206
+# is the last recorded retreat sample strictly inside all SDK move_joints limits.
 RIGHT_RELEASE_SAFE_JOINT_PATH = (
     (
         0.7453176379203796,
@@ -92,13 +92,13 @@ RIGHT_RELEASE_SAFE_JOINT_PATH = (
         -1.533569574356079,
     ),
     (
-        1.2227206244205195,
-        -0.051811932772827037,
-        1.391666589012047,
-        -1.5614329713680626,
-        -2.0018056990128485,
-        0.19112702025328832,
-        -1.595731698495557,
+        1.173583745956421,
+        -0.041921086609363556,
+        1.3612759113311768,
+        -1.5410957336425781,
+        -1.9376506805419922,
+        0.21469242870807648,
+        -1.5670883655548096,
     ),
 )
 
