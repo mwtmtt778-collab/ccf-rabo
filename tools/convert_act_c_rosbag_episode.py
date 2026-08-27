@@ -17,7 +17,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from tools.run_c_only_serial_expert import STATE_TOPICS, TOP_RGB_TOPIC  # noqa: E402
+from tools.run_c_only_serial_expert import TOP_RGB_TOPIC  # noqa: E402
 from tools.test_hybrid_action_replay import (  # noqa: E402
     ACTION_CONTRACT,
     ACTION_DIM,
@@ -40,6 +40,28 @@ def read_events(path: Path) -> list[dict[str, Any]]:
         if line.strip():
             rows.append(json.loads(line))
     return rows
+
+
+def read_arm_states(path: Path) -> tuple[dict[str, list[tuple[int, list[float]]]], np.ndarray]:
+    samples: dict[str, list[tuple[int, list[float]]]] = {"left_arm": [], "right_arm": []}
+    timestamps = []
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        row = json.loads(line)
+        timestamp_ns = int(row["timestamp_monotonic_ns"])
+        left = [float(value) for value in row["left_arm"]]
+        right = [float(value) for value in row["right_arm"]]
+        if len(left) != 7 or len(right) != 7:
+            raise ValueError(f"invalid arm_state.jsonl row {line_number}: expected left7 + right7")
+        samples["left_arm"].append((timestamp_ns, left))
+        samples["right_arm"].append((timestamp_ns, right))
+        timestamps.append(timestamp_ns)
+    return samples, np.asarray(timestamps, dtype=np.int64)
+
+
+def wall_to_monotonic_ns(wall_ns: Sequence[int] | np.ndarray, start_wall_ns: int, start_monotonic_ns: int) -> np.ndarray:
+    return np.asarray(wall_ns, dtype=np.int64) - (int(start_wall_ns) - int(start_monotonic_ns))
 
 
 def timeline_ns(start_ns: int, end_ns: int, hz: float = 5.0) -> np.ndarray:
@@ -88,13 +110,13 @@ def reconstruct_hands(events: list[dict[str, Any]], targets_ns: np.ndarray) -> t
     modes = np.zeros((len(targets_ns), 2), dtype=np.float32)
     command_events = sorted(
         (row for row in events if row.get("event") == "command_start" and row.get("device") in {"LEFT_HAND", "RIGHT_HAND"}),
-        key=lambda row: int(row["timestamp_wall_ns"]),
+        key=lambda row: int(row["timestamp_monotonic_ns"]),
     )
     current_hands = {"LEFT_HAND": np.zeros(6, dtype=np.float32), "RIGHT_HAND": np.zeros(6, dtype=np.float32)}
     current_modes = {"LEFT_HAND": 0.0, "RIGHT_HAND": 0.0}
     event_index = 0
     for target_index, target_ns in enumerate(targets_ns):
-        while event_index < len(command_events) and int(command_events[event_index]["timestamp_wall_ns"]) <= int(target_ns):
+        while event_index < len(command_events) and int(command_events[event_index]["timestamp_monotonic_ns"]) <= int(target_ns):
             row = command_events[event_index]
             device = str(row["device"])
             target = row.get("target")
@@ -138,10 +160,10 @@ def build_aligned_episode(
     return {
         "states": states,
         "state_timestamps": (targets - start_ns).astype(np.float64) / 1e9,
-        "state_wall_ns": targets,
+        "state_monotonic_ns": targets,
         "grasp_modes_at_state": modes,
         "hybrid_actions": actions,
-        "camera_timestamps_wall_ns": camera_stamps,
+        "camera_timestamps_monotonic_ns": camera_stamps,
         "camera_frame_index_for_state": camera_indices,
         "camera_delta_s": camera_delta_ns.astype(np.float64) / 1e9,
         "camera_age_s": np.abs(camera_delta_ns.astype(np.float64)) / 1e9,
@@ -163,7 +185,7 @@ def image_to_ppm(msg: Any) -> bytes:
     return f"P6\n{width} {height}\n255\n".encode("ascii") + rows.tobytes()
 
 
-def read_rosbag(bag_path: Path) -> tuple[list[tuple[int, Any]], dict[str, list[tuple[int, list[float]]]]]:
+def read_rosbag(bag_path: Path) -> list[tuple[int, Any]]:
     try:
         import rosbag2_py
         from rclpy.serialization import deserialize_message
@@ -177,27 +199,11 @@ def read_rosbag(bag_path: Path) -> tuple[list[tuple[int, Any]], dict[str, list[t
     topic_types = {row.name: row.type for row in reader.get_all_topics_and_types()}
     message_classes = {name: get_message(type_name) for name, type_name in topic_types.items()}
     camera: list[tuple[int, Any]] = []
-    arm_samples: dict[str, list[tuple[int, list[float]]]] = {"left_arm": [], "right_arm": []}
-    topic_lookup = {
-        topic: (arm, index)
-        for arm in ("left_arm", "right_arm")
-        for index, topic in enumerate(STATE_TOPICS[arm])
-    }
-    latest = {"left_arm": {}, "right_arm": {}}
     while reader.has_next():
         topic, raw, timestamp_ns = reader.read_next()
         if topic == TOP_RGB_TOPIC:
             camera.append((int(timestamp_ns), deserialize_message(raw, message_classes[topic])))
-        elif topic in topic_lookup:
-            arm, index = topic_lookup[topic]
-            msg = deserialize_message(raw, message_classes[topic])
-            positions = list(msg.position)
-            if not positions:
-                continue
-            latest[arm][index] = float(positions[0])
-            if len(latest[arm]) == 7:
-                arm_samples[arm].append((int(timestamp_ns), [latest[arm][joint] for joint in range(7)]))
-    return camera, arm_samples
+    return camera
 
 
 def percentile_or_none(values: np.ndarray, percentile: float) -> float | None:
@@ -205,43 +211,70 @@ def percentile_or_none(values: np.ndarray, percentile: float) -> float | None:
     return float(np.percentile(finite, percentile)) if len(finite) else None
 
 
-def quality_report(arrays: dict[str, np.ndarray], camera_ns: np.ndarray, events: list[dict[str, Any]], meta: dict[str, Any]) -> dict[str, Any]:
+def quality_report(
+    arrays: dict[str, np.ndarray],
+    camera_ns: np.ndarray,
+    arm_state_ns: np.ndarray,
+    events: list[dict[str, Any]],
+    meta: dict[str, Any],
+) -> dict[str, Any]:
     duration_s = float(arrays["state_timestamps"][-1]) if len(arrays["state_timestamps"]) else 0.0
     raw_duration_s = (int(camera_ns[-1]) - int(camera_ns[0])) / 1e9 if len(camera_ns) >= 2 else 0.0
     camera_fps = (len(camera_ns) - 1) / raw_duration_s if raw_duration_s > 0 else None
+    arm_duration_s = (int(arm_state_ns[-1]) - int(arm_state_ns[0])) / 1e9 if len(arm_state_ns) >= 2 else 0.0
+    arm_hz = (len(arm_state_ns) - 1) / arm_duration_s if arm_duration_s > 0 else None
     left_coverage = float(np.mean(arrays["left_arm_state_age_s"] >= 0.0)) if len(arrays["states"]) else 0.0
     right_coverage = float(np.mean(arrays["right_arm_state_age_s"] >= 0.0)) if len(arrays["states"]) else 0.0
     finite = bool(np.isfinite(arrays["states"]).all() and np.isfinite(arrays["hybrid_actions"]).all())
     age = arrays["camera_age_s"]
+    arm_age = np.maximum(arrays["left_arm_state_age_s"], arrays["right_arm_state_age_s"])
     camera_p95 = percentile_or_none(age, 95)
+    arm_p95 = percentile_or_none(arm_age[arm_age >= 0.0], 95)
     checks = {
         "expert_pass": meta.get("expert_status") == "PASS",
         "state26": arrays["states"].ndim == 2 and arrays["states"].shape[1] == STATE_DIM,
         "hybrid28": arrays["hybrid_actions"].shape == (max(0, len(arrays["states"]) - 1), ACTION_DIM),
         "finite_state_and_action": finite,
         "camera_present": len(camera_ns) > 0,
+        "camera_raw_fps_gte_5": camera_fps is not None and camera_fps >= 5.0,
         "camera_p95_age_lte_0_2s": camera_p95 is not None and camera_p95 <= 0.2,
         "left_arm_full_coverage": left_coverage == 1.0,
         "right_arm_full_coverage": right_coverage == 1.0,
+        "arm_p95_age_lte_0_1s": arm_p95 is not None and arm_p95 <= 0.1,
     }
     accepted = all(checks.values())
     return {
         "raw_camera_frame_count": int(len(camera_ns)),
         "raw_camera_effective_fps": camera_fps,
+        "camera_raw_count": int(len(camera_ns)),
+        "camera_raw_fps": camera_fps,
+        "arm_state_count": int(len(arm_state_ns)),
+        "arm_state_effective_hz": arm_hz,
+        "arm_state_source": "passive_arm_state_jsonl",
         "act_timeline_length": int(len(arrays["states"])),
         "duration_s": duration_s,
-        "camera_age_s": {
-            "median": percentile_or_none(age, 50),
-            "p95": percentile_or_none(age, 95),
-            "max": float(np.max(age)) if len(age) else None,
-        },
+        "camera_age_median_ms": None if percentile_or_none(age, 50) is None else 1000.0 * float(percentile_or_none(age, 50)),
+        "camera_age_p95_ms": None if camera_p95 is None else 1000.0 * camera_p95,
+        "camera_age_max_ms": 1000.0 * float(np.max(age)) if len(age) else None,
+        "arm_age_median_ms": None if percentile_or_none(arm_age[arm_age >= 0.0], 50) is None else 1000.0 * float(percentile_or_none(arm_age[arm_age >= 0.0], 50)),
+        "arm_age_p95_ms": None if arm_p95 is None else 1000.0 * arm_p95,
+        "arm_age_max_ms": 1000.0 * float(np.max(arm_age[arm_age >= 0.0])) if np.any(arm_age >= 0.0) else None,
+        "arm_left_coverage": left_coverage,
+        "arm_right_coverage": right_coverage,
         "left_arm_state_coverage": left_coverage,
         "right_arm_state_coverage": right_coverage,
+        "camera_age_s": {
+            "median": percentile_or_none(age, 50),
+            "p95": camera_p95,
+            "max": float(np.max(age)) if len(age) else None,
+        },
         "hand_state_source": "command_hold_last",
+        "raw_arm_topics_recorded": bool(meta.get("raw_arm_topics_recorded", False)),
         "raw_hand_topics_recorded": bool(meta.get("raw_hand_topics_recorded", False)),
         "action_event_count": len(events),
         "expert_status": meta.get("expert_status"),
         "checks": checks,
+        "accepted": accepted,
         "accepted_for_training": accepted,
     }
 
@@ -260,17 +293,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     output.mkdir(parents=True, exist_ok=True)
     meta = read_json(episode / "episode_meta.json")
     events = read_events(episode / meta.get("action_events_path", "action_events.jsonl"))
-    camera, arm_samples = read_rosbag(episode / meta.get("bag_path", "bag"))
+    camera = read_rosbag(episode / meta.get("bag_path", "bag"))
+    arm_samples, arm_state_ns = read_arm_states(episode / meta.get("arm_state_path", "arm_state.jsonl"))
     command_starts = [row for row in events if row.get("event") == "command_start"]
     terminal = [row for row in events if row.get("event") == "expert_status"]
-    start_ns = int(command_starts[0]["timestamp_wall_ns"]) if command_starts else int(meta["start_wall_ns"])
-    end_ns = int(terminal[-1]["timestamp_wall_ns"]) if terminal else int(meta["end_wall_ns"])
-    camera_ns = np.asarray([row[0] for row in camera], dtype=np.int64)
+    start_ns = int(command_starts[0]["timestamp_monotonic_ns"]) if command_starts else int(meta["start_monotonic_ns"])
+    end_ns = int(terminal[-1]["timestamp_monotonic_ns"]) if terminal else int(meta["end_monotonic_ns"])
+    camera_wall_ns = np.asarray([row[0] for row in camera], dtype=np.int64)
+    camera_ns = wall_to_monotonic_ns(camera_wall_ns, int(meta["start_wall_ns"]), int(meta["start_monotonic_ns"]))
     arrays = build_aligned_episode(camera_ns, arm_samples, events, start_ns=start_ns, end_ns=end_ns)
-    monotonic_offset_ns = int(meta["start_monotonic_ns"]) - int(meta["start_wall_ns"])
-    arrays["state_monotonic_ns"] = arrays["state_wall_ns"] + monotonic_offset_ns
+    wall_minus_monotonic_ns = int(meta["start_wall_ns"]) - int(meta["start_monotonic_ns"])
+    arrays["state_wall_ns"] = arrays["state_monotonic_ns"] + wall_minus_monotonic_ns
     arrays["state_monotonic_timestamps"] = arrays["state_monotonic_ns"].astype(np.float64) / 1e9
-    arrays["camera_monotonic_ns"] = camera_ns + monotonic_offset_ns
+    arrays["camera_timestamps_wall_ns"] = camera_wall_ns
+    arrays["camera_monotonic_ns"] = camera_ns
     arrays["camera_timestamps"] = (camera_ns - start_ns).astype(np.float64) / 1e9
     arrays["camera_ros_timestamps"] = np.full(len(camera_ns), np.nan, dtype=np.float64)
     arrays["state_read_durations"] = np.zeros(len(arrays["states"]), dtype=np.float64)
@@ -288,16 +324,18 @@ def main(argv: Sequence[str] | None = None) -> int:
         {
             "target_timestep_wall_ns": int(target),
             "image_index": int(index),
-            "image_timestamp_wall_ns": int(camera_ns[index]) if index >= 0 else None,
+            "target_timestep_monotonic_ns": int(target_monotonic),
+            "image_timestamp_monotonic_ns": int(camera_ns[index]) if index >= 0 else None,
+            "image_timestamp_wall_ns": int(camera_wall_ns[index]) if index >= 0 else None,
             "delta_s": float(delta),
             "abs_age_s": float(age),
         }
-        for target, index, delta, age in zip(
-            arrays["state_wall_ns"], arrays["camera_frame_index_for_state"], arrays["camera_delta_s"], arrays["camera_age_s"]
+        for target, target_monotonic, index, delta, age in zip(
+            arrays["state_wall_ns"], arrays["state_monotonic_ns"], arrays["camera_frame_index_for_state"], arrays["camera_delta_s"], arrays["camera_age_s"]
         )
     ]
     write_json(output / "camera_alignment.json", alignment)
-    quality = quality_report(arrays, camera_ns, events, meta)
+    quality = quality_report(arrays, camera_ns, arm_state_ns, events, meta)
     write_json(output / "quality_report.json", quality)
     output_meta = {
         "format": "rabo_act_v1_single_episode",
@@ -315,16 +353,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             "grasp_modes_at_state": ["N", 2],
             "hybrid_actions": ["N-1", 28],
             "camera_timestamps_wall_ns": ["F"],
+            "camera_timestamps_monotonic_ns": ["F"],
+            "camera_monotonic_ns": ["F"],
             "camera_frame_paths": ["F"],
             "camera_frame_index_for_state": ["N"],
             "camera_delta_s": ["N"],
             "camera_age_s": ["N"],
         },
-        "camera": {"name": "top", "topic": TOP_RGB_TOPIC, "alignment": "NEAREST_FRAME_OFFLINE"},
-        "arm_alignment": "LATEST_CAUSAL_PASSIVE_ROS",
-        "arm_topic_order": "fixed suffix order from raw episode state_topics",
+        "camera": {"name": "top", "topic": TOP_RGB_TOPIC, "recording": "rosbag_top_only", "alignment": "NEAREST_FRAME_OFFLINE"},
+        "arm_alignment": "LATEST_CAUSAL_PASSIVE_ARM_STATE_JSONL",
+        "arm_state_source": "passive_arm_state_jsonl",
+        "arm_state_joint_order": "SDK_J1_TO_J7",
+        "raw_arm_topics_recorded": False,
         "hand_state_source": "command_hold_last",
-        "raw_hand_topics_recorded": bool(meta.get("raw_hand_topics_recorded", False)),
+        "raw_hand_topics_recorded": False,
         "hand_state_note": "left/right hand6 are reconstructed exclusively from action_events command hold-last",
         "source_raw_episode": str(episode),
         "expert_status": meta.get("expert_status"),

@@ -109,6 +109,10 @@ ARM_TOPIC_SUFFIXES = (
     "08fa69bc43", "1pa9vnh1mr", "2m4fzrdssg", "4jjp9rlwus",
     "rsqed0qcrb", "y1vmospyub", "y8sm0inqbu",
 )
+# Both A7 arms use the same role-specific suffix mapping in the current runtime
+# interface map. Passive order is [J1,J5,J4,J7,J3,J2,J6]; this index tuple
+# converts it to the SDK move_joints order [J1..J7].
+PASSIVE_TO_SDK_INDICES = (0, 5, 4, 2, 1, 6, 3)
 HAND_TOPIC_SUFFIXES = (
     "1ff4n99g6p", "26hns2y9iz", "3id78faqov", "c344tguind",
     "f1re3fuf56", "gww3yfamdt", "k3y7rwcnkq", "kfl2g3asap",
@@ -181,7 +185,13 @@ class ArmObservation:
 class PassiveArmState:
     """Background ROS cache; its only thread receives passive state."""
 
-    def __init__(self, history_hz: float = 5.0) -> None:
+    def __init__(
+        self,
+        history_hz: float = 5.0,
+        *,
+        arm_state_log: Path | None = None,
+        arm_state_log_hz: float = 20.0,
+    ) -> None:
         try:
             import rclpy
             from rclpy.executors import SingleThreadedExecutor
@@ -202,6 +212,19 @@ class PassiveArmState:
         self.sequences = {"left_arm": 0, "right_arm": 0}
         self.last_history_ns = {"left_arm": 0, "right_arm": 0}
         self.history_period_ns = int(round(1e9 / history_hz))
+        self.arm_state_log_path = arm_state_log
+        self.arm_state_log_target_hz = float(arm_state_log_hz)
+        self.arm_state_log_period_ns = int(round(1e9 / arm_state_log_hz))
+        self.arm_state_log_last_ns = 0
+        self.arm_state_log_count = 0
+        self.arm_state_log_error: str | None = None
+        self.arm_state_log_stream = None
+        if arm_state_log is not None:
+            try:
+                arm_state_log.parent.mkdir(parents=True, exist_ok=True)
+                self.arm_state_log_stream = arm_state_log.open("a", encoding="utf-8", buffering=8192)
+            except BaseException as exc:
+                self._record_logger_error(exc)
         self.lock = threading.Lock()
         self.condition = threading.Condition(self.lock)
         self.stop_event = threading.Event()
@@ -228,6 +251,7 @@ class PassiveArmState:
         positions = list(getattr(msg, "position", []))
         if positions:
             now_ns = time.monotonic_ns()
+            snapshot = None
             with self.condition:
                 self.latest[arm][index] = float(positions[0])
                 if len(self.latest[arm]) == 7 and now_ns - self.last_history_ns[arm] >= self.history_period_ns:
@@ -240,6 +264,55 @@ class PassiveArmState:
                     self.history[arm].append(observation)
                     self.last_history_ns[arm] = now_ns
                     self.condition.notify_all()
+                if (
+                    self.arm_state_log_stream is not None
+                    and all(len(self.latest[name]) == 7 for name in ("left_arm", "right_arm"))
+                    and now_ns - self.arm_state_log_last_ns >= self.arm_state_log_period_ns
+                ):
+                    self.arm_state_log_last_ns = now_ns
+                    snapshot = {
+                        "timestamp_monotonic_ns": now_ns,
+                        "timestamp_wall_ns": time.time_ns(),
+                        "left_arm": self._sdk_order(self.latest["left_arm"]),
+                        "right_arm": self._sdk_order(self.latest["right_arm"]),
+                    }
+            if snapshot is not None:
+                self._write_arm_state(snapshot)
+
+    @staticmethod
+    def _sdk_order(values: dict[int, float]) -> list[float]:
+        passive = [float(values[index]) for index in range(7)]
+        return [passive[index] for index in PASSIVE_TO_SDK_INDICES]
+
+    def _write_arm_state(self, snapshot: dict[str, Any]) -> None:
+        try:
+            assert self.arm_state_log_stream is not None
+            self.arm_state_log_stream.write(json.dumps(snapshot, ensure_ascii=False) + "\n")
+            self.arm_state_log_count += 1
+        except BaseException as exc:
+            self._record_logger_error(exc)
+            self.arm_state_log_stream = None
+
+    def _record_logger_error(self, exc: BaseException) -> None:
+        if self.arm_state_log_error is None:
+            self.arm_state_log_error = repr(exc)
+            print(f"[ARM_STATE_LOGGER_WARNING] {self.arm_state_log_error}", file=sys.stderr, flush=True)
+
+    def logger_status(self) -> dict[str, Any]:
+        if self.arm_state_log_path is None:
+            status = "DISABLED"
+        elif self.arm_state_log_error is not None:
+            status = "WARNING"
+        else:
+            status = "PASS"
+        return {
+            "status": status,
+            "path": str(self.arm_state_log_path) if self.arm_state_log_path is not None else None,
+            "sample_count": self.arm_state_log_count,
+            "error": self.arm_state_log_error,
+            "target_hz": self.arm_state_log_target_hz,
+            "joint_order": "SDK_J1_TO_J7",
+        }
 
     def spin(self, seconds: float) -> None:
         self.stop_event.wait(seconds)
@@ -274,13 +347,22 @@ class PassiveArmState:
                 self.condition.wait(timeout=timeout_s)
 
     def close(self) -> None:
-        self.stop_event.set()
-        self.thread.join(timeout=2.0)
-        self.executor.remove_node(self.node)
-        self.executor.shutdown(timeout_sec=1.0)
-        self.node.destroy_node()
-        if self.rclpy.ok():
-            self.rclpy.shutdown()
+        try:
+            self.stop_event.set()
+            self.thread.join(timeout=2.0)
+            self.executor.remove_node(self.node)
+            self.executor.shutdown(timeout_sec=1.0)
+            self.node.destroy_node()
+            if self.rclpy.ok():
+                self.rclpy.shutdown()
+        finally:
+            if self.arm_state_log_stream is not None:
+                try:
+                    self.arm_state_log_stream.close()
+                except BaseException as exc:
+                    self._record_logger_error(exc)
+                finally:
+                    self.arm_state_log_stream = None
 
 
 class SerialExpert:
@@ -569,6 +651,7 @@ class SerialExpert:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the strict serial Nut C Expert and write action_events.jsonl.")
     parser.add_argument("--action-events", type=Path, required=True, help="JSONL output path")
+    parser.add_argument("--arm-state-log", type=Path, help="optional passive arm14 JSONL output path")
     parser.add_argument("--observe-hz", type=float, default=5.0)
     parser.add_argument("--start-threshold-rad", type=float, default=0.003)
     parser.add_argument("--settle-threshold-rad", type=float, default=0.002)
@@ -588,7 +671,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     events = EventWriter(args.action_events.resolve())
     passive = right = left = None
     try:
-        passive = PassiveArmState(args.observe_hz)
+        passive = PassiveArmState(
+            args.observe_hz,
+            arm_state_log=args.arm_state_log.resolve() if args.arm_state_log is not None else None,
+        )
         passive.wait_ready(args.passive_start_timeout_s)
         from tools.test_right_release_stability import make_right_bundle
         from tools.test_dual_closed_loop_v2 import make_left_bundle
@@ -612,6 +698,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         if passive is not None:
             with contextlib.suppress(Exception):
                 passive.close()
+            with contextlib.suppress(Exception):
+                events.write(
+                    "ARM_STATE_LOGGER", "PASSIVE_ARM_STATE", "logger_status", None,
+                    passive.logger_status(), event="logger_status",
+                )
         events.close()
 
 

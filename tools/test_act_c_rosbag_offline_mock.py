@@ -3,17 +3,33 @@
 
 from __future__ import annotations
 
+import io
+import json
+import tempfile
 import unittest
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
 
 from tools.collect_act_c_rosbag import ROSBAG_TOPICS
-from tools.convert_act_c_rosbag_episode import build_aligned_episode, quality_report
-from tools.run_c_only_serial_expert import ArmObservation, SerialExpert, STATE_TOPICS, TOP_RGB_TOPIC
+from tools.convert_act_c_rosbag_episode import (
+    build_aligned_episode,
+    quality_report,
+    read_arm_states,
+    wall_to_monotonic_ns,
+)
+from tools.run_c_only_serial_expert import (
+    ArmObservation,
+    PASSIVE_TO_SDK_INDICES,
+    PassiveArmState,
+    SerialExpert,
+    STATE_TOPICS,
+    TOP_RGB_TOPIC,
+)
 from tools import test_nut_camera_calibration as camera_calibration
 
 
@@ -127,8 +143,11 @@ class FakeSingleThreadedExecutor:
 
 class ActCRosbagOfflineMockTest(unittest.TestCase):
     def test_passive_and_pointcloud_executors_coexist(self) -> None:
-        import rclpy
-        import rclpy.executors
+        try:
+            import rclpy
+            import rclpy.executors
+        except ImportError as exc:
+            self.skipTest(f"rclpy unavailable: {exc}")
 
         FakeSingleThreadedExecutor.instances = []
         nodes = []
@@ -147,8 +166,6 @@ class ActCRosbagOfflineMockTest(unittest.TestCase):
             mock.patch.object(camera_calibration, "SETTLE_SECONDS", 0.01),
             mock.patch.object(camera_calibration, "POINT_TIMEOUT_SECONDS", 0.1),
         ):
-            from tools.run_c_only_serial_expert import PassiveArmState
-
             passive = PassiveArmState(history_hz=500.0)
             try:
                 passive.wait_ready(0.5)
@@ -214,53 +231,59 @@ class ActCRosbagOfflineMockTest(unittest.TestCase):
         self.assertTrue(settled["already_settled"])
         self.assertLess(elapsed, 0.8)
 
-    def test_15_topic_bag_without_raw_hands_aligns_state26_and_hybrid28(self) -> None:
+    def test_top_only_bag_with_arm_jsonl_aligns_state26_and_hybrid28(self) -> None:
         second = 1_000_000_000
-        start = 1_800_000_000_000_000_000
-        end = start + 2 * second
-        camera = [start - 100_000_000 + index * (second // 12) for index in range(27)]
-        arm_samples = {
-            "left_arm": [
-                (start - 50_000_000 + index * 50_000_000, [index * 0.01 + joint for joint in range(7)])
-                for index in range(42)
-            ],
-            "right_arm": [
-                (start - 50_000_000 + index * 50_000_000, [-index * 0.01 - joint for joint in range(7)])
-                for index in range(42)
-            ],
-        }
+        start_mono = 5_000_000_000
+        start_wall = 1_800_000_000_000_000_000
+        end_mono = start_mono + 2 * second
+        camera_wall = [start_wall - 100_000_000 + index * (second // 12) for index in range(27)]
+        camera = wall_to_monotonic_ns(camera_wall, start_wall, start_mono)
+        self.assertEqual(int(camera[0]), start_mono - 100_000_000)
+        arm_rows = [
+            {
+                "timestamp_monotonic_ns": start_mono - 25_000_000 + index * 50_000_000,
+                "timestamp_wall_ns": start_wall - 25_000_000 + index * 50_000_000,
+                "left_arm": [index * 0.01 + joint for joint in range(7)],
+                "right_arm": [-index * 0.01 - joint for joint in range(7)],
+            }
+            for index in range(42)
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            arm_path = Path(temporary) / "arm_state.jsonl"
+            arm_path.write_text("".join(json.dumps(row) + "\n" for row in arm_rows), encoding="utf-8")
+            arm_samples, arm_state_ns = read_arm_states(arm_path)
         right_thumb = [0.0, 1.0, 0.0, 0.0, 0.0, 0.0]
         events = [
             {
-                "event": "command_start", "timestamp_wall_ns": start + 300_000_000,
+                "event": "command_start", "timestamp_monotonic_ns": start_mono + 300_000_000,
                 "device": "RIGHT_HAND", "command": "clench",
                 "target": {"thumb_rotation": 1.0, "clench6_after": right_thumb},
             },
             {
-                "event": "command_start", "timestamp_wall_ns": start + 500_000_000,
+                "event": "command_start", "timestamp_monotonic_ns": start_mono + 500_000_000,
                 "device": "RIGHT_HAND", "command": "grasp_force",
                 "target": {"strength": 1.0, "fingers": [1, 3, 4], "clench6_after": None, "grasp_mode_after": 1},
             },
             {
-                "event": "command_start", "timestamp_wall_ns": start + 1_300_000_000,
+                "event": "command_start", "timestamp_monotonic_ns": start_mono + 1_300_000_000,
                 "device": "RIGHT_HAND", "command": "clench",
                 "target": {"value": [0.0] * 6, "clench6_after": [0.0] * 6, "grasp_mode_after": 0},
             },
         ]
 
-        arrays = build_aligned_episode(camera, arm_samples, events, start_ns=start, end_ns=end)
+        arrays = build_aligned_episode(camera, arm_samples, events, start_ns=start_mono, end_ns=end_mono)
         quality = quality_report(
             arrays,
             np.asarray(camera, dtype=np.int64),
+            arm_state_ns,
             events,
-            {"expert_status": "PASS", "raw_hand_topics_recorded": False},
+            {"expert_status": "PASS", "raw_arm_topics_recorded": False, "raw_hand_topics_recorded": False},
         )
 
-        self.assertEqual(
-            ROSBAG_TOPICS,
-            (TOP_RGB_TOPIC, *STATE_TOPICS["left_arm"], *STATE_TOPICS["right_arm"]),
-        )
-        self.assertEqual(len(ROSBAG_TOPICS), 15)
+        self.assertEqual(ROSBAG_TOPICS, (TOP_RGB_TOPIC,))
+        self.assertEqual(len(ROSBAG_TOPICS), 1)
+        self.assertTrue(set(ROSBAG_TOPICS).isdisjoint(STATE_TOPICS["left_arm"]))
+        self.assertTrue(set(ROSBAG_TOPICS).isdisjoint(STATE_TOPICS["right_arm"]))
         self.assertTrue(set(ROSBAG_TOPICS).isdisjoint(STATE_TOPICS["left_hand"]))
         self.assertTrue(set(ROSBAG_TOPICS).isdisjoint(STATE_TOPICS["right_hand"]))
         self.assertEqual(arrays["states"].shape, (11, 26))
@@ -268,12 +291,81 @@ class ActCRosbagOfflineMockTest(unittest.TestCase):
         np.testing.assert_array_equal(arrays["hybrid_actions"][:, :26], arrays["states"][1:])
         np.testing.assert_array_equal(arrays["hybrid_actions"][:, 26:28], arrays["grasp_modes_at_state"][1:])
         np.testing.assert_allclose(np.diff(arrays["state_timestamps"]), 0.2)
+        np.testing.assert_allclose(arrays["states"][0, :7], arm_rows[0]["left_arm"])
+        np.testing.assert_allclose(arrays["states"][0, 7:14], arm_rows[0]["right_arm"])
+        np.testing.assert_allclose(arrays["states"][1, :7], arm_rows[4]["left_arm"])
         self.assertLessEqual(float(np.max(arrays["camera_age_s"])), 1.0 / 24.0 + 1e-6)
         self.assertTrue(np.isfinite(arrays["states"]).all())
         self.assertTrue(np.any(arrays["states"][:, 21] == 1.0))
         self.assertTrue(np.any(arrays["grasp_modes_at_state"][:, 1] == 1.0))
+        self.assertEqual(quality["camera_raw_count"], 27)
+        self.assertAlmostEqual(quality["camera_raw_fps"], 12.0, places=5)
+        self.assertEqual(quality["arm_state_count"], 42)
+        self.assertAlmostEqual(quality["arm_state_effective_hz"], 20.0)
+        self.assertEqual(quality["arm_state_source"], "passive_arm_state_jsonl")
+        self.assertLessEqual(quality["arm_age_max_ms"], 50.0)
         self.assertEqual(quality["hand_state_source"], "command_hold_last")
+        self.assertFalse(quality["raw_arm_topics_recorded"])
         self.assertFalse(quality["raw_hand_topics_recorded"])
+        self.assertTrue(quality["accepted"])
+
+    def test_passive_arm_logger_decimates_and_writes_sdk_order(self) -> None:
+        passive = PassiveArmState.__new__(PassiveArmState)
+        passive.latest = {"left_arm": {}, "right_arm": {}}
+        passive.history = {"left_arm": [], "right_arm": []}
+        passive.sequences = {"left_arm": 0, "right_arm": 0}
+        passive.last_history_ns = {"left_arm": 0, "right_arm": 0}
+        passive.history_period_ns = 200_000_000
+        passive.arm_state_log_path = Path("mock_arm_state.jsonl")
+        passive.arm_state_log_period_ns = 50_000_000
+        passive.arm_state_log_last_ns = 0
+        passive.arm_state_log_count = 0
+        passive.arm_state_log_error = None
+        passive.arm_state_log_stream = io.StringIO()
+        passive.lock = threading.Lock()
+        passive.condition = threading.Condition(passive.lock)
+        clock = {"mono": 1_000_000_000, "wall": 1_800_000_000_000_000_000}
+
+        def publish_all(offset: float) -> None:
+            for arm in ("left_arm", "right_arm"):
+                for index in range(7):
+                    passive._callback(arm, index, SimpleNamespace(position=[offset + index]))
+
+        with (
+            mock.patch("tools.run_c_only_serial_expert.time.monotonic_ns", side_effect=lambda: clock["mono"]),
+            mock.patch("tools.run_c_only_serial_expert.time.time_ns", side_effect=lambda: clock["wall"]),
+        ):
+            publish_all(0.0)
+            clock["mono"] += 25_000_000
+            clock["wall"] += 25_000_000
+            publish_all(10.0)
+            self.assertEqual(passive.arm_state_log_count, 1)
+            clock["mono"] += 25_000_000
+            clock["wall"] += 25_000_000
+            with passive.condition:
+                passive.latest = {
+                    arm: {index: 20.0 + index for index in range(7)}
+                    for arm in ("left_arm", "right_arm")
+                }
+            passive._callback("left_arm", 0, SimpleNamespace(position=[20.0]))
+
+        rows = [json.loads(line) for line in passive.arm_state_log_stream.getvalue().splitlines()]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[1]["timestamp_monotonic_ns"] - rows[0]["timestamp_monotonic_ns"], 50_000_000)
+        expected = [20.0 + index for index in PASSIVE_TO_SDK_INDICES]
+        self.assertEqual(rows[1]["left_arm"], expected)
+        self.assertEqual(rows[1]["right_arm"], expected)
+
+        class BrokenStream:
+            def write(self, _value):
+                raise OSError("mock disk failure")
+
+        passive.arm_state_log_stream = BrokenStream()
+        clock["mono"] += 50_000_000
+        with mock.patch("tools.run_c_only_serial_expert.time.monotonic_ns", return_value=clock["mono"]):
+            passive._callback("left_arm", 0, SimpleNamespace(position=[99.0]))
+        self.assertEqual(passive.latest["left_arm"][0], 99.0)
+        self.assertIsNotNone(passive.arm_state_log_error)
 
 
 if __name__ == "__main__":

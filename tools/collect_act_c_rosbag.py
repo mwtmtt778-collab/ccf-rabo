@@ -23,11 +23,7 @@ from tools.run_c_only_serial_expert import STATE_TOPICS, TOP_RGB_TOPIC  # noqa: 
 
 
 DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "data" / "act_rosbag_raw"
-ROSBAG_TOPICS = (
-    TOP_RGB_TOPIC,
-    *STATE_TOPICS["left_arm"],
-    *STATE_TOPICS["right_arm"],
-)
+ROSBAG_TOPICS = (TOP_RGB_TOPIC,)
 
 
 def write_json(path: Path, value: Any) -> None:
@@ -42,8 +38,21 @@ def new_episode_dir(root: Path) -> tuple[str, Path]:
     return episode_id, path
 
 
+def read_logger_status(path: Path) -> dict[str, Any] | None:
+    try:
+        rows = (
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        )
+        statuses = [row.get("result") for row in rows if row.get("event") == "logger_status"]
+        return statuses[-1] if statuses and isinstance(statuses[-1], dict) else None
+    except BaseException:
+        return None
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Record TOP RGB + passive state and run the serial Nut C Expert.")
+    parser = argparse.ArgumentParser(description="Record TOP RGB only and run the serial Nut C Expert with passive arm JSONL logging.")
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--recorder-start-wait-s", type=float, default=2.0)
     parser.add_argument("--post-expert-record-s", type=float, default=1.5)
@@ -56,9 +65,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     episode_id, episode_dir = new_episode_dir(args.output_root.resolve())
     bag_path = episode_dir / "bag"
+    arm_state_path = episode_dir / "arm_state.jsonl"
     action_events = episode_dir / "action_events.jsonl"
     expert_log_path = episode_dir / "expert.log"
     action_events.touch()
+    arm_state_path.touch()
     expert_log_path.touch()
     start_wall_ns = time.time_ns()
     start_monotonic_ns = time.monotonic_ns()
@@ -70,6 +81,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         str(PROJECT_ROOT / "tools" / "run_c_only_serial_expert.py"),
         "--action-events",
         str(action_events),
+        "--arm-state-log",
+        str(arm_state_path),
         *args.expert_arg,
     ]
     recorder: subprocess.Popen[Any] | None = None
@@ -109,6 +122,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     end_wall_ns = time.time_ns()
     end_monotonic_ns = time.monotonic_ns()
     expert_status = "PASS" if expert_returncode == 0 and failure_reason is None else "FAULT"
+    logger_status = read_logger_status(action_events)
     metadata = {
         "format": "rabo_act_c_rosbag_raw_v1",
         "episode_id": episode_id,
@@ -122,18 +136,26 @@ def main(argv: Sequence[str] | None = None) -> int:
         "failure_reason": failure_reason,
         "bag_path": "bag",
         "bag_storage": "mcap",
+        "rosbag_topic_count": len(topics),
+        "rosbag_topics": topics,
         "rosbag_returncode": recorder_returncode,
+        "camera_recording": "rosbag_top_only",
         "camera": {
             "name": "top",
             "topic": TOP_RGB_TOPIC,
-            "expected_raw_rate_hz": 10.78,
-            "expected_rate_basis": "measured TOP + arm14 rosbag result: 319 messages / 29.583295496 s",
+            "expected_raw_rate_hz": 12.32,
+            "expected_rate_basis": "measured TOP-only rosbag result: 739 messages / 59.973 s",
         },
-        "state_topics": {name: STATE_TOPICS[name] for name in ("left_arm", "right_arm")},
-        "state_message_type": "sensor_msgs/msg/JointState",
-        "arm_state_topic_order": "fixed suffix order from current runtime interface mapping",
-        "hand_state_source": "command_hold_last",
+        "raw_arm_topics_recorded": False,
         "raw_hand_topics_recorded": False,
+        "arm_state_source": "passive_arm_state_jsonl",
+        "arm_state_path": "arm_state.jsonl",
+        "arm_state_joint_order": "SDK_J1_TO_J7",
+        "arm_state_target_hz": 20.0,
+        "arm_state_logger_status": logger_status,
+        "passive_arm_state_topics": {name: STATE_TOPICS[name] for name in ("left_arm", "right_arm")},
+        "passive_arm_state_message_type": "sensor_msgs/msg/JointState",
+        "hand_state_source": "command_hold_last",
         "action_events_path": "action_events.jsonl",
         "expert_log_path": "expert.log",
         "recorder_start_wait_s": args.recorder_start_wait_s,
