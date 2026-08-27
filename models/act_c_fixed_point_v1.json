@@ -1,0 +1,54 @@
+{
+  "format": "act_c_fixed_point_v1_onnx",
+  "checkpoint": "/home/liyi/ccf_act_baseline/outputs/act_c_fixed_point_5ep_v1/checkpoint_3000.pt",
+  "onnx": "/home/liyi/ccf_act_baseline/outputs/act_c_fixed_point_5ep_v1/onnx/act_c_fixed_point_v1.onnx",
+  "opset": 17,
+  "strict_load": "<All keys matched successfully>",
+  "camera_count": 1,
+  "state_dim": 26,
+  "action_dim": 28,
+  "chunk_size": 10,
+  "inputs": {
+    "top_image": {
+      "shape": [
+        1,
+        3,
+        128,
+        128
+      ],
+      "dtype": "tensor(float)"
+    },
+    "state": {
+      "shape": [
+        1,
+        26
+      ],
+      "dtype": "tensor(float)"
+    }
+  },
+  "outputs": {
+    "action_chunk": {
+      "shape": [
+        1,
+        10,
+        28
+      ],
+      "dtype": "tensor(float)"
+    }
+  },
+  "preprocessing": {
+    "outside_onnx": [
+      "decode TOP image",
+      "BGR-to-RGB",
+      "resize to 128x128",
+      "convert to NCHW float32 RGB in [0,1]",
+      "construct raw state26 in training order"
+    ],
+    "inside_onnx": [
+      "ImageNet image mean/std normalization",
+      "global training state26 mean/std normalization",
+      "global training Hybrid28 output denormalization"
+    ]
+  },
+  "action_contract": "Hybrid28: next state26 target followed by left/right grasp mode"
+}
