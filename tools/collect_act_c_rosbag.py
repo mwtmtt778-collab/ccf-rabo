@@ -23,6 +23,11 @@ from tools.run_c_only_serial_expert import STATE_TOPICS, TOP_RGB_TOPIC  # noqa: 
 
 
 DEFAULT_OUTPUT_ROOT = PROJECT_ROOT / "data" / "act_rosbag_raw"
+ROSBAG_TOPICS = (
+    TOP_RGB_TOPIC,
+    *STATE_TOPICS["left_arm"],
+    *STATE_TOPICS["right_arm"],
+)
 
 
 def write_json(path: Path, value: Any) -> None:
@@ -57,9 +62,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     expert_log_path.touch()
     start_wall_ns = time.time_ns()
     start_monotonic_ns = time.monotonic_ns()
-    topics = [TOP_RGB_TOPIC]
-    for name in ("left_arm", "right_arm", "left_hand", "right_hand"):
-        topics.extend(STATE_TOPICS[name])
+    topics = list(ROSBAG_TOPICS)
     rosbag_command = ["ros2", "bag", "record", "-s", "mcap", "-o", str(bag_path), *topics]
     expert_command = [
         sys.executable,
@@ -123,13 +126,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         "camera": {
             "name": "top",
             "topic": TOP_RGB_TOPIC,
-            "expected_raw_rate_hz": 12.32,
-            "expected_rate_basis": "measured single-topic rosbag result: 739 messages / 59.973 s",
+            "expected_raw_rate_hz": 10.78,
+            "expected_rate_basis": "measured TOP + arm14 rosbag result: 319 messages / 29.583295496 s",
         },
-        "state_topics": STATE_TOPICS,
+        "state_topics": {name: STATE_TOPICS[name] for name in ("left_arm", "right_arm")},
         "state_message_type": "sensor_msgs/msg/JointState",
         "arm_state_topic_order": "fixed suffix order from current runtime interface mapping",
-        "hand_state_mapping_status": "RAW_RECORDED_CLENCH6_MAPPING_UNVERIFIED",
+        "hand_state_source": "command_hold_last",
+        "raw_hand_topics_recorded": False,
         "action_events_path": "action_events.jsonl",
         "expert_log_path": "expert.log",
         "recorder_start_wait_s": args.recorder_start_wait_s,

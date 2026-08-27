@@ -11,8 +11,9 @@ from unittest import mock
 
 import numpy as np
 
-from tools.convert_act_c_rosbag_episode import build_aligned_episode
-from tools.run_c_only_serial_expert import ArmObservation, SerialExpert
+from tools.collect_act_c_rosbag import ROSBAG_TOPICS
+from tools.convert_act_c_rosbag_episode import build_aligned_episode, quality_report
+from tools.run_c_only_serial_expert import ArmObservation, SerialExpert, STATE_TOPICS, TOP_RGB_TOPIC
 from tools import test_nut_camera_calibration as camera_calibration
 
 
@@ -213,7 +214,7 @@ class ActCRosbagOfflineMockTest(unittest.TestCase):
         self.assertTrue(settled["already_settled"])
         self.assertLess(elapsed, 0.8)
 
-    def test_12hz_camera_passive_arms_and_hand_commands_align_to_5hz(self) -> None:
+    def test_15_topic_bag_without_raw_hands_aligns_state26_and_hybrid28(self) -> None:
         second = 1_000_000_000
         start = 1_800_000_000_000_000_000
         end = start + 2 * second
@@ -248,7 +249,20 @@ class ActCRosbagOfflineMockTest(unittest.TestCase):
         ]
 
         arrays = build_aligned_episode(camera, arm_samples, events, start_ns=start, end_ns=end)
+        quality = quality_report(
+            arrays,
+            np.asarray(camera, dtype=np.int64),
+            events,
+            {"expert_status": "PASS", "raw_hand_topics_recorded": False},
+        )
 
+        self.assertEqual(
+            ROSBAG_TOPICS,
+            (TOP_RGB_TOPIC, *STATE_TOPICS["left_arm"], *STATE_TOPICS["right_arm"]),
+        )
+        self.assertEqual(len(ROSBAG_TOPICS), 15)
+        self.assertTrue(set(ROSBAG_TOPICS).isdisjoint(STATE_TOPICS["left_hand"]))
+        self.assertTrue(set(ROSBAG_TOPICS).isdisjoint(STATE_TOPICS["right_hand"]))
         self.assertEqual(arrays["states"].shape, (11, 26))
         self.assertEqual(arrays["hybrid_actions"].shape, (10, 28))
         np.testing.assert_array_equal(arrays["hybrid_actions"][:, :26], arrays["states"][1:])
@@ -258,6 +272,8 @@ class ActCRosbagOfflineMockTest(unittest.TestCase):
         self.assertTrue(np.isfinite(arrays["states"]).all())
         self.assertTrue(np.any(arrays["states"][:, 21] == 1.0))
         self.assertTrue(np.any(arrays["grasp_modes_at_state"][:, 1] == 1.0))
+        self.assertEqual(quality["hand_state_source"], "command_hold_last")
+        self.assertFalse(quality["raw_hand_topics_recorded"])
 
 
 if __name__ == "__main__":
