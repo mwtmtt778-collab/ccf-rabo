@@ -1,7 +1,6 @@
 {
   "format": "act_c_fixed_point_v1_onnx",
-  "checkpoint": "/home/liyi/ccf_act_baseline/outputs/act_c_fixed_point_5ep_v1/checkpoint_3000.pt",
-  "onnx": "/home/liyi/ccf_act_baseline/outputs/act_c_fixed_point_5ep_v1/onnx/act_c_fixed_point_v1.onnx",
+  "onnx": "models/act_c_fixed_point_v1.onnx",
   "opset": 17,
   "strict_load": "<All keys matched successfully>",
   "camera_count": 1,

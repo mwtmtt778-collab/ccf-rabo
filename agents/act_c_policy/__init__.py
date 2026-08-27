@@ -8,6 +8,5 @@ __all__ = ["run"]
 
 
 def run() -> None:
-    """First deployment stage: automatic integrated dry-run, never robot actuation."""
-    raise SystemExit(main(["--dry-run", "--duration", "10"]))
-
+    """Official fixed-point C Agent: serial receding-horizon execution."""
+    raise SystemExit(main(["--execute-mvp"]))

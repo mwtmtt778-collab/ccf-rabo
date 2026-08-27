@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,15 +23,19 @@ from agents.act_c_policy.runtime import (
     CameraSnapshot,
     ConstrainedHandModeState,
     FixedPointCRuntime,
+    HybridHandExecutor,
+    JOINT_LIMIT_MARGIN_RAD,
     OnnxPolicy,
+    RuntimeResources,
     RuntimeFault,
     RuntimeStateReader,
     SerialRecedingHorizonMvp,
     TopCameraReader,
     build_safe_arm_target,
+    load_config,
     main,
+    select_camera_topic,
 )
-from tools.test_hybrid_action_replay import HybridHandExecutor
 
 
 class FakeClock:
@@ -224,8 +229,19 @@ class RuntimeTests(unittest.TestCase):
         predicted = current.copy()
         predicted[1] = 1.0
         target = build_safe_arm_target(current, predicted)
-        self.assertAlmostEqual(float(target.clipped_target[1]), float(ARM_JOINT_LIMITS[1, 1]), places=6)
+        self.assertAlmostEqual(
+            float(target.clipped_target[1]),
+            float(ARM_JOINT_LIMITS[1, 1] - JOINT_LIMIT_MARGIN_RAD),
+            places=6,
+        )
         self.assertLessEqual(target.max_executed_delta, 0.100001)
+
+    def test_mvp_lower_joint_limits_also_keep_margin(self) -> None:
+        current = np.tile(ARM_JOINT_LIMITS[:, 0] + 0.05, 2)
+        predicted = np.full(14, -100.0, dtype=np.float32)
+        target = build_safe_arm_target(current, predicted)
+        expected = np.tile(ARM_JOINT_LIMITS[:, 0] + JOINT_LIMIT_MARGIN_RAD, 2)
+        np.testing.assert_allclose(target.clipped_target, expected, atol=1e-6)
 
     def test_right_mode_completes_zero_one_zero(self) -> None:
         mode = ConstrainedHandModeState()
@@ -315,6 +331,118 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(report["status"], "DONE")
         self.assertEqual(report["policy_steps"], 16)
         self.assertEqual(report["post_done_arm_steps"], 5)
+
+    @staticmethod
+    def _camera_graph(fixed_topics=1):
+        pairs = []
+        for entity in ("left_arm", "right_arm"):
+            for index in range(7):
+                pairs.append((f"/scene/{entity}_tp_ps_j{index}", ["sensor_msgs/msg/JointState"]))
+            pairs.append((f"/scene/{entity}_tp_cam_rgb", ["sensor_msgs/msg/Image"]))
+        for index in range(fixed_topics):
+            pairs.append((f"/scene/top{index}_tp_cam_rgb", ["sensor_msgs/msg/Image"]))
+        return pairs
+
+    def test_camera_auto_discovery_single_candidate_passes(self) -> None:
+        self.assertEqual(
+            select_camera_topic(self._camera_graph(1), "auto"),
+            "/scene/top0_tp_cam_rgb",
+        )
+
+    def test_camera_auto_discovery_zero_candidates_fails_closed(self) -> None:
+        with self.assertRaisesRegex(RuntimeFault, "0 legal candidates"):
+            select_camera_topic(self._camera_graph(0), "auto")
+
+    def test_camera_auto_discovery_multiple_candidates_fails_closed(self) -> None:
+        with self.assertRaisesRegex(RuntimeFault, "ambiguous"):
+            select_camera_topic(self._camera_graph(2), "auto")
+
+    def test_explicit_camera_topic_passes(self) -> None:
+        graph = self._camera_graph(2)
+        self.assertEqual(
+            select_camera_topic(graph, "/scene/top1_tp_cam_rgb"),
+            "/scene/top1_tp_cam_rgb",
+        )
+
+    @staticmethod
+    def _write_portable_config(root: Path, *, create_model: bool) -> Path:
+        (root / "config").mkdir()
+        (root / "models").mkdir()
+        if create_model:
+            (root / "models/policy.onnx").write_bytes(b"mock")
+        (root / "models/contract.json").write_text("{}", encoding="utf-8")
+        config = {
+            "camera_topic": "auto",
+            "left_arm_name": "linker_left",
+            "right_arm_name": "linker_right",
+            "left_hand_name": "hand_left",
+            "right_hand_name": "hand_right",
+            "model": "models/policy.onnx",
+            "contract": "models/contract.json",
+            "dry_run_log": "logs/dry.jsonl",
+            "execute_log": "logs/mvp.jsonl",
+            "max_delta_rad": 0.1,
+            "joint_limit_margin_rad": 0.001,
+        }
+        path = root / "config/act_c_policy.json"
+        path.write_text(json.dumps(config), encoding="utf-8")
+        return path
+
+    def test_repo_relocation_keeps_model_repo_relative(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = self._write_portable_config(root, create_model=True)
+            config = load_config(path, repo_root=root)
+            self.assertEqual(config.model, root / "models/policy.onnx")
+            OnnxPolicy(config.model, session=FakeSession())
+
+    def test_missing_onnx_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = self._write_portable_config(root, create_model=False)
+            with self.assertRaisesRegex(RuntimeFault, "ONNX model missing"):
+                load_config(path, repo_root=root)
+
+    def test_cleanup_is_ordered_and_idempotent(self) -> None:
+        calls = []
+        policy = SimpleNamespace(request_stop=lambda: calls.append("policy_stop"))
+        camera = SimpleNamespace(close=lambda: calls.append("camera_close"))
+        sdk = SimpleNamespace(close=lambda: calls.append("sdk_close"))
+        rclpy_owner = SimpleNamespace(close=lambda: calls.append("rclpy_shutdown"))
+        resources = RuntimeResources(rclpy_owner)
+        resources.policy_loop = policy
+        resources.camera = camera
+        resources.sdk = sdk
+        resources.close()
+        resources.close()
+        self.assertEqual(calls, ["policy_stop", "camera_close", "sdk_close", "rclpy_shutdown"])
+
+    def test_camera_cleanup_destroys_executor_and_node_once(self) -> None:
+        calls = []
+        camera = TopCameraReader.__new__(TopCameraReader)
+        camera.stop_event = threading.Event()
+        camera.thread = SimpleNamespace(is_alive=lambda: False)
+        camera.executor = SimpleNamespace(
+            wake=lambda: calls.append("wake"),
+            remove_node=lambda node: calls.append("remove_node"),
+            shutdown=lambda timeout_sec: calls.append("executor_shutdown"),
+        )
+        camera.node = SimpleNamespace(destroy_node=lambda: calls.append("destroy_node"))
+        camera._close_lock = threading.Lock()
+        camera._closed = False
+        camera._executor_closed = False
+        camera._node_destroyed = False
+        camera.close()
+        camera.close()
+        self.assertEqual(calls, ["wake", "remove_node", "executor_shutdown", "destroy_node"])
+
+    def test_agent_and_tool_share_runtime_main(self) -> None:
+        import agents.act_c_policy as agent_entry
+        import agents.act_c_policy.runtime as runtime
+        import tools.run_act_c_policy_rabo as tool_entry
+
+        self.assertIs(agent_entry.main, runtime.main)
+        self.assertIs(tool_entry.main, runtime.main)
 
 
 if __name__ == "__main__":

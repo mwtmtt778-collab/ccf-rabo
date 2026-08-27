@@ -17,17 +17,14 @@ import numpy as np
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_MODEL = PROJECT_ROOT / "models" / "act_c_fixed_point_v1.onnx"
-DEFAULT_CONTRACT = PROJECT_ROOT / "models" / "act_c_fixed_point_v1.json"
-DEFAULT_DRY_RUN_LOG = PROJECT_ROOT / "logs" / "act_c_runtime_dry_run.jsonl"
-DEFAULT_MVP_LOG = PROJECT_ROOT / "logs" / "act_c_execute_mvp.jsonl"
-TOP_RGB_TOPIC = "/gs_1eebee6f37512bbc1d125b25511e912c/r6ef2dc_tp_cam_303d2b1ce0"
+DEFAULT_CONFIG = PROJECT_ROOT / "config" / "act_c_policy.json"
 HAND_OPEN = np.zeros(6, dtype=np.float32)
 STATE_DIM = 26
 ACTION_DIM = 28
 CHUNK_SIZE = 10
 POLICY_HZ = 5.0
 MAX_DELTA_PER_STEP = 0.10
+JOINT_LIMIT_MARGIN_RAD = 0.001
 MIN_ARM_COMMAND_DELTA = 0.005
 MAX_POLICY_STEPS = 150
 POST_DONE_ARM_STEPS = 5
@@ -51,10 +48,187 @@ ARM_JOINT_LIMITS = np.asarray(
 # [J1,J5,J4,J7,J3,J2,J6].  This is the same verified conversion used by its
 # arm_state.jsonl logger to produce training order [J1,J2,J3,J4,J5,J6,J7].
 PASSIVE_TO_SDK_INDICES = (0, 5, 4, 2, 1, 6, 3)
+IMAGE_TYPE = "sensor_msgs/msg/Image"
+JOINT_STATE_TYPE = "sensor_msgs/msg/JointState"
+GRASP_FORCE_CONFIG = {"strength": 1.0, "fingers": [1, 3, 4]}
 
 
 class RuntimeFault(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class ActCConfig:
+    repo_root: Path
+    path: Path
+    camera_topic: str
+    left_arm_name: str
+    right_arm_name: str
+    left_hand_name: str
+    right_hand_name: str
+    model: Path
+    contract: Path
+    dry_run_log: Path
+    execute_log: Path
+    max_delta_rad: float
+    joint_limit_margin_rad: float
+
+
+def _repo_path(repo_root: Path, value: Any, field: str) -> Path:
+    path = Path(str(value))
+    if path.is_absolute():
+        raise RuntimeFault(f"config {field} must be repo-relative: {path}")
+    resolved = (repo_root / path).resolve()
+    try:
+        resolved.relative_to(repo_root.resolve())
+    except ValueError as exc:
+        raise RuntimeFault(f"config {field} escapes repo root: {path}") from exc
+    return resolved
+
+
+def load_config(
+    path: Path = DEFAULT_CONFIG,
+    *,
+    repo_root: Path = PROJECT_ROOT,
+    require_assets: bool = True,
+) -> ActCConfig:
+    path = path.resolve()
+    if not path.is_file():
+        raise RuntimeFault(f"ACT C config missing: {path}")
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeFault(f"ACT C config unreadable: {exc!r}") from exc
+    required = {
+        "camera_topic", "left_arm_name", "right_arm_name", "left_hand_name",
+        "right_hand_name", "model", "contract", "dry_run_log", "execute_log",
+        "max_delta_rad", "joint_limit_margin_rad",
+    }
+    missing = sorted(required - set(raw))
+    if missing:
+        raise RuntimeFault(f"ACT C config missing fields: {missing}")
+    model = _repo_path(repo_root, raw["model"], "model")
+    contract = _repo_path(repo_root, raw["contract"], "contract")
+    config = ActCConfig(
+        repo_root=repo_root.resolve(),
+        path=path,
+        camera_topic=str(raw["camera_topic"]),
+        left_arm_name=str(raw["left_arm_name"]),
+        right_arm_name=str(raw["right_arm_name"]),
+        left_hand_name=str(raw["left_hand_name"]),
+        right_hand_name=str(raw["right_hand_name"]),
+        model=model,
+        contract=contract,
+        dry_run_log=_repo_path(repo_root, raw["dry_run_log"], "dry_run_log"),
+        execute_log=_repo_path(repo_root, raw["execute_log"], "execute_log"),
+        max_delta_rad=float(raw["max_delta_rad"]),
+        joint_limit_margin_rad=float(raw["joint_limit_margin_rad"]),
+    )
+    if not config.camera_topic or not all(
+        (config.left_arm_name, config.right_arm_name, config.left_hand_name, config.right_hand_name)
+    ):
+        raise RuntimeFault("ACT C device names and camera_topic must be nonempty")
+    if not 0 < config.max_delta_rad <= MAX_DELTA_PER_STEP:
+        raise RuntimeFault(f"max_delta_rad must be in (0,{MAX_DELTA_PER_STEP}]")
+    half_width = float(np.min(ARM_JOINT_LIMITS[:, 1] - ARM_JOINT_LIMITS[:, 0])) / 2.0
+    if not 0 < config.joint_limit_margin_rad < half_width:
+        raise RuntimeFault("joint_limit_margin_rad is invalid")
+    if require_assets:
+        if not config.model.is_file():
+            raise RuntimeFault(f"ACT C ONNX model missing: {config.model}")
+        if not config.contract.is_file():
+            raise RuntimeFault(f"ACT C model contract missing: {config.contract}")
+    return config
+
+
+def _topic_leaf_entity(topic: str, marker: str) -> str | None:
+    leaf = topic.rsplit("/", 1)[-1]
+    if marker not in leaf:
+        return None
+    return leaf.split(marker, 1)[0]
+
+
+def joint_state_topic_groups(topic_pairs: Sequence[tuple[str, Sequence[str]]]) -> dict[str, list[str]]:
+    groups: dict[str, list[str]] = {}
+    for name, types in topic_pairs:
+        if JOINT_STATE_TYPE not in types:
+            continue
+        entity = _topic_leaf_entity(name, "_tp_ps_")
+        if entity is not None:
+            groups.setdefault(entity, []).append(name)
+    return {entity: sorted(names) for entity, names in groups.items()}
+
+
+def image_topic_candidates(topic_pairs: Sequence[tuple[str, Sequence[str]]]) -> list[str]:
+    groups = joint_state_topic_groups(topic_pairs)
+    arm_entities = {entity for entity, names in groups.items() if len(names) == 7}
+    rgb_topics = sorted(
+        name
+        for name, types in topic_pairs
+        if IMAGE_TYPE in types and _topic_leaf_entity(name, "_tp_cam_") is not None
+    )
+    # A fixed TOP camera does not share the entity prefix of a discovered 7-DOF arm.
+    return [
+        name for name in rgb_topics
+        if _topic_leaf_entity(name, "_tp_cam_") not in arm_entities
+    ]
+
+
+def select_camera_topic(
+    topic_pairs: Sequence[tuple[str, Sequence[str]]],
+    configured: str,
+) -> str:
+    image_topics = sorted(name for name, types in topic_pairs if IMAGE_TYPE in types)
+    if configured != "auto":
+        if configured not in image_topics:
+            raise RuntimeFault(
+                f"configured camera topic is unavailable: {configured}; image topics={image_topics}"
+            )
+        return configured
+    candidates = image_topic_candidates(topic_pairs)
+    if len(candidates) == 1:
+        return candidates[0]
+    if not candidates:
+        raise RuntimeFault(f"camera auto discovery found 0 legal candidates; image topics={image_topics}")
+    raise RuntimeFault(
+        f"camera auto discovery is ambiguous ({len(candidates)} candidates): {candidates}; "
+        "set camera_topic explicitly in config/act_c_policy.json"
+    )
+
+
+class RclpyOwner:
+    """Own global rclpy initialization and perform shutdown exactly once, last."""
+
+    def __init__(self, rclpy_module: Any) -> None:
+        self.rclpy = rclpy_module
+        self.owns_init = not bool(rclpy_module.ok())
+        self.closed = False
+        if self.owns_init:
+            rclpy_module.init(args=None)
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        if self.owns_init and self.rclpy.ok():
+            self.rclpy.shutdown()
+
+
+def discover_topic_pairs(rclpy_module: Any, timeout_s: float) -> list[tuple[str, list[str]]]:
+    node = rclpy_module.create_node("act_c_policy_graph_discovery")
+    try:
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        pairs: list[tuple[str, list[str]]] = []
+        while True:
+            pairs = sorted(
+                (str(name), [str(value) for value in types])
+                for name, types in node.get_topic_names_and_types()
+            )
+            if any(IMAGE_TYPE in types for _, types in pairs) or time.monotonic() >= deadline:
+                return pairs
+            time.sleep(0.1)
+    finally:
+        node.destroy_node()
 
 
 @dataclass(frozen=True)
@@ -67,7 +241,7 @@ class CameraSnapshot:
 class TopCameraReader:
     """Independent ROS executor retaining the latest real TOP RGB frame."""
 
-    def __init__(self, rclpy_module: Any, *, topic: str = TOP_RGB_TOPIC) -> None:
+    def __init__(self, rclpy_module: Any, *, topic: str) -> None:
         from rclpy.executors import SingleThreadedExecutor
         from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
         from sensor_msgs.msg import Image
@@ -92,6 +266,10 @@ class TopCameraReader:
         self.first_frame_ns: int | None = None
         self.last_frame_ns: int | None = None
         self.thread = threading.Thread(target=self._spin, name="act-c-top-camera", daemon=True)
+        self._close_lock = threading.Lock()
+        self._closed = False
+        self._executor_closed = False
+        self._node_destroyed = False
         self.thread.start()
 
     @staticmethod
@@ -131,6 +309,8 @@ class TopCameraReader:
         return chw[None, ...]
 
     def _callback(self, message: Any) -> None:
+        if self.stop_event.is_set():
+            return
         try:
             image = self.decode_image(message)
             now_ns = time.monotonic_ns()
@@ -179,12 +359,114 @@ class TopCameraReader:
             span = (self.last_frame_ns - self.first_frame_ns) / 1e9
             return (self.frame_count - 1) / span if span > 0 else None
 
-    def close(self) -> None:
+    def stop_callbacks(self) -> None:
         self.stop_event.set()
-        self.thread.join(timeout=2.0)
-        self.executor.remove_node(self.node)
-        self.executor.shutdown(timeout_sec=1.0)
-        self.node.destroy_node()
+        with contextlib.suppress(Exception):
+            self.executor.wake()
+        if self.thread is not threading.current_thread() and self.thread.is_alive():
+            self.thread.join(timeout=2.0)
+
+    def close(self) -> None:
+        with self._close_lock:
+            if self._closed:
+                return
+            self.stop_callbacks()
+            if not self._executor_closed:
+                with contextlib.suppress(Exception):
+                    self.executor.remove_node(self.node)
+                try:
+                    with contextlib.suppress(Exception):
+                        self.executor.shutdown(timeout_sec=1.0)
+                finally:
+                    self._executor_closed = True
+            if not self._node_destroyed:
+                try:
+                    with contextlib.suppress(Exception):
+                        self.node.destroy_node()
+                finally:
+                    self._node_destroyed = True
+            self._closed = True
+
+
+@dataclass(frozen=True)
+class ArmObservation:
+    sequence: int
+    timestamp_monotonic_ns: int
+    state: tuple[float, ...]
+
+
+def require_sdk_success(value: Any, operation: str) -> None:
+    if value is None:
+        return
+    if isinstance(value, bool):
+        if value:
+            return
+        raise RuntimeFault(f"{operation} returned False")
+    text = str(value).lower()
+    if any(token in text for token in ("error", "failed", "fail", "false", "失败", "错误")):
+        raise RuntimeFault(f"{operation} failed: {value!r}")
+
+
+class SdkDeviceBundle:
+    """Portable Rabo SDK clients selected only by config device names."""
+
+    def __init__(self, config: ActCConfig, *, include_hands: bool) -> None:
+        from rabo_robocap import LinkerArmA7, LinkerHandO6Left, LinkerHandO6Right
+
+        self.closed = False
+        self.left_arm = self.right_arm = self.left_hand = self.right_hand = None
+        try:
+            self.left_arm = LinkerArmA7(robot_id=config.left_arm_name, mode="sim")
+            self.right_arm = LinkerArmA7(robot_id=config.right_arm_name, mode="sim")
+            if include_hands:
+                self.left_hand = LinkerHandO6Left(robot_id=config.left_hand_name, mode="sim")
+                self.right_hand = LinkerHandO6Right(robot_id=config.right_hand_name, mode="sim")
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        for device in (self.left_hand, self.right_hand, self.left_arm, self.right_arm):
+            if device is not None and hasattr(device, "shutdown"):
+                with contextlib.suppress(Exception):
+                    device.shutdown()
+
+
+class SdkArmStateSource:
+    """Read-only state26 arm source using the public SDK J1..J7 order."""
+
+    sdk_order = True
+
+    def __init__(self, left_arm: Any, right_arm: Any) -> None:
+        self.arms = {"left_arm": left_arm, "right_arm": right_arm}
+        self.sequences = {"left_arm": 0, "right_arm": 0}
+
+    def wait_ready(self, timeout_s: float) -> None:
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        last_error: BaseException | None = None
+        while time.monotonic() <= deadline:
+            try:
+                self.observation("left_arm")
+                self.observation("right_arm")
+                return
+            except BaseException as exc:
+                last_error = exc
+                time.sleep(0.05)
+        raise RuntimeFault(f"SDK passive arm state not ready: {last_error!r}")
+
+    def observation(self, arm: str) -> ArmObservation:
+        if arm not in self.arms:
+            raise ValueError(f"unknown arm: {arm}")
+        values = np.asarray(self.arms[arm].get_joint_angles(), dtype=np.float32)
+        if values.shape != (7,) or not np.isfinite(values).all():
+            raise RuntimeFault(f"invalid {arm} SDK state: shape={values.shape}, values={values}")
+        self.sequences[arm] += 1
+        return ArmObservation(
+            self.sequences[arm], time.monotonic_ns(), tuple(float(value) for value in values)
+        )
 
 
 class RuntimeStateReader:
@@ -205,8 +487,13 @@ class RuntimeStateReader:
     def snapshot(self) -> tuple[np.ndarray, int]:
         left = self.passive.observation("left_arm")
         right = self.passive.observation("right_arm")
-        left_sdk = np.asarray(left.state, dtype=np.float32)[list(PASSIVE_TO_SDK_INDICES)]
-        right_sdk = np.asarray(right.state, dtype=np.float32)[list(PASSIVE_TO_SDK_INDICES)]
+        left_raw = np.asarray(left.state, dtype=np.float32)
+        right_raw = np.asarray(right.state, dtype=np.float32)
+        if getattr(self.passive, "sdk_order", False):
+            left_sdk, right_sdk = left_raw, right_raw
+        else:
+            left_sdk = left_raw[list(PASSIVE_TO_SDK_INDICES)]
+            right_sdk = right_raw[list(PASSIVE_TO_SDK_INDICES)]
         state = np.concatenate(
             (
                 left_sdk,
@@ -403,6 +690,7 @@ def build_safe_arm_target(
     predicted_arm14: Sequence[float] | np.ndarray,
     *,
     max_delta_per_step: float = MAX_DELTA_PER_STEP,
+    joint_limit_margin_rad: float = JOINT_LIMIT_MARGIN_RAD,
 ) -> ArmTarget:
     current = np.asarray(current_arm14, dtype=np.float32)
     predicted = np.asarray(predicted_arm14, dtype=np.float32)
@@ -414,14 +702,19 @@ def build_safe_arm_target(
         raise ValueError("max_delta_per_step must be positive")
     low = np.tile(ARM_JOINT_LIMITS[:, 0], 2)
     high = np.tile(ARM_JOINT_LIMITS[:, 1], 2)
+    safe_low = low + float(joint_limit_margin_rad)
+    safe_high = high - float(joint_limit_margin_rad)
+    if joint_limit_margin_rad <= 0 or np.any(safe_low >= safe_high):
+        raise ValueError("joint_limit_margin_rad is invalid")
     if np.any(current < low) or np.any(current > high):
         raise RuntimeFault("current real arm state is outside SDK hard limits")
     raw_delta = predicted - current
     clipped_delta = np.clip(raw_delta, -max_delta_per_step, max_delta_per_step)
-    target = np.clip(current + clipped_delta, low, high).astype(np.float32, copy=False)
+    target = np.clip(current + clipped_delta, safe_low, safe_high).astype(np.float32, copy=False)
     executed_delta = target - current
     if float(np.max(np.abs(executed_delta))) > max_delta_per_step + 1e-6:
         raise RuntimeFault("internal arm delta clip violation")
+    assert_arm_target_safe(target, joint_limit_margin_rad=joint_limit_margin_rad)
     return ArmTarget(
         raw_prediction=predicted.copy(),
         clipped_target=target.copy(),
@@ -430,11 +723,60 @@ def build_safe_arm_target(
     )
 
 
+def assert_arm_target_safe(
+    target_arm14: Sequence[float] | np.ndarray,
+    *,
+    joint_limit_margin_rad: float = JOINT_LIMIT_MARGIN_RAD,
+) -> None:
+    target = np.asarray(target_arm14, dtype=np.float32)
+    if target.shape not in ((7,), (14,)) or not np.isfinite(target).all():
+        raise RuntimeFault(f"invalid final arm target: shape={target.shape}")
+    repeats = 1 if target.shape == (7,) else 2
+    low = np.tile(ARM_JOINT_LIMITS[:, 0], repeats)
+    high = np.tile(ARM_JOINT_LIMITS[:, 1], repeats)
+    safe_low = low + float(joint_limit_margin_rad)
+    safe_high = high - float(joint_limit_margin_rad)
+    if np.any(target < safe_low) or np.any(target > safe_high):
+        raise RuntimeFault("final arm target violates joint limit safety margin")
+    if np.any(target <= low) or np.any(target >= high):
+        raise RuntimeFault("final arm target is not strictly inside SDK hard limits")
+
+
 @dataclass(frozen=True)
 class ModeDecision:
     mode: int
     apply_hand: bool
     transition: str | None
+
+
+class HybridHandExecutor:
+    """Persistent position/force actuator semantics shared by Agent and tool."""
+
+    def __init__(self, clench: Any, grasp_force: Any) -> None:
+        self._clench = clench
+        self._grasp_force = grasp_force
+        self.mode = 0
+
+    def apply(self, target_clench: Sequence[float], target_mode: int, *, blocking: bool) -> str:
+        target_mode = int(target_mode)
+        if target_mode not in (0, 1):
+            raise ValueError(f"invalid grasp mode: {target_mode}")
+        if self.mode == 0 and target_mode == 1:
+            value = self._grasp_force(blocking)
+            require_sdk_success(value, "hand.grasp_force")
+            self.mode = 1
+            return "GRASP_FORCE_RISING_EDGE"
+        if self.mode == 1 and target_mode == 1:
+            return "FORCE_MODE_HOLD_NO_HAND_COMMAND"
+        values = [float(value) for value in target_clench]
+        if self.mode == 1 and target_mode == 0:
+            value = self._clench(values, blocking)
+            require_sdk_success(value, "hand.clench")
+            self.mode = 0
+            return "POSITION_MODE_FALLING_EDGE_CLENCH"
+        value = self._clench(values, blocking)
+        require_sdk_success(value, "hand.clench")
+        return "POSITION_MODE_CLENCH"
 
 
 class ConstrainedHandModeState:
@@ -500,6 +842,7 @@ class SerialRecedingHorizonMvp:
         max_policy_steps: int = MAX_POLICY_STEPS,
         post_done_arm_steps: int = POST_DONE_ARM_STEPS,
         max_delta_per_step: float = MAX_DELTA_PER_STEP,
+        joint_limit_margin_rad: float = JOINT_LIMIT_MARGIN_RAD,
         no_arm_move_threshold: float = MIN_ARM_COMMAND_DELTA,
         monotonic_ns: Any = time.monotonic_ns,
         sleep: Any = time.sleep,
@@ -515,11 +858,16 @@ class SerialRecedingHorizonMvp:
         self.max_policy_steps = int(max_policy_steps)
         self.post_done_arm_steps = int(post_done_arm_steps)
         self.max_delta_per_step = float(max_delta_per_step)
+        self.joint_limit_margin_rad = float(joint_limit_margin_rad)
         self.no_arm_move_threshold = float(no_arm_move_threshold)
         self.monotonic_ns = monotonic_ns
         self.sleep = sleep
         self.right_mode = ConstrainedHandModeState()
         self.left_mode = ConstrainedHandModeState()
+        self.stop_event = threading.Event()
+
+    def request_stop(self) -> None:
+        self.stop_event.set()
 
     def _apply_hand(
         self,
@@ -543,6 +891,8 @@ class SerialRecedingHorizonMvp:
         post_done_steps = 0
         with log_path.open("w", encoding="utf-8", buffering=1) as stream:
             for step in range(self.max_policy_steps):
+                if self.stop_event.is_set():
+                    raise RuntimeFault("policy loop stopped")
                 now_ns = int(self.monotonic_ns())
                 camera = self.camera.snapshot()
                 state, state_timestamp_ns = self.state_reader.snapshot()
@@ -553,7 +903,9 @@ class SerialRecedingHorizonMvp:
                     raise RuntimeFault("ONNX action chunk contains NaN/Inf or has wrong shape")
                 action = chunk[0, 0]
                 arm_target = build_safe_arm_target(
-                    state[0, :14], action[:14], max_delta_per_step=self.max_delta_per_step
+                    state[0, :14], action[:14],
+                    max_delta_per_step=self.max_delta_per_step,
+                    joint_limit_margin_rad=self.joint_limit_margin_rad,
                 )
                 print(
                     "[ACT_MVP_TARGET] "
@@ -566,6 +918,10 @@ class SerialRecedingHorizonMvp:
                 arm_commanded = arm_target.max_executed_delta >= self.no_arm_move_threshold
                 settled = True
                 if arm_commanded:
+                    assert_arm_target_safe(
+                        arm_target.clipped_target,
+                        joint_limit_margin_rad=self.joint_limit_margin_rad,
+                    )
                     settled = bool(
                         self.arm_executor.move_pair(
                             arm_target.clipped_target[:7].tolist(),
@@ -645,22 +1001,89 @@ class SerialRecedingHorizonMvp:
         raise RuntimeFault("MAX_POLICY_STEPS_EXCEEDED")
 
 
-class _NullEventWriter:
-    def write(self, *args: Any, **kwargs: Any) -> None:
-        return None
+class SerialArmExecutor:
+    """Serial move_joints followed by passive SDK state settle detection."""
 
+    def __init__(
+        self,
+        state_source: SdkArmStateSource,
+        left_arm: Any,
+        right_arm: Any,
+        args: argparse.Namespace,
+        *,
+        joint_limit_margin_rad: float,
+        monotonic: Any = time.monotonic,
+        sleep: Any = time.sleep,
+    ) -> None:
+        self.state_source = state_source
+        self.arms = {"left_arm": left_arm, "right_arm": right_arm}
+        self.args = args
+        self.joint_limit_margin_rad = float(joint_limit_margin_rad)
+        self.monotonic = monotonic
+        self.sleep = sleep
 
-class _SerialArmExecutor:
-    """Adapter over the retained serial move_joints + passive-settle implementation."""
+    def _move_one(self, arm_name: str, target: list[float], *, step: int) -> dict[str, Any]:
+        # Validate this 7D target against the same safety margin immediately before SDK send.
+        assert_arm_target_safe(target, joint_limit_margin_rad=self.joint_limit_margin_rad)
 
-    def __init__(self, serial: Any, left_arm: Any, right_arm: Any) -> None:
-        self.serial = serial
-        self.left_arm = left_arm
-        self.right_arm = right_arm
+        baseline = self.state_source.observation(arm_name)
+        started = self.monotonic()
+        result = self.arms[arm_name].move_joints([float(value) for value in target], blocking=False)
+        require_sdk_success(result, f"{arm_name}.move_joints")
+        returned = self.monotonic()
+        deadline = started + float(self.args.motion_timeout_s)
+        previous = np.asarray(baseline.state, dtype=np.float32)
+        movement_started = False
+        stable_count = 0
+        no_motion_stable_count = 0
+        max_observed_delta = 0.0
+        while self.monotonic() < deadline:
+            observation = self.state_source.observation(arm_name)
+            current = np.asarray(observation.state, dtype=np.float32)
+            adjacent = float(np.max(np.abs(current - previous)))
+            baseline_delta = float(np.max(np.abs(current - np.asarray(baseline.state))))
+            max_observed_delta = max(max_observed_delta, adjacent, baseline_delta)
+            significant = max(adjacent, baseline_delta) > float(self.args.start_threshold_rad)
+            if not movement_started and significant:
+                movement_started = True
+                stable_count = 0
+            elif movement_started and adjacent < float(self.args.settle_threshold_rad):
+                stable_count += 1
+            elif movement_started:
+                stable_count = 0
+            elif adjacent < float(self.args.settle_threshold_rad):
+                no_motion_stable_count += 1
+            else:
+                no_motion_stable_count = 0
+            previous = current
+            already_settled = (
+                not movement_started
+                and no_motion_stable_count >= int(self.args.settle_samples)
+                and self.monotonic() - returned >= float(self.args.no_motion_grace_s)
+            )
+            if (movement_started and stable_count >= int(self.args.settle_samples)) or already_settled:
+                settled = {
+                    "movement_started": movement_started,
+                    "already_settled": already_settled,
+                    "max_observed_delta_rad": max_observed_delta,
+                    "settle_elapsed_s": self.monotonic() - started,
+                }
+                print(
+                    "[ARM_SERIAL] "
+                    f"step={step} arm={arm_name} settled=True "
+                    f"movement_started={movement_started} already_settled={already_settled} "
+                    f"settle_elapsed_s={settled['settle_elapsed_s']:.3f}",
+                    flush=True,
+                )
+                if self.args.post_settle_s > 0:
+                    self.sleep(float(self.args.post_settle_s))
+                return settled
+            self.sleep(1.0 / float(self.args.observe_hz))
+        raise TimeoutError(f"{arm_name} passive settle timeout after {self.args.motion_timeout_s:g}s")
 
     def move_pair(self, left_target: list[float], right_target: list[float], *, step: int) -> bool:
-        self.serial.move_joints(f"ACT_MVP_{step:03d}_LEFT", "left_arm", self.left_arm, left_target)
-        self.serial.move_joints(f"ACT_MVP_{step:03d}_RIGHT", "right_arm", self.right_arm, right_target)
+        self._move_one("left_arm", left_target, step=step)
+        self._move_one("right_arm", right_target, step=step)
         return True
 
 
@@ -682,6 +1105,35 @@ def _append_mvp_fault(log_path: Path, exc: BaseException) -> None:
             )
 
 
+class RuntimeResources:
+    """Idempotent ordered cleanup: loop/callbacks/executor/node, SDK, rclpy."""
+
+    def __init__(self, rclpy_owner: Any) -> None:
+        self.rclpy_owner = rclpy_owner
+        self.policy_loop: Any | None = None
+        self.camera: Any | None = None
+        self.sdk: Any | None = None
+        self._close_lock = threading.Lock()
+        self.closed = False
+
+    def close(self) -> None:
+        with self._close_lock:
+            if self.closed:
+                return
+            self.closed = True
+            if self.policy_loop is not None:
+                with contextlib.suppress(Exception):
+                    self.policy_loop.request_stop()
+            if self.camera is not None:
+                with contextlib.suppress(Exception):
+                    self.camera.close()
+            if self.sdk is not None:
+                with contextlib.suppress(Exception):
+                    self.sdk.close()
+            with contextlib.suppress(Exception):
+                self.rclpy_owner.close()
+
+
 def validate_contract_file(path: Path) -> None:
     contract = json.loads(path.read_text(encoding="utf-8"))
     if contract.get("camera_count") != 1 or contract.get("state_dim") != 26:
@@ -690,78 +1142,93 @@ def validate_contract_file(path: Path) -> None:
         raise RuntimeFault("model contract action/chunk mismatch")
 
 
-def run_live_dry(args: argparse.Namespace) -> dict[str, Any]:
-    # PassiveArmState owns rclpy init and its dedicated arm-state executor.
-    from tools.run_c_only_serial_expert import PassiveArmState
+def _initialize_live(
+    args: argparse.Namespace,
+    config: ActCConfig,
+    *,
+    include_hands: bool,
+) -> tuple[RuntimeResources, TopCameraReader, RuntimeStateReader, OnnxPolicy, SdkDeviceBundle]:
+    import rclpy
 
-    validate_contract_file(args.contract.resolve())
-    passive = PassiveArmState(history_hz=20.0)
-    camera: TopCameraReader | None = None
+    validate_contract_file(config.contract)
+    policy = OnnxPolicy(config.model, threads=args.threads)
+    owner = RclpyOwner(rclpy)
+    resources = RuntimeResources(owner)
     try:
-        camera = TopCameraReader(passive.rclpy)
-        state_reader = RuntimeStateReader(passive)
-        policy = OnnxPolicy(args.model, threads=args.threads)
-        runtime = FixedPointCRuntime(camera, state_reader, policy, rate_hz=args.rate)
-        runtime.wait_ready(args.ready_timeout)
-        print("ACT C FIXED-POINT POLICY", flush=True)
-        print(f"Model: {args.model.resolve()}", flush=True)
-        print("Camera: READY", flush=True)
-        print("State: READY", flush=True)
-        print(f"Policy rate: {args.rate:g} Hz", flush=True)
-        print("Mode: DRY_RUN (no robot SDK control clients)", flush=True)
-        return runtime.run_dry(args.duration, args.log)
-    finally:
-        if camera is not None:
-            camera.close()
-        passive.close()
-
-
-def run_live_mvp(args: argparse.Namespace) -> dict[str, Any]:
-    from agents.three_nut_expert.config import RIGHT_GRASP_FORCE
-    from expert.left_nut_grasp_planner import GRASP_FORCE as LEFT_GRASP_FORCE
-    from tools.run_c_only_serial_expert import PassiveArmState, SerialExpert
-    from tools.test_hybrid_action_replay import HybridHandExecutor
-
-    validate_contract_file(args.contract.resolve())
-    passive = PassiveArmState(history_hz=args.observe_hz)
-    camera: TopCameraReader | None = None
-    right = left = None
-    try:
-        camera = TopCameraReader(passive.rclpy)
-        state_reader = RuntimeStateReader(passive)
-        deadline = time.monotonic() + args.ready_timeout
+        topic_pairs = discover_topic_pairs(rclpy, min(float(args.ready_timeout), 5.0))
+        camera_topic = select_camera_topic(topic_pairs, config.camera_topic)
+        print(f"Selected TOP: {camera_topic}", flush=True)
+        camera = TopCameraReader(rclpy, topic=camera_topic)
+        resources.camera = camera
+        sdk = SdkDeviceBundle(config, include_hands=include_hands)
+        resources.sdk = sdk
+        assert sdk.left_arm is not None and sdk.right_arm is not None
+        state_source = SdkArmStateSource(sdk.left_arm, sdk.right_arm)
+        state_reader = RuntimeStateReader(state_source)
+        deadline = time.monotonic() + float(args.ready_timeout)
         camera.wait_ready(max(0.0, deadline - time.monotonic()))
-        print("TOP READY", flush=True)
+        print("Camera READY", flush=True)
         state_reader.wait_ready(max(0.0, deadline - time.monotonic()))
         state, _ = state_reader.snapshot()
         if not np.isfinite(state).all():
             raise RuntimeFault("state26 is not finite at readiness gate")
-        print("Passive state READY", flush=True)
-        policy = OnnxPolicy(args.model, threads=args.threads)
+        print("State26 READY", flush=True)
+        return resources, camera, state_reader, policy, sdk
+    except BaseException:
+        resources.close()
+        raise
 
-        from tools.test_right_release_stability import make_right_bundle
-        from tools.test_dual_closed_loop_v2 import make_left_bundle
 
-        right = make_right_bundle()
-        left = make_left_bundle()
-        serial = SerialExpert(_NullEventWriter(), passive, right, left, args)
-        arm_executor = _SerialArmExecutor(serial, left.left_arm, right.right_arm)
+def run_live_dry(args: argparse.Namespace, config: ActCConfig) -> dict[str, Any]:
+    resources: RuntimeResources | None = None
+    try:
+        resources, camera, state_reader, policy, _sdk = _initialize_live(
+            args, config, include_hands=False
+        )
+        runtime = FixedPointCRuntime(camera, state_reader, policy, rate_hz=args.rate)
+        print("ACT C FIXED-POINT POLICY", flush=True)
+        print(f"Model: {config.model}", flush=True)
+        print(f"Policy rate: {args.rate:g} Hz", flush=True)
+        print("Mode: DRY_RUN (SDK state reads only; no robot commands)", flush=True)
+        return runtime.run_dry(args.duration, config.dry_run_log)
+    finally:
+        if resources is not None:
+            resources.close()
+
+
+def run_live_mvp(args: argparse.Namespace, config: ActCConfig) -> dict[str, Any]:
+    resources: RuntimeResources | None = None
+    try:
+        resources, camera, state_reader, policy, sdk = _initialize_live(
+            args, config, include_hands=True
+        )
+        assert sdk.left_arm is not None and sdk.right_arm is not None
+        assert sdk.left_hand is not None and sdk.right_hand is not None
+        state_source = state_reader.passive
+        arm_executor = SerialArmExecutor(
+            state_source,
+            sdk.left_arm,
+            sdk.right_arm,
+            args,
+            joint_limit_margin_rad=config.joint_limit_margin_rad,
+        )
 
         def right_clench(target: list[float], blocking: bool) -> Any:
-            return right.right_hand.clench(*target, blocking=blocking)
+            return sdk.right_hand.clench(*target, blocking=blocking)
 
         def right_force(blocking: bool) -> Any:
-            return right.right_hand.grasp_force(**RIGHT_GRASP_FORCE, blocking=blocking)
+            return sdk.right_hand.grasp_force(**GRASP_FORCE_CONFIG, blocking=blocking)
 
         def left_clench(target: list[float], blocking: bool) -> Any:
-            return left.left_hand.clench(*target, blocking=blocking)
+            return sdk.left_hand.clench(*target, blocking=blocking)
 
         def left_force(blocking: bool) -> Any:
-            return left.left_hand.grasp_force(**LEFT_GRASP_FORCE, blocking=blocking)
+            return sdk.left_hand.grasp_force(**GRASP_FORCE_CONFIG, blocking=blocking)
 
         print("ACT C SERIAL RECEDING-HORIZON MVP", flush=True)
         print("This is NOT 5Hz streaming.", flush=True)
-        print(f"Arm target max delta: {MAX_DELTA_PER_STEP:.2f} rad", flush=True)
+        print(f"Arm target max delta: {config.max_delta_rad:.2f} rad", flush=True)
+        print(f"Joint limit margin: {config.joint_limit_margin_rad:.3f} rad", flush=True)
         print("Mode control: constrained hysteresis", flush=True)
         print("Execution: serial move + passive settle", flush=True)
         runtime = SerialRecedingHorizonMvp(
@@ -771,27 +1238,17 @@ def run_live_mvp(args: argparse.Namespace) -> dict[str, Any]:
             arm_executor,
             HybridHandExecutor(left_clench, left_force),
             HybridHandExecutor(right_clench, right_force),
+            max_delta_per_step=config.max_delta_rad,
+            joint_limit_margin_rad=config.joint_limit_margin_rad,
         )
-        return runtime.run(args.mvp_log)
+        resources.policy_loop = runtime
+        return runtime.run(config.execute_log)
     except BaseException as exc:
-        _append_mvp_fault(args.mvp_log, exc)
+        _append_mvp_fault(config.execute_log, exc)
         raise
     finally:
-        if camera is not None:
-            with contextlib.suppress(Exception):
-                camera.close()
-        if right is not None:
-            from tools.test_right_release_stability import shutdown_bundle
-
-            with contextlib.suppress(Exception):
-                shutdown_bundle(right)
-        if left is not None:
-            from tools.test_dual_closed_loop_v2 import shutdown_left_bundle
-
-            with contextlib.suppress(Exception):
-                shutdown_left_bundle(left)
-        with contextlib.suppress(Exception):
-            passive.close()
+        if resources is not None:
+            resources.close()
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -800,14 +1257,11 @@ def build_parser() -> argparse.ArgumentParser:
     mode.add_argument("--dry-run", action="store_true")
     mode.add_argument("--execute", action="store_true")
     mode.add_argument("--execute-mvp", action="store_true")
-    parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
-    parser.add_argument("--contract", type=Path, default=DEFAULT_CONTRACT)
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--duration", type=float, default=10.0)
     parser.add_argument("--rate", type=float, default=POLICY_HZ)
     parser.add_argument("--ready-timeout", type=float, default=20.0)
     parser.add_argument("--threads", type=int, default=2)
-    parser.add_argument("--log", type=Path, default=DEFAULT_DRY_RUN_LOG)
-    parser.add_argument("--mvp-log", type=Path, default=DEFAULT_MVP_LOG)
     parser.add_argument("--observe-hz", type=float, default=5.0)
     parser.add_argument("--start-threshold-rad", type=float, default=0.003)
     parser.add_argument("--settle-threshold-rad", type=float, default=0.002)
@@ -827,10 +1281,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             "to the existing HybridHandExecutor's exact {0,1} modes. No SDK client was created."
         )
     try:
+        config = load_config(args.config, repo_root=PROJECT_ROOT)
         if args.execute_mvp:
-            run_live_mvp(args)
+            run_live_mvp(args, config)
         else:
-            run_live_dry(args)
+            run_live_dry(args, config)
         return 0
     except BaseException as exc:
         print(f"FAULT: {exc!r}", file=sys.stderr, flush=True)
