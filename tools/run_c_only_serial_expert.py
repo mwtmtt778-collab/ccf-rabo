@@ -132,6 +132,7 @@ class PassiveArmState:
     def __init__(self, history_hz: float = 5.0) -> None:
         try:
             import rclpy
+            from rclpy.executors import SingleThreadedExecutor
             from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
             from sensor_msgs.msg import JointState
         except Exception as exc:
@@ -139,6 +140,8 @@ class PassiveArmState:
         self.rclpy = rclpy
         rclpy.init(args=None)
         self.node = rclpy.create_node("act_c_serial_passive_motion_state")
+        self.executor = SingleThreadedExecutor(context=self.node.context)
+        self.executor.add_node(self.node)
         self.latest: dict[str, dict[int, float]] = {"left_arm": {}, "right_arm": {}}
         self.history: dict[str, deque[ArmObservation]] = {
             "left_arm": deque(maxlen=512),
@@ -163,7 +166,7 @@ class PassiveArmState:
     def _run(self) -> None:
         try:
             while not self.stop_event.is_set():
-                self.rclpy.spin_once(self.node, timeout_sec=0.05)
+                self.executor.spin_once(timeout_sec=0.05)
         except BaseException as exc:
             with self.condition:
                 self.error = exc
@@ -221,6 +224,8 @@ class PassiveArmState:
     def close(self) -> None:
         self.stop_event.set()
         self.thread.join(timeout=2.0)
+        self.executor.remove_node(self.node)
+        self.executor.shutdown(timeout_sec=1.0)
         self.node.destroy_node()
         if self.rclpy.ok():
             self.rclpy.shutdown()

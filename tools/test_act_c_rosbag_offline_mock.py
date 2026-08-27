@@ -7,11 +7,13 @@ import unittest
 import threading
 import time
 from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 
 from tools.convert_act_c_rosbag_episode import build_aligned_episode
 from tools.run_c_only_serial_expert import ArmObservation, SerialExpert
+from tools import test_nut_camera_calibration as camera_calibration
 
 
 class FakeEvents:
@@ -65,7 +67,108 @@ def serial_args(**overrides):
     return SimpleNamespace(**values)
 
 
+class FakeRosNode:
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.context = object()
+        self.subscriptions = []
+        self.destroyed = False
+
+    def create_subscription(self, _message_type, topic, callback, _qos):
+        subscription = SimpleNamespace(topic=topic, callback=callback)
+        self.subscriptions.append(subscription)
+        return subscription
+
+    def destroy_subscription(self, subscription) -> None:
+        if subscription in self.subscriptions:
+            self.subscriptions.remove(subscription)
+
+    def destroy_node(self) -> None:
+        self.destroyed = True
+
+
+class FakeSingleThreadedExecutor:
+    instances = []
+
+    def __init__(self, *, context=None) -> None:
+        self.context = context
+        self.node = None
+        self.shutdown_called = False
+        self.spin_count = 0
+        self.__class__.instances.append(self)
+
+    def add_node(self, node) -> bool:
+        self.node = node
+        return True
+
+    def remove_node(self, node) -> bool:
+        if self.node is node:
+            self.node = None
+            return True
+        return False
+
+    def spin_once(self, timeout_sec=None) -> None:
+        self.spin_count += 1
+        node = self.node
+        if node is not None:
+            for subscription in list(node.subscriptions):
+                if "points" in subscription.topic:
+                    message = SimpleNamespace(frame=self.spin_count)
+                else:
+                    message = SimpleNamespace(position=[self.spin_count * 0.001])
+                subscription.callback(message)
+        time.sleep(min(float(timeout_sec or 0.0), 0.001))
+
+    def shutdown(self, timeout_sec=None) -> bool:
+        self.shutdown_called = True
+        return True
+
+
 class ActCRosbagOfflineMockTest(unittest.TestCase):
+    def test_passive_and_pointcloud_executors_coexist(self) -> None:
+        import rclpy
+        import rclpy.executors
+
+        FakeSingleThreadedExecutor.instances = []
+        nodes = []
+
+        def create_node(name):
+            node = FakeRosNode(name)
+            nodes.append(node)
+            return node
+
+        with (
+            mock.patch.object(rclpy, "init"),
+            mock.patch.object(rclpy, "ok", return_value=True),
+            mock.patch.object(rclpy, "shutdown"),
+            mock.patch.object(rclpy, "create_node", side_effect=create_node),
+            mock.patch.object(rclpy.executors, "SingleThreadedExecutor", FakeSingleThreadedExecutor),
+            mock.patch.object(camera_calibration, "SETTLE_SECONDS", 0.01),
+            mock.patch.object(camera_calibration, "POINT_TIMEOUT_SECONDS", 0.1),
+        ):
+            from tools.run_c_only_serial_expert import PassiveArmState
+
+            passive = PassiveArmState(history_hz=500.0)
+            try:
+                passive.wait_ready(0.5)
+                before = passive.observation("left_arm").sequence
+                cloud, frames = camera_calibration.capture_fresh_cloud()
+                after = passive.observation("left_arm").sequence
+                self.assertIsNotNone(cloud)
+                self.assertGreater(frames, 0)
+                self.assertGreater(after, before)
+                self.assertEqual(len(FakeSingleThreadedExecutor.instances), 2)
+                passive_executor, cloud_executor = FakeSingleThreadedExecutor.instances
+                self.assertIsNot(passive_executor, cloud_executor)
+                self.assertFalse(passive_executor.shutdown_called)
+                self.assertTrue(cloud_executor.shutdown_called)
+                self.assertTrue(nodes[1].destroyed)
+                self.assertFalse(nodes[0].destroyed)
+            finally:
+                passive.close()
+            self.assertTrue(FakeSingleThreadedExecutor.instances[0].shutdown_called)
+            self.assertTrue(nodes[0].destroyed)
+
     def test_motion_during_two_second_sdk_call_is_not_lost(self) -> None:
         passive = FakePassiveArmState([0.0] * 7)
         events = FakeEvents()

@@ -131,6 +131,7 @@ def clear_of_storage_box(position: list[float]) -> bool:
 @dataclass
 class CloudReceiver:
     node: Any
+    executor: Any
     subscription: Any
     owns_rclpy_context: bool
     latest: Any = None
@@ -138,11 +139,9 @@ class CloudReceiver:
     frames: int = 0
 
     def spin_for(self, seconds: float) -> None:
-        import rclpy
-
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
-            rclpy.spin_once(self.node, timeout_sec=min(0.1, max(0.0, deadline - time.monotonic())))
+            self.executor.spin_once(timeout_sec=min(0.1, max(0.0, deadline - time.monotonic())))
 
     def next_after(self, marker: float, timeout: float) -> Any | None:
         deadline = time.monotonic() + timeout
@@ -158,6 +157,10 @@ class CloudReceiver:
         with contextlib.suppress(Exception):
             self.node.destroy_subscription(self.subscription)
         with contextlib.suppress(Exception):
+            self.executor.remove_node(self.node)
+        with contextlib.suppress(Exception):
+            self.executor.shutdown(timeout_sec=1.0)
+        with contextlib.suppress(Exception):
             self.node.destroy_node()
         if self.owns_rclpy_context:
             with contextlib.suppress(Exception):
@@ -166,6 +169,7 @@ class CloudReceiver:
 
 def start_receiver() -> CloudReceiver:
     import rclpy
+    from rclpy.executors import SingleThreadedExecutor
     from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
     from sensor_msgs.msg import PointCloud2
 
@@ -177,6 +181,8 @@ def start_receiver() -> CloudReceiver:
     if owns_rclpy_context:
         rclpy.init(args=None)
     node = rclpy.create_node("nut_camera_calibration")
+    executor = SingleThreadedExecutor(context=node.context)
+    executor.add_node(node)
     qos = QoSProfile(
         history=HistoryPolicy.KEEP_LAST,
         depth=1,
@@ -186,7 +192,12 @@ def start_receiver() -> CloudReceiver:
         reliability=ReliabilityPolicy.RELIABLE,
         durability=DurabilityPolicy.VOLATILE,
     )
-    receiver = CloudReceiver(node=node, subscription=None, owns_rclpy_context=owns_rclpy_context)
+    receiver = CloudReceiver(
+        node=node,
+        executor=executor,
+        subscription=None,
+        owns_rclpy_context=owns_rclpy_context,
+    )
 
     def callback(msg: PointCloud2) -> None:
         receiver.latest = msg
