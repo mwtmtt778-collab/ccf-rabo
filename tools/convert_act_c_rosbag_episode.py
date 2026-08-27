@@ -218,6 +218,9 @@ def quality_report(
     events: list[dict[str, Any]],
     meta: dict[str, Any],
 ) -> dict[str, Any]:
+    task_profile = str(meta.get("task_profile", "fixed_point_c_baseline"))
+    visual_mode = str(meta.get("visual_mode", "async_latest_hold"))
+    requires_visual_generalization = bool(meta.get("requires_visual_generalization", False))
     duration_s = float(arrays["state_timestamps"][-1]) if len(arrays["state_timestamps"]) else 0.0
     raw_duration_s = (int(camera_ns[-1]) - int(camera_ns[0])) / 1e9 if len(camera_ns) >= 2 else 0.0
     camera_fps = (len(camera_ns) - 1) / raw_duration_s if raw_duration_s > 0 else None
@@ -230,20 +233,60 @@ def quality_report(
     arm_age = np.maximum(arrays["left_arm_state_age_s"], arrays["right_arm_state_age_s"])
     camera_p95 = percentile_or_none(age, 95)
     arm_p95 = percentile_or_none(arm_age[arm_age >= 0.0], 95)
+    camera_timestamps_valid = bool(
+        len(camera_ns) > 0
+        and np.all(camera_ns > 0)
+        and (len(camera_ns) == 1 or np.all(np.diff(camera_ns) >= 0))
+    )
+    hand_source_valid = meta.get("hand_state_source", "command_hold_last") == "command_hold_last"
     checks = {
         "expert_pass": meta.get("expert_status") == "PASS",
         "state26": arrays["states"].ndim == 2 and arrays["states"].shape[1] == STATE_DIM,
         "hybrid28": arrays["hybrid_actions"].shape == (max(0, len(arrays["states"]) - 1), ACTION_DIM),
         "finite_state_and_action": finite,
         "camera_present": len(camera_ns) > 0,
+        "camera_raw_count_positive": len(camera_ns) > 0,
+        "camera_timestamps_monotonic_and_valid": camera_timestamps_valid,
         "camera_raw_fps_gte_5": camera_fps is not None and camera_fps >= 5.0,
         "camera_p95_age_lte_0_2s": camera_p95 is not None and camera_p95 <= 0.2,
         "left_arm_full_coverage": left_coverage == 1.0,
         "right_arm_full_coverage": right_coverage == 1.0,
         "arm_p95_age_lte_0_1s": arm_p95 is not None and arm_p95 <= 0.1,
+        "hand_state_source_command_hold_last": hand_source_valid,
     }
-    accepted = all(checks.values())
+    if task_profile == "fixed_point_c_baseline":
+        hard_check_names = (
+            "expert_pass",
+            "state26",
+            "hybrid28",
+            "finite_state_and_action",
+            "camera_present",
+            "camera_raw_count_positive",
+            "camera_timestamps_monotonic_and_valid",
+            "left_arm_full_coverage",
+            "right_arm_full_coverage",
+            "arm_p95_age_lte_0_1s",
+            "hand_state_source_command_hold_last",
+        )
+    else:
+        hard_check_names = (
+            "expert_pass",
+            "state26",
+            "hybrid28",
+            "finite_state_and_action",
+            "camera_present",
+            "camera_raw_fps_gte_5",
+            "camera_p95_age_lte_0_2s",
+            "left_arm_full_coverage",
+            "right_arm_full_coverage",
+            "arm_p95_age_lte_0_1s",
+        )
+    hard_checks = {name: checks[name] for name in hard_check_names}
+    accepted = all(hard_checks.values())
     return {
+        "task_profile": task_profile,
+        "visual_mode": visual_mode,
+        "requires_visual_generalization": requires_visual_generalization,
         "raw_camera_frame_count": int(len(camera_ns)),
         "raw_camera_effective_fps": camera_fps,
         "camera_raw_count": int(len(camera_ns)),
@@ -274,6 +317,7 @@ def quality_report(
         "action_event_count": len(events),
         "expert_status": meta.get("expert_status"),
         "checks": checks,
+        "hard_acceptance_checks": hard_checks,
         "accepted": accepted,
         "accepted_for_training": accepted,
     }
@@ -341,6 +385,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         "format": "rabo_act_v1_single_episode",
         "episode_id": meta["episode_id"],
         "sequence": ["C"],
+        "task_profile": str(meta.get("task_profile", "fixed_point_c_baseline")),
+        "visual_mode": str(meta.get("visual_mode", "async_latest_hold")),
+        "requires_visual_generalization": bool(meta.get("requires_visual_generalization", False)),
         "fps": 5.0,
         "state_dim": STATE_DIM,
         "action_dim": ACTION_DIM,

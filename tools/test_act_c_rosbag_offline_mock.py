@@ -308,6 +308,50 @@ class ActCRosbagOfflineMockTest(unittest.TestCase):
         self.assertFalse(quality["raw_arm_topics_recorded"])
         self.assertFalse(quality["raw_hand_topics_recorded"])
         self.assertTrue(quality["accepted"])
+        self.assertEqual(quality["task_profile"], "fixed_point_c_baseline")
+        self.assertEqual(quality["visual_mode"], "async_latest_hold")
+        self.assertFalse(quality["requires_visual_generalization"])
+
+        low_rate_camera = np.asarray(camera[::12], dtype=np.int64)
+        stale_camera_arrays = dict(arrays)
+        stale_camera_arrays["camera_age_s"] = np.full(len(arrays["states"]), 0.6, dtype=np.float64)
+        fixed_quality = quality_report(
+            stale_camera_arrays,
+            low_rate_camera,
+            arm_state_ns,
+            events,
+            {
+                "expert_status": "PASS",
+                "task_profile": "fixed_point_c_baseline",
+                "visual_mode": "async_latest_hold",
+                "requires_visual_generalization": False,
+                "hand_state_source": "command_hold_last",
+            },
+        )
+        self.assertFalse(fixed_quality["checks"]["camera_raw_fps_gte_5"])
+        self.assertFalse(fixed_quality["checks"]["camera_p95_age_lte_0_2s"])
+        self.assertNotIn("camera_raw_fps_gte_5", fixed_quality["hard_acceptance_checks"])
+        self.assertNotIn("camera_p95_age_lte_0_2s", fixed_quality["hard_acceptance_checks"])
+        self.assertTrue(fixed_quality["accepted_for_training"])
+
+        general_quality = quality_report(
+            stale_camera_arrays,
+            low_rate_camera,
+            arm_state_ns,
+            events,
+            {"expert_status": "PASS", "task_profile": "generalization", "hand_state_source": "command_hold_last"},
+        )
+        self.assertFalse(general_quality["accepted_for_training"])
+
+        invalid_camera_quality = quality_report(
+            stale_camera_arrays,
+            low_rate_camera[::-1],
+            arm_state_ns,
+            events,
+            {"expert_status": "PASS", "task_profile": "fixed_point_c_baseline", "hand_state_source": "command_hold_last"},
+        )
+        self.assertFalse(invalid_camera_quality["checks"]["camera_timestamps_monotonic_and_valid"])
+        self.assertFalse(invalid_camera_quality["accepted_for_training"])
 
     def test_passive_arm_logger_decimates_and_writes_sdk_order(self) -> None:
         passive = PassiveArmState.__new__(PassiveArmState)
